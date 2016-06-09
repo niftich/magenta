@@ -7,8 +7,14 @@
 # license that can be found in the LICENSE file or at
 # https://opensource.org/licenses/MIT
 
+if [ -x "/opt/local/bin/gfind" ]; then
+    FIND="gfind"
+else
+    FIND="find"
+fi
+
 if [ "$#" -lt 1 ]; then
-    FILES=`find . -type f -regex ".*\.[chS]\|.*\.cpp"`
+    FILES=`$FIND . -type f -regex ".*\.[chS]\|.*\.cpp"`
     echo running ctags
     rm -f tags
     echo $FILES | xargs ctags -a
