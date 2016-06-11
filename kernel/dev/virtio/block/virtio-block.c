@@ -9,6 +9,7 @@
 #include <assert.h>
 #include <trace.h>
 #include <compiler.h>
+#include <string.h>
 #include <list.h>
 #include <err.h>
 #include <kernel/thread.h>
@@ -18,7 +19,11 @@
 #include <lib/bio.h>
 #include <dev/virtio.h>
 
-#define LOCAL_TRACE 0
+#if WITH_DEV_PCIE
+#include <dev/pcie.h>
+#endif
+
+#define LOCAL_TRACE 1
 
 struct virtio_blk_config {
     uint64_t capacity;
@@ -60,7 +65,7 @@ struct virtio_blk_req {
 static enum handler_return virtio_block_irq_driver_callback(struct virtio_device *dev, uint ring, const struct vring_used_elem *e);
 static ssize_t virtio_bdev_read_block(struct bdev *bdev, void *buf, bnum_t block, uint count);
 static ssize_t virtio_bdev_write_block(struct bdev *bdev, const void *buf, bnum_t block, uint count);
-static status_t virtio_block_init(struct virtio_device *dev, uint32_t host_features);
+static status_t virtio_block_init(struct virtio_device *dev);
 
 struct virtio_block_dev {
     struct virtio_device *dev;
@@ -82,9 +87,9 @@ struct virtio_block_dev {
 
 VIRTIO_DEV_CLASS(block, VIRTIO_DEV_ID_BLOCK, NULL, virtio_block_init, NULL);
 
-static status_t virtio_block_init(struct virtio_device *dev, uint32_t host_features)
+static status_t virtio_block_init(struct virtio_device *dev)
 {
-    LTRACEF("dev %p, host_features 0x%x\n", dev, host_features);
+    LTRACEF("dev %p\n", dev);
 
     /* allocate a new block device */
     struct virtio_block_dev *bdev = malloc(sizeof(struct virtio_block_dev));
@@ -114,12 +119,18 @@ static status_t virtio_block_init(struct virtio_device *dev, uint32_t host_featu
     /* make sure the device is reset */
     virtio_reset_device(dev);
 
-    volatile struct virtio_blk_config *config = (struct virtio_blk_config *)dev->config_ptr;
+    struct virtio_blk_config config;
 
-    LTRACEF("capacity 0x%llx\n", config->capacity);
-    LTRACEF("size_max 0x%x\n", config->size_max);
-    LTRACEF("seg_max  0x%x\n", config->seg_max);
-    LTRACEF("blk_size 0x%x\n", config->blk_size);
+    if (dev->type == VIO_MMIO) {
+        memcpy(&config, dev->mmio.config_ptr, sizeof(config));
+    } else if (dev->type == VIO_PCI) {
+        virtio_pci_copy_device_config(dev, &config, sizeof(config));
+    }
+
+    LTRACEF("capacity 0x%llx\n", config.capacity);
+    LTRACEF("size_max 0x%x\n", config.size_max);
+    LTRACEF("seg_max  0x%x\n", config.seg_max);
+    LTRACEF("blk_size 0x%x\n", config.blk_size);
 
     /* ack and set the driver status bit */
     virtio_status_acknowledge_driver(dev);
@@ -127,7 +138,7 @@ static status_t virtio_block_init(struct virtio_device *dev, uint32_t host_featu
     // XXX check features bits and ack/nak them
 
     /* allocate a virtio ring */
-    status_t err = virtio_alloc_ring(dev, 0, 256);
+    status_t err = virtio_alloc_ring(dev, 0, 128); // XXX set to 128 to match legacy pci
     if (err < 0)
         panic("failed to allocate virtio ring\n");
 
@@ -142,7 +153,7 @@ static status_t virtio_block_init(struct virtio_device *dev, uint32_t host_featu
     char buf[16];
     snprintf(buf, sizeof(buf), "virtio%u", found_index++);
     bio_initialize_bdev(&bdev->bdev, buf,
-                        config->blk_size, config->capacity,
+                        config.blk_size, config.capacity,
                         0, NULL, BIO_FLAGS_NONE);
 
     /* override our block device hooks */
@@ -151,7 +162,7 @@ static status_t virtio_block_init(struct virtio_device *dev, uint32_t host_featu
 
     bio_register_device(&bdev->bdev);
 
-    printf("found virtio block device of size %lld\n", config->capacity * config->blk_size);
+    printf("found virtio block device of size %lld\n", config.capacity * config.blk_size);
 
     return NO_ERROR;
 }
@@ -328,4 +339,93 @@ static ssize_t virtio_bdev_write_block(struct bdev *bdev, const void *buf, bnum_
         return ERR_IO;
     }
 }
+
+#if WITH_DEV_PCIE
+// PCI
+#include <dev/pcie.h>
+
+static void* virtio_block_pci_probe(pcie_device_state_t* pci_device)
+{
+    DEBUG_ASSERT(pci_device);
+
+    /* Is this the droid we are looking for? */
+    if ((pci_device->common.vendor_id != 0x1af4) ||
+        (pci_device->common.device_id != 0x1001)) {
+        return NULL;
+    }
+
+    LTRACEF("found our pci device!\n");
+
+    struct virtio_device *dev;
+    status_t err = virtio_add_pci_device(&dev, pci_device);
+    if (err < 0)
+        return NULL;
+
+    return dev;
+}
+
+// XXX hack
+extern pcie_irq_handler_retval_t virtio_pci_irq_handler(struct pcie_common_state* pci_device, uint  irq_id, void* ctx);
+
+static status_t virtio_block_pci_startup(struct pcie_device_state* pci_device)
+{
+    struct virtio_device *dev = (struct virtio_device *)pci_device->driver_ctx;
+
+    LTRACE_ENTRY;
+
+    status_t ret;
+    pcie_irq_mode_caps_t caps;
+    ret = pcie_query_irq_mode_capabilities(&pci_device->common,
+                                          PCIE_IRQ_MODE_LEGACY,
+                                          &caps);
+    LTRACEF("Legacy IRQ: status %d, max irqs %u\n", ret, caps.max_irqs);
+
+    ret = pcie_query_irq_mode_capabilities(&pci_device->common,
+                                          PCIE_IRQ_MODE_MSI,
+                                          &caps);
+    LTRACEF("MSI IRQ: status %d, max irqs %u\n", ret, caps.max_irqs);
+
+    ret = pcie_query_irq_mode_capabilities(&pci_device->common,
+                                          PCIE_IRQ_MODE_MSI_X,
+                                          &caps);
+    LTRACEF("MSI-X IRQ: status %d, max irqs %u\n", ret, caps.max_irqs);
+
+    ret = pcie_set_irq_mode(&dev->pci.pci_state->common,
+                            PCIE_IRQ_MODE_LEGACY,
+                            1,
+                            PCIE_IRQ_SHARE_MODE_SYSTEM_SHARED);
+    LTRACEF("pcie_set_irq_mode legacy allocate returns %d\n", ret);
+
+    // call our init routine
+    ret = virtio_block_init(dev);
+    if (ret != NO_ERROR)
+        return ret;
+
+    /* Register our handler; if the mode we are operating in does not support
+     * masking, we might start to receive interrupts as soon as we register. */
+    ret = pcie_register_irq_handler(&pci_device->common, 0, virtio_pci_irq_handler, dev);
+    if (ret != NO_ERROR) {
+        TRACEF("Failed to register IRQ handler (err = %d)\n", ret);
+        return ret;
+    }
+
+    ret = pcie_unmask_irq(&pci_device->common, 0);
+    if (ret != NO_ERROR) {
+        TRACEF("Failed to unmask IRQ (err = %d)\n", ret);
+        return ret;
+    }
+
+    return NO_ERROR;
+}
+
+static const pcie_driver_fn_table_t virtio_block_pci_fn = {
+    .pcie_probe_fn    = virtio_block_pci_probe,
+    .pcie_startup_fn  = virtio_block_pci_startup,
+    .pcie_shutdown_fn = NULL, //intel_i915_pci_shutdown,
+    .pcie_release_fn  = NULL, //intel_i915_pci_release,
+};
+
+STATIC_PCIE_DRIVER(virtio_block, "Virtio Block Device", virtio_block_pci_fn);
+
+#endif
 

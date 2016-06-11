@@ -15,11 +15,11 @@ struct virtio_mmio_config {
     uint32_t version;
     uint32_t device_id;
     uint32_t vendor_id;
-    /* 0x10 */  uint32_t host_features;
-    uint32_t host_features_sel;
+    /* 0x10 */  uint32_t device_features;
+    uint32_t device_features_sel;
     uint32_t __reserved0[2];
-    /* 0x20 */  uint32_t guest_features;
-    uint32_t guest_features_sel;
+    /* 0x20 */  uint32_t driver_features;
+    uint32_t driver_features_sel;
     uint32_t guest_page_size;
     uint32_t __reserved1[1];
     /* 0x30 */  uint32_t queue_sel;
@@ -48,3 +48,18 @@ STATIC_ASSERT(sizeof(struct virtio_mmio_config) == 0x100);
 #define VIRTIO_STATUS_FEATURES_OK (1<<3)
 #define VIRTIO_STATUS_DEVICE_NEEDS_RESET (1<<6)
 #define VIRTIO_STATUS_FAILED      (1<<7)
+
+/* PCI IO space for virtio devices */
+#define VIRTIO_PCI_DEVICE_FEATURES      (0x0) // 32
+#define VIRTIO_PCI_DRIVER_FEATURES      (0x4) // 32
+#define VIRTIO_PCI_QUEUE_PFN            (0x8) // 32
+#define VIRTIO_PCI_QUEUE_SIZE           (0xc) // 16
+#define VIRTIO_PCI_QUEUE_SELECT         (0xe) // 16
+#define VIRTIO_PCI_QUEUE_NOTIFY         (0x10) // 16
+#define VIRTIO_PCI_DEVICE_STATUS        (0x12) // 8
+#define VIRTIO_PCI_ISR_STATUS           (0x13) // 8
+#define VIRTIO_PCI_MSI_CONFIG_VECTOR    (0x14) // 16
+#define VIRTIO_PCI_MSI_QUEUE_VECTOR     (0x16) // 16
+
+#define VIRTIO_PCI_CONFIG_OFFSET_NOMSI  (0x14) // 16
+#define VIRTIO_PCI_CONFIG_OFFSET_MSI    (0x18) // 16

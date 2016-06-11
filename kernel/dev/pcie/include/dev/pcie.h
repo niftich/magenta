@@ -309,6 +309,17 @@ static inline void pcie_write16(volatile uint16_t* reg, uint16_t val) { *reg = L
 static inline void pcie_write32(volatile uint32_t* reg, uint32_t val) { *reg = LE32(val); }
 
 /*
+ * PIO based PCIe register access helpers.
+ */
+uint8_t  pcie_io_read8 (const pcie_bar_info_t *bar, uint16_t reg);
+uint16_t pcie_io_read16(const pcie_bar_info_t *bar, uint16_t reg);
+uint32_t pcie_io_read32(const pcie_bar_info_t *bar, uint16_t reg);
+
+void pcie_io_write8 (const pcie_bar_info_t *bar, uint16_t reg, uint8_t  val);
+void pcie_io_write16(const pcie_bar_info_t *bar, uint16_t reg, uint16_t val);
+void pcie_io_write32(const pcie_bar_info_t *bar, uint16_t reg, uint32_t val);
+
+/*
  * Helper methods used for safely downcasting from pcie_common_state_t's to
  * their derrived types.
  */

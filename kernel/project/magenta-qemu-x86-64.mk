@@ -9,7 +9,9 @@
 # emulating a standard PC with a 64bit x86 core
 
 SUBARCH := x86-64
-MODULES +=
+MODULES += \
+    dev/virtio/block \
+    dev/virtio/rng \
 
 # we're going to need to put the user cpio archive in the kernel binary directly
 EMBED_USER_BOOTFS:=true

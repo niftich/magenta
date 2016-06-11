@@ -102,7 +102,7 @@ struct virtio_rng_device {
 };
 
 static void virtio_rng_module_init(void);
-static status_t virtio_rng_init(struct virtio_device *vio_dev, uint32_t host_features);
+static status_t virtio_rng_init(struct virtio_device *vio_dev);
 
 VIRTIO_DEV_CLASS(rng, VIRTIO_DEV_ID_ENTROPY_SRC, virtio_rng_module_init, virtio_rng_init, NULL);
 
@@ -210,7 +210,7 @@ static void virtio_rng_module_init(void)
                         dev->entropy_pool);
 }
 
-static status_t virtio_rng_init(struct virtio_device *vio_dev, uint32_t host_features)
+static status_t virtio_rng_init(struct virtio_device *vio_dev)
 {
     struct virtio_rng_device* dev = &g_device;
 

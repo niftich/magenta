@@ -27,7 +27,7 @@
 static enum handler_return virtio_gpu_irq_driver_callback(struct virtio_device *dev, uint ring, const struct vring_used_elem *e);
 static enum handler_return virtio_gpu_config_change_callback(struct virtio_device *dev);
 static int virtio_gpu_flush_thread(void *arg);
-static status_t virtio_gpu_init(struct virtio_device *dev, uint32_t host_features);
+static status_t virtio_gpu_init(struct virtio_device *dev);
 static status_t virtio_gpu_start(struct virtio_device *dev);
 
 struct virtio_gpu_dev {
@@ -411,9 +411,9 @@ static void dump_gpu_config(const volatile struct virtio_gpu_config *config)
     LTRACEF("reserved 0x%x\n", config->reserved);
 }
 
-static status_t virtio_gpu_init(struct virtio_device *dev, uint32_t host_features)
+static status_t virtio_gpu_init(struct virtio_device *dev)
 {
-    LTRACEF("dev %p, host_features 0x%x\n", dev, host_features);
+    LTRACEF("dev %p\n", dev);
 
     /* allocate a new gpu device */
     struct virtio_gpu_dev *gdev = malloc(sizeof(struct virtio_gpu_dev));

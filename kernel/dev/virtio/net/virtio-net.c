@@ -92,7 +92,7 @@ struct virtio_net_dev {
 static enum handler_return virtio_net_irq_driver_callback(struct virtio_device *dev, uint ring, const struct vring_used_elem *e);
 static int virtio_net_rx_worker(void *arg);
 static status_t virtio_net_queue_rx(struct virtio_net_dev *ndev, pktbuf_t *p);
-static status_t virtio_net_init(struct virtio_device *dev, uint32_t host_features);
+static status_t virtio_net_init(struct virtio_device *dev);
 
 VIRTIO_DEV_CLASS(net, VIRTIO_DEV_ID_NET, NULL, virtio_net_init, NULL);
 
@@ -126,9 +126,9 @@ static void dump_feature_bits(uint32_t feature)
     printf("\n");
 }
 
-static status_t virtio_net_init(struct virtio_device *dev, uint32_t host_features)
+static status_t virtio_net_init(struct virtio_device *dev)
 {
-    LTRACEF("dev %p, host_features 0x%x\n", dev, host_features);
+    LTRACEF("dev %p\n", dev);
 
     /* allocate a new net device */
     struct virtio_net_dev *ndev = calloc(1, sizeof(struct virtio_net_dev));
@@ -149,7 +149,7 @@ static status_t virtio_net_init(struct virtio_device *dev, uint32_t host_feature
     virtio_status_acknowledge_driver(dev);
 
     // XXX check features bits and ack/nak them
-    dump_feature_bits(host_features);
+    //dump_feature_bits(host_features);
 
     /* set our irq handler */
     dev->irq_driver_callback = &virtio_net_irq_driver_callback;

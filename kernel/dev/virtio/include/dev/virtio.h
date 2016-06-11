@@ -38,6 +38,8 @@ int virtio_mmio_detect(void *ptr, uint count, const uint irqs[]);
 #define MAX_VIRTIO_RINGS 4
 
 struct virtio_mmio_config;
+struct pcie_device_state;
+struct pcie_bar_info;
 
 struct virtio_device {
     bool valid;
@@ -45,8 +47,24 @@ struct virtio_device {
     uint index;
     uint irq;
 
-    volatile struct virtio_mmio_config *mmio_config;
-    void *config_ptr;
+    enum {
+        VIO_NONE,
+        VIO_MMIO,
+        VIO_PCI
+    } type;
+
+    union {
+        struct {
+            /* mmio state (if detected via a mmio virtio window) */
+            volatile struct virtio_mmio_config *mmio_config;
+            void *config_ptr;
+        } mmio;
+        struct {
+            /* pci state (if detected via pci) */
+            struct pcie_device_state *pci_state;
+            const struct pcie_bar_info *pci_control_bar;
+        } pci;
+    };
 
     void *priv; /* a place for the driver to put private data */
 
@@ -90,9 +108,9 @@ void virtio_submit_chain(struct virtio_device *dev, uint ring_index, uint16_t de
 
 void virtio_kick(struct virtio_device *dev, uint ring_idnex);
 
-/* class driver registration */
+/* mmio class driver registration */
 typedef void(*virtio_module_init_func)(void);
-typedef status_t(*virtio_init_func)(struct virtio_device*, uint32_t);
+typedef status_t(*virtio_init_func)(struct virtio_device*);
 typedef status_t(*virtio_starup_func)(struct virtio_device*);
 typedef struct virtio_dev_class {
     uint32_t                device_id;
@@ -111,4 +129,9 @@ const virtio_dev_class_t __virtio_class_##_name __SECTION("virtio_classes") = { 
     .init_fn = init, \
     .startup_fn = startup, \
 };
+
+/* pci device registration */
+status_t virtio_add_pci_device(struct virtio_device **dev, struct pcie_device_state* pci_device);
+status_t virtio_pci_copy_device_config(struct virtio_device *dev, void *_buf, size_t len);
+status_t virtio_pci_allocate_irq(struct virtio_device *dev);
 

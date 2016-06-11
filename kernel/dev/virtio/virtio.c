@@ -24,29 +24,11 @@
 
 #include "virtio_priv.h"
 
-#define LOCAL_TRACE 0
+#if WITH_DEV_PCIE
+#include <dev/pcie.h>
+#endif
 
-/* list of class drivers, declared with VIRTIO_DEV_CLASS() macro */
-extern const virtio_dev_class_t __start_virtio_classes[] __WEAK;
-extern const virtio_dev_class_t __stop_virtio_classes[] __WEAK;
-
-static struct virtio_device *devices;
-
-static void dump_mmio_config(const volatile struct virtio_mmio_config *mmio)
-{
-    printf("mmio at %p\n", mmio);
-    printf("\tmagic 0x%x\n", mmio->magic);
-    printf("\tversion 0x%x\n", mmio->version);
-    printf("\tdevice_id 0x%x\n", mmio->device_id);
-    printf("\tvendor_id 0x%x\n", mmio->vendor_id);
-    printf("\thost_features 0x%x\n", mmio->host_features);
-    printf("\tguest_page_size %u\n", mmio->guest_page_size);
-    printf("\tqnum %u\n", mmio->queue_num);
-    printf("\tqnum_max %u\n", mmio->queue_num_max);
-    printf("\tqnum_align %u\n", mmio->queue_align);
-    printf("\tqnum_pfn %u\n", mmio->queue_pfn);
-    printf("\tstatus 0x%x\n", mmio->status);
-}
+#define LOCAL_TRACE 1
 
 void virtio_dump_desc(const struct vring_desc *desc)
 {
@@ -57,134 +39,10 @@ void virtio_dump_desc(const struct vring_desc *desc)
     printf("\tnext  0x%hhx\n", desc->next);
 }
 
-static enum handler_return virtio_mmio_irq(void *arg)
-{
-    struct virtio_device *dev = (struct virtio_device *)arg;
-    LTRACEF("dev %p, index %u\n", dev, dev->index);
-
-    uint32_t irq_status = dev->mmio_config->interrupt_status;
-    LTRACEF("status 0x%x\n", irq_status);
-
-    enum handler_return ret = INT_NO_RESCHEDULE;
-    if (irq_status & 0x1) { /* used ring update */
-        // XXX is this safe?
-        dev->mmio_config->interrupt_ack = 0x1;
-
-        /* cycle through all the active rings */
-        for (uint r = 0; r < MAX_VIRTIO_RINGS; r++) {
-            if ((dev->active_rings_bitmap & (1<<r)) == 0)
-                continue;
-
-            struct vring *ring = &dev->ring[r];
-            LTRACEF("ring %u: used flags 0x%hhx idx 0x%hhx last_used %u\n", r, ring->used->flags, ring->used->idx, ring->last_used);
-
-            uint cur_idx = ring->used->idx;
-            for (uint i = ring->last_used; i != (cur_idx & ring->num_mask); i = (i + 1) & ring->num_mask) {
-                LTRACEF("looking at idx %u\n", i);
-
-                // process chain
-                struct vring_used_elem *used_elem = &ring->used->ring[i];
-                LTRACEF("id %u, len %u\n", used_elem->id, used_elem->len);
-
-                DEBUG_ASSERT(dev->irq_driver_callback);
-                ret |= dev->irq_driver_callback(dev, r, used_elem);
-
-                ring->last_used = (ring->last_used + 1) & ring->num_mask;
-            }
-        }
-    }
-    if (irq_status & 0x2) { /* config change */
-        dev->mmio_config->interrupt_ack = 0x2;
-
-        if (dev->config_change_callback) {
-            ret |= dev->config_change_callback(dev);
-        }
-    }
-
-    LTRACEF("exiting irq\n");
-
-    return ret;
-}
-
-int virtio_mmio_detect(void *ptr, uint count, const uint irqs[])
-{
-    LTRACEF("ptr %p, count %u\n", ptr, count);
-
-    DEBUG_ASSERT(ptr);
-    DEBUG_ASSERT(irqs);
-    DEBUG_ASSERT(!devices);
-
-    /* allocate an array big enough to hold a list of devices */
-    devices = calloc(count, sizeof(struct virtio_device));
-    if (!devices)
-        return ERR_NO_MEMORY;
-
-    int found = 0;
-    for (uint i = 0; i < count; i++) {
-        volatile struct virtio_mmio_config *mmio = (struct virtio_mmio_config *)((uint8_t *)ptr + i * 0x200);
-        struct virtio_device *dev = &devices[i];
-
-        dev->index = i;
-        dev->irq = irqs[i];
-
-        mask_interrupt(irqs[i]);
-        register_int_handler(irqs[i], &virtio_mmio_irq, (void *)dev);
-
-        LTRACEF("looking at magic 0x%x version 0x%x did 0x%x vid 0x%x\n",
-                mmio->magic, mmio->version, mmio->device_id, mmio->vendor_id);
-
-        if ((mmio->magic != VIRTIO_MMIO_MAGIC) ||
-            (mmio->device_id == VIRTIO_DEV_ID_INVALID))
-            continue;
-
-#if LOCAL_TRACE
-        dump_mmio_config(mmio);
-#endif
-        const virtio_dev_class_t *class;
-        for (class = __start_virtio_classes; class != __stop_virtio_classes; class++) {
-            if (mmio->device_id != class->device_id)
-                continue;
-
-            LTRACEF("found %s device\n", class->name);
-            dev->mmio_config = mmio;
-            dev->config_ptr = (void *)mmio->config;
-
-            status_t err = class->init_fn(dev, mmio->host_features);
-            if (err >= 0) {
-                // good device
-                dev->valid = true;
-
-                if (dev->irq_driver_callback)
-                    unmask_interrupt(dev->irq);
-
-                if (class->startup_fn)
-                    class->startup_fn(dev);
-            } else {
-                LTRACEF("Failed to initialize VirtIO MMIO device id %u at position %u (err = %d)\n",
-                        mmio->device_id, i, err);
-
-                // indicate to the device that something went fatally wrong on the driver side.
-                dev->mmio_config->status |= VIRTIO_STATUS_FAILED;
-            }
-
-            break;
-        }
-
-        if (class == __stop_virtio_classes) {
-            TRACEF("Unrecognized VirtIO MMIO device id %u discovered at position %u\n",
-                    mmio->device_id, i);
-        }
-
-        if (dev->valid)
-            found++;
-    }
-
-    return found;
-}
-
 void virtio_free_desc(struct virtio_device *dev, uint ring_index, uint16_t desc_index)
 {
-    LTRACEF("dev %p ring %u index %u free_count %u\n", dev, ring_index, desc_index, dev->ring[ring_index].free_count);
+    LTRACEF("dev %p ring %u index %u free_count %u\n", dev, ring_index, desc_index,
+            dev->ring[ring_index].free_count);
     dev->ring[ring_index].desc[desc_index].next = dev->ring[ring_index].free_list;
     dev->ring[ring_index].free_list = desc_index;
     dev->ring[ring_index].free_count++;
@@ -220,7 +78,8 @@ uint16_t virtio_alloc_desc(struct virtio_device *dev, uint ring_index)
     return i;
 }
 
-struct vring_desc *virtio_alloc_desc_chain(struct virtio_device *dev, uint ring_index, size_t count, uint16_t *start_index)
+struct vring_desc *virtio_alloc_desc_chain(struct virtio_device *dev, uint ring_index,
+        size_t count, uint16_t *start_index)
 {
     if (dev->ring[ring_index].free_count < count)
         return NULL;
@@ -262,7 +121,7 @@ void virtio_submit_chain(struct virtio_device *dev, uint ring_index, uint16_t de
     struct vring_avail *avail = dev->ring[ring_index].avail;
 
     avail->ring[avail->idx & dev->ring[ring_index].num_mask] = desc_index;
-    DSB;
+    mb();
     avail->idx++;
 
 #if LOCAL_TRACE
@@ -274,8 +133,14 @@ void virtio_kick(struct virtio_device *dev, uint ring_index)
 {
     LTRACEF("dev %p, ring %u\n", dev, ring_index);
 
-    dev->mmio_config->queue_notify = ring_index;
-    DSB;
+    if (dev->type == VIO_MMIO) {
+        dev->mmio.mmio_config->queue_notify = ring_index;
+        mb();
+#if WITH_DEV_PCIE
+    } else if (dev->type == VIO_PCI) {
+        pcie_io_write16(dev->pci.pci_control_bar, VIRTIO_PCI_QUEUE_NOTIFY, ring_index);
+#endif
+    }
 }
 
 status_t virtio_alloc_ring(struct virtio_device *dev, uint index, uint16_t len)
@@ -297,7 +162,8 @@ status_t virtio_alloc_ring(struct virtio_device *dev, uint index, uint16_t len)
 
 #if WITH_KERNEL_VM
     void *vptr;
-    status_t err = vmm_alloc_contiguous(vmm_get_kernel_aspace(), "virtio_ring", size, &vptr, 0, VMM_FLAG_COMMIT, ARCH_MMU_FLAG_UNCACHED_DEVICE);
+    status_t err = vmm_alloc_contiguous(vmm_get_kernel_aspace(), "virtio_ring", size, &vptr,
+            0, VMM_FLAG_COMMIT, ARCH_MMU_FLAG_UNCACHED_DEVICE);
     if (err < 0)
         return ERR_NO_MEMORY;
 
@@ -334,12 +200,19 @@ status_t virtio_alloc_ring(struct virtio_device *dev, uint index, uint16_t len)
     }
 
     /* register the ring with the device */
-    DEBUG_ASSERT(dev->mmio_config);
-    dev->mmio_config->guest_page_size = PAGE_SIZE;
-    dev->mmio_config->queue_sel = index;
-    dev->mmio_config->queue_num = len;
-    dev->mmio_config->queue_align = PAGE_SIZE;
-    dev->mmio_config->queue_pfn = pa / PAGE_SIZE;
+    if (dev->type == VIO_MMIO) {
+        dev->mmio.mmio_config->guest_page_size = PAGE_SIZE;
+        dev->mmio.mmio_config->queue_sel = index;
+        dev->mmio.mmio_config->queue_num = len;
+        dev->mmio.mmio_config->queue_align = PAGE_SIZE;
+        dev->mmio.mmio_config->queue_pfn = pa / PAGE_SIZE;
+#if WITH_DEV_PCIE
+    } else if (dev->type == VIO_PCI) {
+        pcie_io_write16(dev->pci.pci_control_bar, VIRTIO_PCI_QUEUE_SELECT, index);
+        pcie_io_write16(dev->pci.pci_control_bar, VIRTIO_PCI_QUEUE_SIZE, len);
+        pcie_io_write32(dev->pci.pci_control_bar, VIRTIO_PCI_QUEUE_PFN, pa / PAGE_SIZE);
+#endif
+    }
 
     /* mark the ring active */
     dev->active_rings_bitmap |= (1 << index);
@@ -349,27 +222,42 @@ status_t virtio_alloc_ring(struct virtio_device *dev, uint index, uint16_t len)
 
 void virtio_reset_device(struct virtio_device *dev)
 {
-    dev->mmio_config->status = 0;
+    if (dev->type == VIO_MMIO)
+        dev->mmio.mmio_config->status = 0;
+#if WITH_DEV_PCIE
+    else if (dev->type == VIO_PCI)
+        pcie_io_write8(dev->pci.pci_control_bar, VIRTIO_PCI_DEVICE_STATUS, 0);
+#endif
 }
 
 void virtio_status_acknowledge_driver(struct virtio_device *dev)
 {
-    dev->mmio_config->status |= VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER;
+    if (dev->type == VIO_MMIO)
+        dev->mmio.mmio_config->status |= VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER;
+#if WITH_DEV_PCIE
+    else if (dev->type == VIO_PCI) {
+        uint8_t val = pcie_io_read8(dev->pci.pci_control_bar, VIRTIO_PCI_DEVICE_STATUS);
+        val |= VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER;
+        pcie_io_write8(dev->pci.pci_control_bar, VIRTIO_PCI_DEVICE_STATUS, val);
+    }
+#endif
 }
 
 void virtio_status_driver_ok(struct virtio_device *dev)
 {
-    dev->mmio_config->status |= VIRTIO_STATUS_DRIVER_OK;
+    if (dev->type == VIO_MMIO)
+        dev->mmio.mmio_config->status |= VIRTIO_STATUS_DRIVER_OK;
+#if WITH_DEV_PCIE
+    else if (dev->type == VIO_PCI) {
+        uint8_t val = pcie_io_read8(dev->pci.pci_control_bar, VIRTIO_PCI_DEVICE_STATUS);
+        val |= VIRTIO_STATUS_DRIVER_OK;
+        pcie_io_write8(dev->pci.pci_control_bar, VIRTIO_PCI_DEVICE_STATUS, val);
+    }
+#endif
 }
 
 void virtio_init(uint level)
 {
-    /* call all the class driver module init hooks */
-    const virtio_dev_class_t *class;
-    for (class = __start_virtio_classes; class != __stop_virtio_classes; class++) {
-        if (class->module_init_fn)
-            class->module_init_fn();
-    }
 }
 
 LK_INIT_HOOK(virtio, &virtio_init, LK_INIT_LEVEL_THREADING);

@@ -1085,3 +1085,76 @@ void pcie_modify_cmd(const pcie_device_state_t* device, uint16_t clr_bits, uint1
 void pcie_rescan_bus(void) {
     pcie_scan_and_start_devices(&g_drv_state);
 }
+
+uint8_t pcie_io_read8 (const pcie_bar_info_t *bar, uint16_t reg)
+{
+    if (bar->is_mmio)
+        return 0;
+
+#if ARCH_X86
+    return inp(bar->bus_addr + reg);
+#else
+    PANIC_UNIMPLEMENTED;
+#endif
+}
+
+uint16_t pcie_io_read16(const pcie_bar_info_t *bar, uint16_t reg)
+{
+    if (bar->is_mmio)
+        return 0;
+
+#if ARCH_X86
+    return inpw(bar->bus_addr + reg);
+#else
+    PANIC_UNIMPLEMENTED;
+#endif
+}
+
+uint32_t pcie_io_read32(const pcie_bar_info_t *bar, uint16_t reg)
+{
+    if (bar->is_mmio)
+        return 0;
+
+#if ARCH_X86
+    return inpd(bar->bus_addr + reg);
+#else
+    PANIC_UNIMPLEMENTED;
+#endif
+}
+
+void pcie_io_write8 (const pcie_bar_info_t *bar, uint16_t reg, uint8_t  val)
+{
+    if (bar->is_mmio)
+        return;
+
+#if ARCH_X86
+    outp(bar->bus_addr + reg, val);
+#else
+    PANIC_UNIMPLEMENTED;
+#endif
+}
+
+void pcie_io_write16(const pcie_bar_info_t *bar, uint16_t reg, uint16_t val)
+{
+    if (bar->is_mmio)
+        return;
+
+#if ARCH_X86
+    outpw(bar->bus_addr + reg, val);
+#else
+    PANIC_UNIMPLEMENTED;
+#endif
+}
+
+void pcie_io_write32(const pcie_bar_info_t *bar, uint16_t reg, uint32_t val)
+{
+    if (bar->is_mmio)
+        return;
+
+#if ARCH_X86
+    outpd(bar->bus_addr + reg, val);
+#else
+    PANIC_UNIMPLEMENTED;
+#endif
+}
+
