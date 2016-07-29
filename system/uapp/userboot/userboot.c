@@ -82,6 +82,8 @@ int main(int argc, char** argv) {
     uint64_t bootfs_size;
     uintptr_t bootfs_val;
 
+    cprintf("Made it to userboot.c\n");
+
     mx_status_t status = mx_vm_object_get_size(bootfs_vmo, &bootfs_size);
     if (status < 0) {
         cprintf("userboot: failed to get bootfs size (%d)\n", status);

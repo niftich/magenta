@@ -15,8 +15,6 @@
 
 #if WITH_DEV_INTERRUPT_ARM_GIC
 #include <dev/interrupt/arm_gic.h>
-#else
-#error need other implementation of interrupt controller that can ipi
 #endif
 
 #define LOCAL_TRACE 0
