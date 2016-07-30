@@ -877,6 +877,30 @@ mx_ssize_t sys_vm_object_read(mx_handle_t handle, void* data, uint64_t offset, m
     return vmo->Read(data, len, offset);
 }
 
+
+mx_status_t sys_vm_object_sync_cache(mx_handle_t handle, uint64_t offset, uint64_t len) {
+    LTRACEF("handle %d, offset 0x%llx, len 0x%llx\n", handle, offset, len);
+
+    // lookup the dispatcher from handle
+    auto up = ProcessDispatcher::GetCurrent();
+    utils::RefPtr<Dispatcher> dispatcher;
+    uint32_t rights;
+    if (!up->GetDispatcher(handle, &dispatcher, &rights))
+        return ERR_INVALID_ARGS;
+
+    auto vmo = dispatcher->get_vm_object_dispatcher();
+    if (!vmo)
+        return ERR_BAD_HANDLE;
+
+    if (!magenta_rights_check(rights, MX_RIGHT_READ))
+        return ERR_ACCESS_DENIED;
+
+    // do the read operation
+    return vmo->CacheSync(offset,len);
+}
+
+
+
 mx_ssize_t sys_vm_object_write(mx_handle_t handle, const void* data, uint64_t offset, mx_size_t len) {
     LTRACEF("handle %d, data %p, offset 0x%llx, len 0x%lx\n", handle, data, offset, len);
 

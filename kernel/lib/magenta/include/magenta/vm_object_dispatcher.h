@@ -27,6 +27,7 @@ public:
     mx_ssize_t Write(const void* user_data, mx_size_t length, uint64_t offset);
     mx_status_t SetSize(uint64_t);
     mx_status_t GetSize(uint64_t* size);
+    mx_status_t CacheSync(uint64_t offset, uint64_t len);
 
     // XXX really belongs in process
     mx_status_t Map(utils::RefPtr<VmAspace> aspace, uint32_t vmo_rights, uint64_t offset, mx_size_t len,

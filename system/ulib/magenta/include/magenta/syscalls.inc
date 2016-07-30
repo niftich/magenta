@@ -134,6 +134,7 @@ MAGENTA_DDKCALL_DEF(3, 3, 106, mx_status_t, mmap_device_memory, mx_paddr_t paddr
                     void **out_vaddr)
 MAGENTA_DDKCALL_DEF(3, 3, 107, mx_status_t, alloc_device_memory, uint32_t len, mx_paddr_t *out_paddr,
                     void **out_vaddr)
+MAGENTA_DDKCALL_DEF(3, 3, 108, mx_status_t, vm_object_sync_cache, mx_handle_t handle, uint64_t offset, uint64_t len)
 
 MAGENTA_SYSCALL_DEF(2, 2, 160, mx_ssize_t, cprng_draw, void* buffer, mx_size_t len);
 // TODO(security)

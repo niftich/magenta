@@ -65,6 +65,12 @@ mx_status_t VmObjectDispatcher::GetSize(uint64_t* size) {
     return NO_ERROR;
 }
 
+mx_status_t VmObjectDispatcher::CacheSync(uint64_t offset, uint64_t len) {
+
+    return vmo_->CacheSync(offset,len);
+}
+
+
 mx_status_t VmObjectDispatcher::Map(utils::RefPtr<VmAspace> aspace, uint32_t vmo_rights, uint64_t offset, mx_size_t len,
                                     uintptr_t* _ptr, uint32_t flags) {
     DEBUG_ASSERT(aspace);

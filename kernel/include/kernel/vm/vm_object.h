@@ -43,6 +43,8 @@ public:
     // fault in a page at a given offset with PF_FLAGS
     vm_page_t* FaultPage(uint64_t offset, uint pf_flags);
 
+    status_t CacheSync(uint64_t offset, uint64_t len);
+
     // read/write operators against kernel pointers only
     status_t Read(void* ptr, uint64_t offset, size_t len, size_t* bytes_read);
     status_t Write(const void* ptr, uint64_t offset, size_t len, size_t* bytes_written);
