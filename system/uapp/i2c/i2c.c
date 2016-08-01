@@ -167,7 +167,7 @@ int cmd_read(int fd, int argc, const char** argv) {
 
     int ret = read(fd, buf, length);
     if (ret < 0) {
-        printf("Error reading from slave. (%d)\n", ret);
+        printf("Error reading from slave. (%d, %d)\n", ret, errno);
         goto cmd_read_finish;
     }
 
@@ -206,7 +206,7 @@ int cmd_write(int fd, int argc, const char** argv) {
 
     ret = write(fd, buf, argc);
     if (ret < 0)
-        printf("Error writing to slave. (%d)\n", ret);
+        printf("Error writing to slave. (%d, %d)\n", ret, errno);
 
 cmd_write_finish:
     free(buf);

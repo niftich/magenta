@@ -630,6 +630,52 @@ static void acpi_sleep(void)
 }
 #endif
 
+static void acpi_debug_ps0(char *path)
+{
+    ACPI_HANDLE dev;
+    ACPI_STATUS status = AcpiGetHandle(NULL, path, &dev);
+    if (status != AE_OK) {
+        printf("Failed to find path\n");
+        return;
+    }
+
+    status = AcpiEvaluateObject(dev, (char*)"_PS0", NULL, NULL);
+    if (status != AE_OK) {
+        printf("Failed to find object's PS0 method\n");
+        return;
+    }
+}
+
+static void acpi_debug_dump_pkg(char *path)
+{
+    ACPI_BUFFER buffer = {
+        .Length = ACPI_ALLOCATE_BUFFER,
+        .Pointer = NULL,
+    };
+    ACPI_STATUS status = AcpiEvaluateObject(NULL, path, NULL, &buffer);
+    if (status != AE_OK) {
+        printf("Failed to find object's method: %d\n", status);
+        return;
+    }
+
+    ACPI_OBJECT *object = buffer.Pointer;
+    if (object->Type != ACPI_TYPE_PACKAGE) {
+        printf("Wrong type\n");
+        goto end;
+    }
+    for (unsigned int i = 0; i < object->Package.Count; ++i) {
+        ACPI_OBJECT *elt = &object->Package.Elements[i];
+        if (elt->Type != ACPI_TYPE_INTEGER) {
+            printf("Wrong type in package\n");
+            goto end;
+        }
+        printf("Value: %lld\n", elt->Integer.Value);
+    }
+
+end:
+    AcpiOsFree(buffer.Pointer);
+}
+
 #undef INDENT_PRINTF
 
 static int cmd_acpi(int argc, const cmd_args *argv)
@@ -647,6 +693,7 @@ usage:
         printf("%s walk-ns\n", argv[0].str);
         printf("%s spy\n", argv[0].str);
         printf("%s sleep\n", argv[0].str);
+        printf("%s ps0 <path>\n", argv[0].str);
         return ERR_INTERNAL;
     }
 
@@ -664,6 +711,16 @@ usage:
         acpi_debug_walk_ns();
     } else if (!strcmp(argv[1].str, "spy")) {
         acpi_debug_hook_all_events();
+    } else if (!strcmp(argv[1].str, "ps0")) {
+        if (argc < 3) {
+            goto notenoughargs;
+        }
+        acpi_debug_ps0((char*)argv[2].str);
+    } else if (!strcmp(argv[1].str, "dump-pkg")) {
+        if (argc < 3) {
+            goto notenoughargs;
+        }
+        acpi_debug_dump_pkg((char*)argv[2].str);
     } else if (!strcmp(argv[1].str, "sleep")) {
 #if ARCH_X86_64
         acpi_sleep();

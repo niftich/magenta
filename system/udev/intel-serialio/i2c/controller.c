@@ -21,6 +21,7 @@
 #include <intel-serialio/reg.h>
 #include <intel-serialio/serialio.h>
 #include <magenta/syscalls.h>
+#include <magenta/syscalls-ddk.h>
 #include <magenta/types.h>
 #include <runtime/mutex.h>
 #include <stdio.h>
@@ -278,9 +279,19 @@ mx_status_t intel_serialio_i2c_reset_controller(
     intel_serialio_i2c_device_t* device) {
     mx_status_t status = NO_ERROR;
 
+    printf("DEVICE REGS: %08x\n", *REG32((void *)device->regs + 0x24c));
+    // Wake up device if it is in DevIdle state
+    RMWREG32((void*)device->regs + 0x24c, 2, 1, 0);
+
+    // Wait for wakeup to finish processing
+    while (*REG32((void *)device->regs + 0x24c) & (1<<0));
+
     // Reset the device.
     RMWREG32(device->soft_reset, 0, 2, 0x0);
     RMWREG32(device->soft_reset, 0, 2, 0x3);
+
+    // Clear the "Restore Required" flag
+    RMWREG32((void*)device->regs + 0x24c, 3, 1, 0);
 
     // Disable the controller.
     RMWREG32(&device->regs->i2c_en, I2C_EN_ENABLE, 1, 0);
@@ -366,6 +377,11 @@ mx_status_t intel_serialio_bind_i2c(mx_driver_t* drv, mx_device_t* dev) {
     pci_protocol_t* pci;
     if (device_get_protocol(dev, MX_PROTOCOL_PCI, (void**)&pci))
         return ERR_NOT_SUPPORTED;
+
+    mx_debug_send_command("acpi ps0 \\_SB.PCI0.I2C1", 24);
+    /*
+    mx_debug_send_command("acpi ps0 \\_SB.PCI0.I2C0.SAM", 28);
+    */
 
     mx_status_t status = pci->claim_device(dev);
     if (status < 0)
