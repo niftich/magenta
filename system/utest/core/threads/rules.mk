@@ -25,5 +25,6 @@ MODULE_NAME := threads-test
 
 MODULE_LIBS := \
     ulib/unittest ulib/mxio ulib/magenta ulib/musl
+MODULE_STATIC_LIBS := ulib/runtime
 
 include make/module.mk

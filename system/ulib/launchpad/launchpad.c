@@ -80,7 +80,7 @@ mx_status_t launchpad_create(const char* name, launchpad_t** result) {
         return ERR_NO_MEMORY;
 
     uint32_t name_len = MIN(strlen(name), MX_MAX_NAME_LEN);
-    mx_handle_t proc = mx_process_create(name, name_len);
+    mx_handle_t proc = mx_process_create(name, name_len, 0);
     if (proc < 0) {
         free(lp);
         return proc;
@@ -646,14 +646,6 @@ mx_handle_t launchpad_start(launchpad_t* lp) {
         return ERR_NO_MEMORY;
     }
 
-    // TODO(mcgrathr): The kernel doesn't permit duplicating a process
-    // handle yet, so we don't actually send it.  But we keep the structure
-    // of this code based on the plan to send it.  So for now just send
-    // a dummy handle instead.
-#if 1
-    mx_handle_t proc = lp_proc(lp);
-    lp_proc(lp) = mx_vm_object_create(0);
-#else
     // The proc handle in lp->handles[0] will be consumed by message_write.
     // So we'll need a duplicate to do process operations later.
     mx_handle_t proc = mx_handle_duplicate(lp_proc(lp), MX_RIGHT_SAME_RIGHTS);
@@ -663,7 +655,41 @@ mx_handle_t launchpad_start(launchpad_t* lp) {
         mx_handle_close(child_bootstrap);
         return proc;
     }
-#endif
+
+    // create a new thread to run in the process
+    mx_handle_t thread = mx_thread_create(proc, "name", strlen("name"), 0);
+    if (thread < 0) {
+        mx_handle_close(proc);
+        free(msg);
+        mx_handle_close(to_child);
+        mx_handle_close(child_bootstrap);
+        return thread;
+    }
+
+    // create a new stack for the first thread
+    const size_t stack_size = 64*1024;
+    mx_handle_t thread_stack_vmo = mx_vm_object_create(stack_size);
+    if (thread_stack_vmo < 0) {
+        mx_handle_close(thread);
+        mx_handle_close(proc);
+        free(msg);
+        mx_handle_close(to_child);
+        mx_handle_close(child_bootstrap);
+        return thread_stack_vmo;
+    }
+
+    // map it
+    uintptr_t stack_ptr;
+    status = mx_process_vm_map(proc, thread_stack_vmo, 0, stack_size, &stack_ptr, MX_VM_FLAG_PERM_READ | MX_VM_FLAG_PERM_WRITE);
+    mx_handle_close(thread_stack_vmo);
+    if (status < 0) {
+        mx_handle_close(thread);
+        mx_handle_close(proc);
+        free(msg);
+        mx_handle_close(to_child);
+        mx_handle_close(child_bootstrap);
+        return status;
+    }
 
     status = mx_message_write(to_child, msg, size,
                               lp->handles, lp->handle_count, 0);
@@ -674,8 +700,7 @@ mx_handle_t launchpad_start(launchpad_t* lp) {
         for (size_t i = 0; i < lp->handle_count; ++i)
             lp->handles[i] = MX_HANDLE_INVALID;
         lp->handle_count = 0;
-        // TODO(mcgrathr): Pass in vdso_base somehow.
-        status = mx_process_start(proc, child_bootstrap, lp->entry);
+        status = mx_process_start(proc, thread, lp->entry, stack_ptr + stack_size, child_bootstrap);
     }
     // process_start consumed child_bootstrap if successful.
     if (status == NO_ERROR)
@@ -683,6 +708,7 @@ mx_handle_t launchpad_start(launchpad_t* lp) {
 
     mx_handle_close(child_bootstrap);
     mx_handle_close(proc);
+    mx_handle_close(thread);
 
     return status;
 }

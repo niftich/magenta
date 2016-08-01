@@ -677,37 +677,82 @@ mx_status_t sys_message_pipe_create(mx_handle_t out_handle[2], uint32_t flags) {
     return NO_ERROR;
 }
 
-mx_handle_t sys_thread_create(int (*entry)(void*), void* arg, const char* name, uint32_t name_len) {
-    LTRACEF("entry %p\n", entry);
+mx_handle_t sys_thread_create(mx_handle_t process_handle, const char* name, uint32_t name_len, uint32_t flags) {
+    LTRACEF("flags 0x%x\n", flags);
 
+    // copy the name to a local buffer
     char buf[MX_MAX_NAME_LEN];
     utils::StringPiece sp;
     status_t result = magenta_copy_user_string(name, name_len, buf, sizeof(buf), &sp);
     if (result != NO_ERROR)
         return result;
 
+    // currently, the only valid flag value is 0
+    if (flags != 0)
+        return ERR_INVALID_ARGS;
+
+    // convert process handle to process dispatcher
     auto up = ProcessDispatcher::GetCurrent();
 
+    utils::RefPtr<Dispatcher> process_dispatcher;
+
+    ProcessDispatcher *process = nullptr;
+    if (process_handle == 0) {
+        // XXX temporary hack to look up 'current process'
+        process = up;
+    } else {
+        mx_rights_t process_rights;
+
+        if (!up->GetDispatcher(process_handle, &process_dispatcher, &process_rights))
+            return ERR_INVALID_ARGS;
+
+        process = process_dispatcher->get_process_dispatcher();
+        if (!process)
+            return ERR_BAD_HANDLE;
+
+        // XXX rights check
+    }
+
+    // create the thread object
     utils::RefPtr<UserThread> user_thread;
-    result = up->CreateUserThread(sp, entry, arg, &user_thread);
+    result = process->CreateUserThread(sp.data(), flags, &user_thread);
     if (result != NO_ERROR)
         return result;
 
-    user_thread->Start();
-
-    utils::RefPtr<Dispatcher> dispatcher;
-    mx_rights_t rights;
-    result = ThreadDispatcher::Create(utils::move(user_thread), &dispatcher, &rights);
+    // create the thread dispatcher
+    utils::RefPtr<Dispatcher> thread_dispatcher;
+    mx_rights_t thread_rights;
+    result = ThreadDispatcher::Create(utils::move(user_thread), &thread_dispatcher, &thread_rights);
     if (result != NO_ERROR)
         return result;
 
-    HandleUniquePtr handle(MakeHandle(utils::move(dispatcher), rights));
+    HandleUniquePtr handle(MakeHandle(utils::move(thread_dispatcher), thread_rights));
     if (!handle)
         return ERR_NO_MEMORY;
 
     mx_handle_t hv = up->MapHandleToValue(handle.get());
     up->AddHandle(utils::move(handle));
     return hv;
+
+}
+
+mx_handle_t sys_thread_start(mx_handle_t thread_handle, uintptr_t entry, uintptr_t stack, uintptr_t arg) {
+    LTRACEF("handle %d, entry 0x%lx, stack 0x%lx, arg 0x%lx\n", thread_handle, entry, stack, arg);
+
+    auto up = ProcessDispatcher::GetCurrent();
+    utils::RefPtr<Dispatcher> dispatcher;
+    uint32_t rights;
+
+    if (!up->GetDispatcher(thread_handle, &dispatcher, &rights))
+        return ERR_INVALID_ARGS;
+
+    auto thread = dispatcher->get_thread_dispatcher();
+    if (!thread)
+        return ERR_BAD_HANDLE;
+
+    auto status = thread->Start(entry, stack, arg);
+
+    return status;
 }
 
 void sys_thread_exit() {
@@ -778,9 +823,10 @@ mx_status_t sys_thread_arch_prctl(mx_handle_t handle_value, uint32_t op, uintptr
     return NO_ERROR;
 }
 
-mx_handle_t sys_process_create(const char* name, uint32_t name_len) {
-    LTRACEF("name %p, len %u\n", name, name_len);
+mx_handle_t sys_process_create(const char* name, uint32_t name_len, uint32_t flags) {
+    LTRACEF("name %p, flags 0x%x\n", name, flags);
 
+    // copy out the name
     char buf[MX_MAX_NAME_LEN];
     utils::StringPiece sp;
     status_t result = magenta_copy_user_string(name, name_len, buf, sizeof(buf), &sp);
@@ -788,9 +834,14 @@ mx_handle_t sys_process_create(const char* name, uint32_t name_len) {
         return result;
     LTRACEF("name %s\n", buf);
 
+    // currently, the only valid flag value is 0
+    if (flags != 0)
+        return ERR_INVALID_ARGS;
+
+    // create a new process dispatcher
     utils::RefPtr<Dispatcher> dispatcher;
     mx_rights_t rights;
-    status_t res = ProcessDispatcher::Create(sp, &dispatcher, &rights);
+    status_t res = ProcessDispatcher::Create(sp, &dispatcher, &rights, flags);
     if (res != NO_ERROR)
         return res;
 
@@ -804,22 +855,42 @@ mx_handle_t sys_process_create(const char* name, uint32_t name_len) {
     return hv;
 }
 
-mx_status_t sys_process_start(mx_handle_t handle_value, mx_handle_t arg_handle_value, mx_vaddr_t entry) {
-    LTRACEF("handle %u\n", handle_value);
+mx_status_t sys_process_start(mx_handle_t process_handle, mx_handle_t thread_handle, uintptr_t entry, uintptr_t stack, mx_handle_t arg_handle_value) {
+    LTRACEF("phandle %d, thandle %d, entry 0x%lx, stack 0x%lx, arg_handle %d\n",
+            process_handle, thread_handle, entry, stack, arg_handle_value);
 
     auto up = ProcessDispatcher::GetCurrent();
-    utils::RefPtr<Dispatcher> dispatcher;
-    uint32_t rights;
 
-    if (!up->GetDispatcher(handle_value, &dispatcher, &rights))
+    // get process dispatcher
+    utils::RefPtr<Dispatcher> process_dispatcher;
+    uint32_t process_rights;
+    if (!up->GetDispatcher(process_handle, &process_dispatcher, &process_rights))
         return BadHandle();
 
-    auto process = dispatcher->get_process_dispatcher();
+    auto process = process_dispatcher->get_process_dispatcher();
     if (!process)
         return ERR_WRONG_TYPE;
 
+    // XXX test process rights
+
+    // get thread_dispatcher
+    utils::RefPtr<Dispatcher> thread_dispatcher;
+    uint32_t thread_rights;
+    if (!up->GetDispatcher(thread_handle, &thread_dispatcher, &thread_rights))
+        return ERR_INVALID_ARGS;
+
+    auto thread = thread_dispatcher->get_thread_dispatcher();
+    if (!thread)
+        return ERR_BAD_HANDLE;
+
+    // XXX test thread_rights
+
+    // XXX test that thread belongs to process
+
+    // XXX test that handle has TRANSFER rights
+
     HandleUniquePtr arg_handle = up->RemoveHandle(arg_handle_value);
-    if (!arg_handle_value)
+    if (!arg_handle)
         return ERR_INVALID_ARGS;
 
     auto arg_nhv = process->MapHandleToValue(arg_handle.get());
@@ -827,7 +898,7 @@ mx_status_t sys_process_start(mx_handle_t handle_value, mx_handle_t arg_handle_v
 
     // TODO(cpu) if Start() fails we want to undo RemoveHandle().
 
-    return process->Start(reinterpret_cast<void*>(arg_nhv), entry);
+    return process->Start(thread, entry, stack, arg_nhv);
 }
 
 mx_handle_t sys_event_create(uint32_t options) {

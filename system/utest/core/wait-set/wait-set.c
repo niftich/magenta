@@ -18,6 +18,7 @@
 #include <magenta/syscalls.h>
 
 #include <unittest/unittest.h>
+#include <unittest/test-utils.h>
 
 bool wait_set_create_test(void) {
     BEGIN_TEST;
@@ -357,9 +358,8 @@ bool wait_set_wait_threaded_test(void) {
     EXPECT_EQ(mx_wait_set_add(ws, ev, MX_SIGNAL_SIGNALED, cookie), NO_ERROR, "");
 
     const char signaler_name[] = "signaler";
-    mx_handle_t thread = mx_thread_create(signaler_thread_fn, &ev, signaler_name,
-                                          sizeof(signaler_name));
-    ASSERT_GT(thread, 0, "mx_thread_create() failed");
+    mx_handle_t thread = tu_thread_create(signaler_thread_fn, &ev, signaler_name);
+    ASSERT_GT(thread, 0, "tu_thread_create() failed");
 
     mx_wait_set_result_t results[5] = {};
     uint32_t num_results = 5u;
@@ -374,8 +374,8 @@ bool wait_set_wait_threaded_test(void) {
     ASSERT_EQ(mx_event_reset(ev), NO_ERROR, "");
 
     const char closer_name[] = "closer";
-    thread = mx_thread_create(closer_thread_fn, &ev, closer_name, sizeof(closer_name));
-    ASSERT_GT(thread, 0, "mx_thread_create() failed");
+    thread = tu_thread_create(closer_thread_fn, &ev, closer_name);
+    ASSERT_GT(thread, 0, "tu_thread_create() failed");
 
     num_results = 5u;
     EXPECT_EQ(mx_wait_set_wait(ws, MX_TIME_INFINITE, &num_results, results, NULL), NO_ERROR, "");
@@ -404,8 +404,8 @@ bool wait_set_wait_cancelled_test(void) {
 
     // We close the wait set handle!
     const char closer_name[] = "closer";
-    mx_handle_t thread = mx_thread_create(closer_thread_fn, &ws, closer_name, sizeof(closer_name));
-    ASSERT_GT(thread, 0, "mx_thread_create() failed");
+    mx_handle_t thread = tu_thread_create(closer_thread_fn, &ws, closer_name);
+    ASSERT_GT(thread, 0, "tu_thread_create() failed");
 
     mx_wait_set_result_t results[5] = {};
     uint32_t num_results = 5u;

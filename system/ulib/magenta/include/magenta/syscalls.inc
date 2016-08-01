@@ -81,10 +81,10 @@ MAGENTA_SYSCALL_DEF(3, 3, 46, mx_status_t, object_signal, mx_handle_t handle, ui
                     uint32_t clear_mask)
 
 // Threads
-MAGENTA_SYSCALL_DEF(4, 4, 50, mx_handle_t, thread_create, int (*entry)(void*), void* arg,
-                    const char* name, uint32_t name_len)
-MAGENTA_SYSCALL_DEF_WITH_ATTRS(0, 0, 51, void, thread_exit, (noreturn), void)
-MAGENTA_SYSCALL_DEF(3, 3, 52, mx_status_t, thread_arch_prctl, mx_handle_t handle, uint32_t op,
+MAGENTA_SYSCALL_DEF(4, 4, 50, mx_handle_t, thread_create, mx_handle_t process, const char* name, uint32_t name_len, uint32_t flags)
+MAGENTA_SYSCALL_DEF(4, 4, 51, mx_status_t, thread_start, mx_handle_t handle, uintptr_t thread_entry, uintptr_t stack, uintptr_t arg)
+MAGENTA_SYSCALL_DEF_WITH_ATTRS(0, 0, 52, void, thread_exit, (noreturn), void)
+MAGENTA_SYSCALL_DEF(3, 3, 53, mx_status_t, thread_arch_prctl, mx_handle_t handle, uint32_t op,
                     uintptr_t* value_ptr)
 
 // Messages
@@ -100,9 +100,8 @@ MAGENTA_DDKCALL_DEF(1, 1, 71, mx_status_t, interrupt_event_complete, mx_handle_t
 MAGENTA_DDKCALL_DEF(1, 1, 72, mx_status_t, interrupt_event_wait, mx_handle_t handle)
 
 // Processes
-MAGENTA_SYSCALL_DEF(2, 2, 80, mx_handle_t, process_create, const char* name, uint32_t name_len)
-MAGENTA_SYSCALL_DEF(3, 3, 82, mx_status_t, process_start, mx_handle_t handle, mx_handle_t handle_arg,
-                    mx_vaddr_t entry)
+MAGENTA_SYSCALL_DEF(3, 3, 80, mx_handle_t, process_create, const char* name, uint32_t name_len, uint32_t flags)
+MAGENTA_SYSCALL_DEF(5, 5, 82, mx_status_t, process_start, mx_handle_t process_handle, mx_handle_t thread_handle, uintptr_t entry, uintptr_t stack, mx_handle_t arg_handle)
 MAGENTA_SYSCALL_DEF(6, 7, 83, mx_status_t, process_vm_map, mx_handle_t proc_handle, mx_handle_t vmo_handle,
                     uint64_t offset, mx_size_t len, uintptr_t *ptr, uint32_t flags)
 MAGENTA_SYSCALL_DEF(3, 3, 84, mx_status_t, process_vm_unmap, mx_handle_t proc_handle, uintptr_t address,

@@ -114,7 +114,7 @@ static void init_tls(mxr_thread_t* thread) {
     mxr_tls_set(MXR_TLS_SLOT_ERRNO, &thread->errno_value);
 }
 
-static int thread_trampoline(void* ctx) {
+static void thread_trampoline(uintptr_t ctx) {
     mxr_thread_t* thread = (mxr_thread_t*)ctx;
 
     init_tls(thread);
@@ -140,7 +140,7 @@ static int thread_trampoline(void* ctx) {
     }
 
     mx_thread_exit();
-    return 0;
+    return;
 }
 
 // Local implementation so libruntime does not depend on libc.
@@ -162,14 +162,44 @@ mx_status_t mxr_thread_create(mxr_thread_entry_t entry, void* arg, const char* n
     thread->state_lock = MXR_MUTEX_INIT;
     thread->state = JOINABLE;
 
+    // TODO(kulakowski) Track process handle.
+    mx_handle_t self_handle = 0;
+
     if (name == NULL)
         name = "";
     size_t name_length = local_strlen(name) + 1;
-    mx_handle_t handle = mx_thread_create(thread_trampoline, thread, name, name_length);
+    mx_handle_t handle = mx_thread_create(self_handle, name, name_length, 0);
     if (handle < 0) {
         deallocate_thread_page(thread);
         return (mx_status_t)handle;
     }
+
+    // create a new stack for the first thread
+    const size_t stack_size = 64*1024;
+    mx_handle_t thread_stack_vmo = mx_vm_object_create(stack_size);
+    if (thread_stack_vmo < 0) {
+        deallocate_thread_page(thread);
+        mx_handle_close(handle);
+        return thread_stack_vmo;
+    }
+
+    // map it
+    uintptr_t stack_ptr;
+    status = mx_process_vm_map(self_handle, thread_stack_vmo, 0, stack_size, &stack_ptr, MX_VM_FLAG_PERM_READ | MX_VM_FLAG_PERM_WRITE);
+    mx_handle_close(thread_stack_vmo);
+    if (status < 0) {
+        deallocate_thread_page(thread);
+        mx_handle_close(handle);
+        return status;
+    }
+
+    status = mx_thread_start(handle, (uintptr_t)thread_trampoline, stack_ptr + stack_size, (uintptr_t)thread);
+    if (status < 0) {
+        deallocate_thread_page(thread);
+        mx_handle_close(handle);
+        return status;
+    }
+
     thread->handle = handle;
     *thread_out = thread;
     return NO_ERROR;

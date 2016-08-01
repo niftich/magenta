@@ -115,7 +115,7 @@ static void bootstrap(mx_handle_t log, struct options* o,
     mx_handle_t child_start_handle = pipeh[1];
 
     const char* filename = o->value[OPTION_FILENAME];
-    mx_handle_t proc = mx_process_create(filename, strlen(filename));
+    mx_handle_t proc = mx_process_create(filename, strlen(filename), 0);
     if (proc < 0)
         fail(log, proc, "mx_process_create failed\n");
 
@@ -141,7 +141,26 @@ static void bootstrap(mx_handle_t log, struct options* o,
     check(log, status, "mx_message_write to child failed\n");
     mx_handle_close(to_child);
 
-    status = mx_process_start(proc, child_start_handle, entry);
+    // create a new thread
+    const char *thread_name = "main";
+    mx_handle_t thread_handle = mx_thread_create(proc, thread_name, strlen(thread_name), 0);
+    if (thread_handle < 0)
+        fail(log, thread_handle, "mx_thread_create failed\n");
+
+    // create a new stack for the first thread
+    const size_t stack_size = 64*1024;
+    mx_handle_t thread_stack_vmo = mx_vm_object_create(stack_size);
+    if (thread_stack_vmo < 0)
+        fail(log, thread_handle, "mx_vm_object_create failed\n");
+
+    // map it
+    uintptr_t stack_ptr;
+    status = mx_process_vm_map(proc, thread_stack_vmo, 0, stack_size, &stack_ptr, MX_VM_FLAG_PERM_READ | MX_VM_FLAG_PERM_WRITE);
+    mx_handle_close(thread_stack_vmo);
+    if (status < 0)
+        fail(log, thread_handle, "mx_process_vm_map failed\n");
+
+    status = mx_process_start(proc, thread_handle, entry, stack_ptr + stack_size, child_start_handle);
     check(log, status, "mx_process_start failed\n");
 
     // TODO(mcgrathr): Really there is no reason for this process to stick

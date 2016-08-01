@@ -22,6 +22,7 @@
 #include <magenta/msg_pipe_dispatcher.h>
 #include <magenta/process_dispatcher.h>
 #include <magenta/processargs.h>
+#include <magenta/thread_dispatcher.h>
 #include <magenta/vm_object_dispatcher.h>
 
 #include "code-start.h"
@@ -254,7 +255,7 @@ static int attempt_userboot(const void* bootfs, size_t bfslen) {
 
     mx_rights_t rights;
     utils::RefPtr<Dispatcher> proc_disp;
-    status = ProcessDispatcher::Create("userboot", &proc_disp, &rights);
+    status = ProcessDispatcher::Create("userboot", &proc_disp, &rights, 0);
     if (status < 0)
         return status;
 
@@ -309,7 +310,38 @@ static int attempt_userboot(const void* bootfs, size_t bfslen) {
     }
 
     dprintf(SPEW, "userboot: %-23s @ %#" PRIxPTR "\n", "entry point", entry);
-    status = proc->Start((void*)(uintptr_t)hv, entry);
+
+    // create a user thread
+    utils::RefPtr<UserThread> t;
+    status  = proc->CreateUserThread("userboot", 0, &t);
+    if (status < 0)
+        return status;
+
+    utils::RefPtr<Dispatcher> thread_disp;
+    status = ThreadDispatcher::Create(t, &thread_disp, &rights);
+    if (status < 0)
+        return status;
+
+    auto thread = thread_disp->get_thread_dispatcher();
+    DEBUG_ASSERT(thread);
+
+    // make a handle for the new thread
+    proc->AddHandle(HandleUniquePtr(MakeHandle(utils::move(thread_disp), rights)));
+
+    // allocate a stack for it
+    const size_t stack_size = 16*PAGE_SIZE;
+    auto stack_vmo = VmObject::Create(PMM_ALLOC_FLAG_ANY, stack_size);
+    if (!stack_vmo)
+        return ERR_NO_MEMORY;
+
+    void *stack_ptr;
+    status = aspace->MapObject(stack_vmo, "stack", 0, stack_size, &stack_ptr, 0, 0, ARCH_MMU_FLAG_PERM_USER | ARCH_MMU_FLAG_PERM_NO_EXECUTE);
+    if (status < 0) {
+        return status;
+    }
+
+    // start the process
+    status = proc->Start(thread, entry, reinterpret_cast<uintptr_t>(stack_ptr) + stack_size, hv);
     if (status != NO_ERROR) {
         printf("userboot: failed to start process %d\n", status);
         return status;
@@ -318,6 +350,7 @@ static int attempt_userboot(const void* bootfs, size_t bfslen) {
     // hold onto a global ref to the boot process.
     // TODO(mcgrathr): This should go away eventually.
     userboot_process = utils::move(proc_disp);
+
     return NO_ERROR;
 }
 

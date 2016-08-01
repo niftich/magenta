@@ -20,12 +20,14 @@
 
 #include <magenta/futex_context.h>
 #include <magenta/magenta.h>
+#include <magenta/thread_dispatcher.h>
 #include <magenta/user_copy.h>
 
 #define LOCAL_TRACE 0
 
 static constexpr mx_rights_t kDefaultProcessRights = MX_RIGHT_READ  |
                                                      MX_RIGHT_WRITE |
+                                                     MX_RIGHT_DUPLICATE |
                                                      MX_RIGHT_TRANSFER;
 
 mutex_t ProcessDispatcher::global_process_list_mutex_ =
@@ -34,9 +36,9 @@ utils::DoublyLinkedList<ProcessDispatcher*> ProcessDispatcher::global_process_li
 
 mx_status_t ProcessDispatcher::Create(utils::StringPiece name,
                                       utils::RefPtr<Dispatcher>* dispatcher,
-                                      mx_rights_t* rights) {
+                                      mx_rights_t* rights, uint32_t flags) {
     AllocChecker ac;
-    auto process = new (&ac) ProcessDispatcher(name);
+    auto process = new (&ac) ProcessDispatcher(name, flags);
     if (!ac.check())
         return ERR_NO_MEMORY;
 
@@ -49,7 +51,7 @@ mx_status_t ProcessDispatcher::Create(utils::StringPiece name,
     return NO_ERROR;
 }
 
-ProcessDispatcher::ProcessDispatcher(utils::StringPiece name)
+ProcessDispatcher::ProcessDispatcher(utils::StringPiece name, uint32_t flags)
     : state_tracker_(true, mx_signals_state_t{0u, MX_SIGNAL_SIGNALED}) {
     LTRACE_ENTRY_OBJ;
 
@@ -99,40 +101,24 @@ status_t ProcessDispatcher::Initialize() {
     return NO_ERROR;
 }
 
-status_t ProcessDispatcher::Start(void* arg, mx_vaddr_t entry) {
-    LTRACE_ENTRY_OBJ;
+status_t ProcessDispatcher::Start(ThreadDispatcher *thread, uintptr_t entry, uintptr_t stack, mx_handle_t arg) {
+    LTRACEF("process %p thread %p, entry 0x%lx, stack 0x%lx, arg %d\n", this, thread, entry, stack, arg);
 
     // grab and hold the state lock across this entire routine, since we're
     // effectively transitioning from INITIAL to RUNNING
     AutoLock lock(state_lock_);
 
-    DEBUG_ASSERT(state_ == State::INITIAL);
-
     // make sure we're in the right state
-    if (state_ != State::INITIAL) {
-        TRACEF("ProcessDispatcher has not been loaded\n");
+    if (state_ != State::INITIAL)
         return ERR_BAD_STATE;
-    }
 
-    if (entry) {
-        entry_ = (thread_start_routine)entry;
-    }
-
-    // TODO: move the creation of the initial thread to user space
-    status_t result;
-    // create the first thread
-    utils::RefPtr<UserThread> t;
-    result = CreateUserThread("main", entry_, arg, &t);
-    if (result != NO_ERROR) {
-        SetState(State::DEAD);
-        return result;
-    }
-    // we're ready to run now
-    main_thread_ = t;
-    SetState(State::RUNNING);
-
+    // start the initial thread
     LTRACEF("starting main thread\n");
-    t->Start();
+    auto status = thread->Start(entry, stack, static_cast<uintptr_t>(arg));
+    if (status < 0)
+        return status;
+
+    SetState(State::RUNNING);
 
     return NO_ERROR;
 }
@@ -349,13 +335,11 @@ status_t ProcessDispatcher::GetInfo(mx_process_info_t* info) {
     return NO_ERROR;
 }
 
-status_t ProcessDispatcher::CreateUserThread(utils::StringPiece name,
-                                             thread_start_routine entry, void* arg,
-                                             utils::RefPtr<UserThread>* user_thread) {
+status_t ProcessDispatcher::CreateUserThread(utils::StringPiece name, uint32_t flags, utils::RefPtr<UserThread>* user_thread) {
     AllocChecker ac;
     auto ut = utils::AdoptRef(new (&ac) UserThread(GenerateKernelObjectId(),
                                                    utils::RefPtr<ProcessDispatcher>(this),
-                                                   entry, arg));
+                                                   flags));
     if (!ac.check())
         return ERR_NO_MEMORY;
 
