@@ -10,7 +10,7 @@ MODULES += \
 
 #	app/shell \
 
-
+ENABLE_BUILD_LISTFILES:=true
 EMBED_USER_BOOTFS:=true
 
 include project/virtual/user.mk

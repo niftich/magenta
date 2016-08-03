@@ -151,10 +151,10 @@ status_t unmask_interrupt(unsigned int vector)
             reg = INTC_ENABLE2;
         else
             reg = INTC_ENABLE1;
-        printf("vector = %x   reg=%lx\n",vector,reg);
-        printf("basic pending = %08x\n", *(uint32_t *)0xffffffffc000b200);
-        printf("irq1  pending = %08x\n", *(uint32_t *)0xffffffffc000b204);
-        printf("irq2  pending = %08x\n", *(uint32_t *)0xffffffffc000b208);
+        //printf("vector = %x   reg=%lx\n",vector,reg);
+        //printf("basic pending = %08x\n", *(uint32_t *)0xffffffffc000b200);
+        //printf("irq1  pending = %08x\n", *(uint32_t *)0xffffffffc000b204);
+        //printf("irq2  pending = %08x\n", *(uint32_t *)0xffffffffc000b208);
         *REG32(reg) = 1 << (vector % 32);
     } else {
         PANIC_UNIMPLEMENTED;

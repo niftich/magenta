@@ -95,7 +95,11 @@ int console_starter(void* arg) {
 #endif
 
 int main(int argc, char** argv) {
+    //printf("finally in devmgr \n");
+    //while (1) ;;
+
     devmgr_io_init();
+
     if (argc > 1) {
         return devicehost(argc, argv);
     }

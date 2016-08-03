@@ -252,6 +252,8 @@ static mx_status_t load_segment(mx_handle_t proc, mx_handle_t vmo,
                 mx_handle_close(copy_vmo);
                 return n;
             }
+            mx_vm_object_sync_cache(copy_vmo,0,data_size);
+
             vmo = copy_vmo;                 // Leak the handle.
             file_end -= file_start;
             file_start = 0;
@@ -304,6 +306,7 @@ static mx_status_t load_segment(mx_handle_t proc, mx_handle_t vmo,
             mx_handle_close(bss_vmo);
             return ERR_IO;
         }
+        mx_vm_object_sync_cache(bss_vmo,0,n);
     }
 
     mx_status_t status = mx_process_vm_map(proc, bss_vmo, 0,
@@ -326,8 +329,11 @@ mx_status_t elf_load_finish(mx_handle_t proc, elf_load_info_t* info,
     for (uint_fast16_t i = 0;
          status == NO_ERROR && i < info->e_phnum;
          ++i) {
-        if (info->phdrs[i].p_type == PT_LOAD)
+
+        if (info->phdrs[i].p_type == PT_LOAD) {
             status = load_segment(proc, vmo, bias, &info->phdrs[i]);
+        }
+        
     }
 
     return status;
