@@ -111,6 +111,7 @@ static inline void panic(void) {
 #define MX_PROTOCOL_ETHERNET 'pETH'
 #define MX_PROTOCOL_BLUETOOTH_HCI 'pBTH'
 #define MX_PROTOCOL_TPM 'pTPM'
+#define MX_PROTOCOL_INTEL_ME 'pIME'
 
 #define BUILTIN_DRIVER       \
     __ALIGNED(sizeof(void*)) \

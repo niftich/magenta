@@ -87,6 +87,9 @@
 #define BIND_USB_IFC_SUBCLASS 0x0206
 #define BIND_USB_IFC_PROTOCOL 0x0207
 
+// Intel ME binding variables at 0x03XX
+#define BIND_INTEL_ME_ADDR   0x0300
+
 typedef struct mx_bind_inst {
     uint32_t op;
     uint32_t arg;
