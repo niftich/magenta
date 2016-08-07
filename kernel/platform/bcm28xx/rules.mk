@@ -45,8 +45,10 @@ GLOBAL_DEFINES += \
     MEMSIZE=$(MEMSIZE) \
     MMU_WITH_TRAMPOLINE=1 \
 	BCM2837=1 \
-	PLATFORM_SUPPORTS_PANIC_SHELL=1 \
 	WITH_LIB_DEBUGLOG=1 \
+	PLATFORM_SUPPORTS_PANIC_SHELL=1 \
+	PLATFORM_NO_PCI_BUS=1 \
+
 
 MODULE_SRCS += \
 	$(LOCAL_DIR)/miniuart.c
@@ -61,8 +63,13 @@ MODULE_DEPS += \
     dev/virtio/rng \
 	dev/interrupt \
 	dev/pcie \
-	app/shell \
+
+
+#	app/shell \
 
 endif
 
 include make/module.mk
+
+#	PLATFORM_SUPPORTS_PANIC_SHELL=1 \
+

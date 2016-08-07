@@ -102,7 +102,6 @@ utils::RefPtr<VmObject> VmObject::Create(uint32_t pmm_alloc_flags, uint64_t size
 status_t VmObject::CacheSync(uint64_t offset, uint64_t len) {
    DEBUG_ASSERT(magic_ == MAGIC);
 
-    printf("Attempting cache sync at %llx of length %llx\n",offset,len);
     AutoLock a(lock_);
 
     // trim the size
@@ -128,8 +127,7 @@ status_t VmObject::CacheSync(uint64_t offset, uint64_t len) {
         paddr_t pa = vm_page_to_paddr(p);
         uint8_t* page_ptr = reinterpret_cast<uint8_t*>(paddr_to_kvaddr(pa));
 
-        // call the copy routine
-
+        // synch the memory
         arch_sync_cache_range((addr_t)(page_ptr + page_offset), tocopy);
         
         offset += tocopy;

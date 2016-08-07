@@ -103,6 +103,10 @@ static mx_status_t kpci_init_children(mx_driver_t* drv, mx_device_t* parent) {
 }
 
 static mx_status_t kpci_drv_init(mx_driver_t* drv) {
+
+#ifdef PLATFORM_NO_PCI_BUS  
+    return NO_ERROR;
+#else
     mx_status_t status;
 
     if ((status = device_create(&kpci_root_dev, drv, "pci", &kpci_device_proto))) {
@@ -118,6 +122,7 @@ static mx_status_t kpci_drv_init(mx_driver_t* drv) {
     } else {
         return kpci_init_children(drv, kpci_root_dev);
     }
+#endif
 }
 
 mx_driver_t _driver_kpci BUILTIN_DRIVER = {
@@ -126,6 +131,7 @@ mx_driver_t _driver_kpci BUILTIN_DRIVER = {
         .init = kpci_drv_init,
     },
 };
+
 
 mx_status_t devmgr_create_pcidev(mx_device_t** out, uint32_t index) {
     return kpci_init_child(&_driver_kpci, out, index);

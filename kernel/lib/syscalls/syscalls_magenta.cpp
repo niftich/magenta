@@ -704,7 +704,7 @@ mx_handle_t sys_process_create(const char* name, uint32_t name_len) {
     auto up = ProcessDispatcher::GetCurrent();
     mx_handle_t hv = up->MapHandleToValue(handle.get());
     up->AddHandle(utils::move(handle));
-    TRACEF("new proces created =>%s   handle=%llx\n",name,(uint64_t)hv);
+    LTRACEF("new proces created =>%s   handle=%llx\n",name,(uint64_t)hv);
     return hv;
 }
 
@@ -734,7 +734,7 @@ mx_status_t sys_process_start(mx_handle_t handle_value, mx_handle_t arg_handle_v
 
     arch_aspace_t& aspace2 = aspace->arch_aspace();
 
-    TRACEF("Process aspace tt_phys=%llx  tt_virt=%llx  @%llx\n",(uint64_t)aspace2.tt_phys, (uint64_t)(aspace2.tt_virt),(uint64_t)&aspace2);
+    LTRACEF("Process aspace tt_phys=%llx  tt_virt=%llx  @%llx\n",(uint64_t)aspace2.tt_phys, (uint64_t)(aspace2.tt_virt),(uint64_t)&aspace2);
 
 
 
@@ -1021,7 +1021,7 @@ mx_status_t sys_process_vm_map(mx_handle_t proc_handle, mx_handle_t vmo_handle,
 
         // get the address space out of the process dispatcher
         aspace = process->aspace();
-        aspace->Dump();
+
         if (!aspace)
             return ERR_INVALID_ARGS;
     }
@@ -1031,15 +1031,11 @@ mx_status_t sys_process_vm_map(mx_handle_t proc_handle, mx_handle_t vmo_handle,
     if (copy_from_user(&ptr, reinterpret_cast<uint8_t*>(user_ptr), sizeof(ptr)) != NO_ERROR)
         return ERR_INVALID_ARGS;
 
-    //printf("%lx-----user pointer at %lx ->%lx\n",proc_handle,ptr,*user_ptr);
     // do the map call
     mx_status_t status = vmo->Map(utils::move(aspace), vmo_rights, offset, len, &ptr, flags);
     if (status != NO_ERROR)
         return status;
 
-    //aspace->Dump();
-
-    //printf("%lx*****user pointer at %lx ->%lx\n",proc_handle,ptr,*user_ptr);
     // copy the user pointer back
     if (copy_to_user(reinterpret_cast<uint8_t*>(user_ptr), &ptr, sizeof(ptr)) != NO_ERROR)
         return ERR_INVALID_ARGS;

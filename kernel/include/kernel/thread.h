@@ -70,7 +70,7 @@ enum thread_tls_list {
 
 #define THREAD_NAME_LENGTH 64
 
-#define THREAD_LINEBUFFER_LENGTH 128
+#define THREAD_LINEBUFFER_LENGTH 158
 
 typedef struct thread {
     int magic;
