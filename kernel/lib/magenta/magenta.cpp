@@ -20,8 +20,11 @@
 #include <magenta/process_dispatcher.h>
 #include <magenta/state_tracker.h>
 
+#ifdef WITH_DEV_PCIE
 // The next two includes should be removed. See DeleteHandle().
 #include <magenta/pci_interrupt_dispatcher.h>
+#endif
+
 #include <magenta/io_mapping_dispatcher.h>
 
 #include <utils/arena.h>
@@ -69,8 +72,10 @@ void DeleteHandle(Handle* handle) {
         // have complicated Close() logic which cannot be untangled at
         // this time.
         switch (disp->GetType()) {
+#ifdef WITH_DEV_PCIE
             case MX_OBJ_TYPE_PCI_INT: disp->get_pci_interrupt_dispatcher()->Close();
                 break;
+#endif
             case MX_OBJ_TYPE_IOMAP: disp->get_io_mapping_dispatcher()->Close();
                 break;
             default:  break;

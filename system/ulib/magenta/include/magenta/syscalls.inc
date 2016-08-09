@@ -145,6 +145,7 @@ MAGENTA_DDKCALL_DEF(4, 4, 170, mx_status_t, bootloader_fb_get_info, uint32_t* fo
 MAGENTA_DDKCALL_DEF(6, 6, 171, mx_status_t, set_framebuffer, void* vaddr, uint32_t len, uint32_t format,
                     uint32_t width, uint32_t height, uint32_t stride)
 
+#ifdef WITH_DEV_PCIE
 // temporary pci syscalls
 // TODO: remove when the pci driver moves to user space
 MAGENTA_DDKCALL_DEF(2, 2, 180, mx_handle_t, pci_get_nth_device, uint32_t index,
@@ -165,6 +166,7 @@ MAGENTA_DDKCALL_DEF(4, 4, 190, mx_status_t, pci_query_irq_mode_caps, mx_handle_t
                     mx_pci_irq_mode_t mode, uint32_t* out_max_irqs)
 MAGENTA_DDKCALL_DEF(4, 4, 191, mx_status_t, pci_set_irq_mode, mx_handle_t handle, mx_pci_irq_mode_t mode,
                     uint32_t requested_irq_count)
+#endif
 
 // I/O mapping objects
 MAGENTA_DDKCALL_DEF(3, 3, 200, mx_status_t, io_mapping_get_info, mx_handle_t handle, void** out_vaddr,

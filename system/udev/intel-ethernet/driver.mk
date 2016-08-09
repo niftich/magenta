@@ -14,6 +14,8 @@
 
 LOCAL_DIR := $(GET_LOCAL_DIR)
 
+ifeq ($(WITH_DEV_PCIE),1)
 DRIVER_SRCS += \
     $(LOCAL_DIR)/ethernet.c \
     $(LOCAL_DIR)/ie.c
+endif

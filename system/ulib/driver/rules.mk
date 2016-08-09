@@ -28,9 +28,15 @@ MODULE_SRCS := \
 	$(LOCAL_DIR)/binding.c \
 	$(LOCAL_DIR)/rpc-device.c \
 	$(LOCAL_DIR)/api.c \
+	$(LOCAL_DIR)/main.c \
+
+ifeq ($(WITH_DEV_PCIE),1)
+MODULE_SRCS := \
 	system/udev/kpci/kpci.c \
 	system/udev/kpci/protocol.c \
-	$(LOCAL_DIR)/main.c \
+
+endif
+
 
 MODULE_HEADER_DEPS := ulib/ddk
 

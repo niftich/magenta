@@ -18,8 +18,13 @@
 
 #include <magenta/interrupt_dispatcher.h>
 #include <magenta/magenta.h>
+#if WITH_DEV_PCIE
 #include <magenta/pci_device_dispatcher.h>
 #include <magenta/pci_interrupt_dispatcher.h>
+#endif
+
+#include <magenta/io_mapping_dispatcher.h>
+
 #include <magenta/process_dispatcher.h>
 #include <magenta/user_copy.h>
 
@@ -178,7 +183,7 @@ mx_status_t sys_set_framebuffer(void* vaddr, uint32_t len, uint32_t format, uint
 
     return NO_ERROR;
 }
-
+#if WITH_DEV_PCIE
 mx_handle_t sys_pci_get_nth_device(uint32_t index, mx_pcie_get_nth_info_t* out_info) {
     /**
      * Returns the pci config of a device.
@@ -515,7 +520,7 @@ mx_status_t sys_pci_set_irq_mode(mx_handle_t handle,
 
     return pci_device->SetIrqMode(mode, requested_irq_count);
 }
-
+#endif
 /**
  * Gets info about an I/O mapping object.
  * @param handle Handle associated with an I/O mapping object.

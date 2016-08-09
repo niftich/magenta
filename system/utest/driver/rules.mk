@@ -18,9 +18,11 @@ MODULE := $(LOCAL_DIR)
 
 MODULE_TYPE := userapp-static
 
+ifeq ($(WITH_DEV_PCIE),1)
 MODULE_SRCS := \
     system/udev/intel-ethernet/ethernet.c \
     system/udev/intel-ethernet/ie.c
+endif
 
 MODULE_NAME := test-driver
 

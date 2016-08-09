@@ -27,9 +27,6 @@ MODULE_SRCS := \
     $(LOCAL_DIR)/magenta.cpp \
     $(LOCAL_DIR)/msg_pipe_dispatcher.cpp \
     $(LOCAL_DIR)/msg_pipe.cpp \
-    $(LOCAL_DIR)/pci_device_dispatcher.cpp \
-    $(LOCAL_DIR)/pci_interrupt_dispatcher.cpp \
-    $(LOCAL_DIR)/pci_io_mapping_dispatcher.cpp \
     $(LOCAL_DIR)/process_dispatcher.cpp \
     $(LOCAL_DIR)/state_tracker.cpp \
     $(LOCAL_DIR)/thread_dispatcher.cpp \
@@ -39,6 +36,15 @@ MODULE_SRCS := \
     $(LOCAL_DIR)/wait_event.cpp \
     $(LOCAL_DIR)/wait_set_dispatcher.cpp \
     $(LOCAL_DIR)/wait_state_observer.cpp \
+
+ifeq ($(WITH_DEV_PCIE),1)
+MODULE_SRCS := \
+    $(LOCAL_DIR)/pci_device_dispatcher.cpp \
+    $(LOCAL_DIR)/pci_interrupt_dispatcher.cpp \
+    $(LOCAL_DIR)/pci_io_mapping_dispatcher.cpp \
+ 
+endif
+
 
 MODULE_DEPS := \
     lib/dpc \

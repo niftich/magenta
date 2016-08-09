@@ -58,6 +58,7 @@ int devicehost(int argc, char** argv) {
     if (argc != 3) {
         return -1;
     }
+#ifdef WITH_DEV_PCI
     if (!strncmp(argv[1], "pci=", 4)) {
         uint32_t index = strtoul(argv[1] + 4, NULL, 10);
 
@@ -72,6 +73,7 @@ int devicehost(int argc, char** argv) {
         devmgr_init_builtin_drivers();
         devmgr_handle_messages();
     }
+#endif
     printf("devhost: exiting\n");
     return 0;
 }
