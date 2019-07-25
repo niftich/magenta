@@ -1,4 +1,4 @@
-#include "libc.h"
+#include <stddef.h>
 #include <wctype.h>
 
 #define CASEMAP(u1, u2, l) \
@@ -258,14 +258,3 @@ wint_t towupper(wint_t wc) {
 wint_t towlower(wint_t wc) {
     return __towcase(wc, 1);
 }
-
-wint_t __towupper_l(wint_t c, locale_t l) {
-    return towupper(c);
-}
-
-wint_t __towlower_l(wint_t c, locale_t l) {
-    return towlower(c);
-}
-
-weak_alias(__towupper_l, towupper_l);
-weak_alias(__towlower_l, towlower_l);

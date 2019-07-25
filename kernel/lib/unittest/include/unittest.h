@@ -86,7 +86,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#include <compiler.h>
+#include <magenta/compiler.h>
 #include <trace.h>
 
 __BEGIN_CDECLS
@@ -96,12 +96,6 @@ __BEGIN_CDECLS
  * the default output is the printf
  */
 int unittest_printf(const char* format, ...);
-
-/*
- * Function to set the FILE target for printing
- * the unit test output.
- */
-void unittest_set_output_file_target(FILE* target);
 
 /*
  * Macros to format the error string

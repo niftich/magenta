@@ -33,12 +33,12 @@ void cbuf_initialize_etc(cbuf_t *cbuf, size_t len, void *buf)
 
     cbuf->head = 0;
     cbuf->tail = 0;
-    cbuf->len_pow2 = log2_uint(len);
+    cbuf->len_pow2 = log2_uint_floor(len);
     cbuf->buf = buf;
     event_init(&cbuf->event, false, 0);
     spin_lock_init(&cbuf->lock);
 
-    LTRACEF("len %zd, len_pow2 %u\n", len, cbuf->len_pow2);
+    LTRACEF("len %zu, len_pow2 %u\n", len, cbuf->len_pow2);
 }
 
 size_t cbuf_space_avail(cbuf_t *cbuf)
@@ -56,7 +56,7 @@ size_t cbuf_write_etc(cbuf_t *cbuf, const void *_buf, size_t len, uint32_t flags
 {
     const char *buf = (const char *)_buf;
 
-    LTRACEF("len %zd\n", len);
+    LTRACEF("len %zu\n", len);
 
     DEBUG_ASSERT(cbuf);
     DEBUG_ASSERT(len < valpow2(cbuf->len_pow2));
@@ -69,8 +69,17 @@ size_t cbuf_write_etc(cbuf_t *cbuf, const void *_buf, size_t len, uint32_t flags
 
     while (pos < len && cbuf_space_avail(cbuf) > 0) {
         if (cbuf->head >= cbuf->tail) {
-            write_len = MIN(valpow2(cbuf->len_pow2) - cbuf->head, len - pos);
+            if (cbuf->tail == 0) {
+                // Special case - if tail is at position 0, we can't write all
+                // the way to the end of the buffer. Otherwise, head ends up at
+                // 0, head == tail, and buffer is considered "empty" again.
+                write_len = MIN(valpow2(cbuf->len_pow2) - cbuf->head - 1, len - pos);
+            } else {
+                // Write to the end of the buffer.
+                write_len = MIN(valpow2(cbuf->len_pow2) - cbuf->head, len - pos);
+            }
         } else {
+            // Write from head to tail-1.
             write_len = MIN(cbuf->tail - cbuf->head - 1, len - pos);
         }
 
@@ -91,14 +100,14 @@ size_t cbuf_write_etc(cbuf_t *cbuf, const void *_buf, size_t len, uint32_t flags
         pos += write_len;
     }
 
-    int signalled = 0;
+    int signaled = 0;
     if (cbuf->head != cbuf->tail)
-        signalled = event_signal(&cbuf->event, false);
+        signaled = event_signal(&cbuf->event, false);
 
     spin_unlock_irqrestore(&cbuf->lock, state);
 
-    if ((flags & CBUF_WRITE_FLAG_CANRESCHEDULE) && (signalled > 0))
-        thread_preempt();
+    if ((flags & CBUF_WRITE_FLAG_CANRESCHEDULE) && (signaled > 0))
+        thread_preempt(false);
 
     return pos;
 }
@@ -206,7 +215,7 @@ size_t cbuf_write_char(cbuf_t *cbuf, char c, bool canreschedule)
     spin_lock_irqsave(&cbuf->lock, state);
 
     size_t ret = 0;
-    int signalled = 0;
+    int signaled = 0;
     if (cbuf_space_avail(cbuf) > 0) {
         cbuf->buf[cbuf->head] = c;
 
@@ -214,13 +223,13 @@ size_t cbuf_write_char(cbuf_t *cbuf, char c, bool canreschedule)
         ret = 1;
 
         if (cbuf->head != cbuf->tail)
-            signalled = event_signal(&cbuf->event, false);
+            signaled = event_signal(&cbuf->event, false);
     }
 
     spin_unlock_irqrestore(&cbuf->lock, state);
 
-    if (canreschedule && (signalled > 0))
-        thread_preempt();
+    if (canreschedule && (signaled > 0))
+        thread_preempt(false);
 
     return ret;
 }

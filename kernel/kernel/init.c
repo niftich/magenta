@@ -5,22 +5,16 @@
 // license that can be found in the LICENSE file or at
 // https://opensource.org/licenses/MIT
 
-#include <compiler.h>
+#include <magenta/compiler.h>
 #include <debug.h>
-#include <kernel/debug.h>
 #include <kernel/thread.h>
 #include <kernel/timer.h>
 #include <kernel/mp.h>
-#include <kernel/port.h>
+
+void kernel_init(void);
 
 void kernel_init(void)
 {
-    // if enabled, configure kernel log
-    kernel_log_init();
-
-    // if enabled, configure the kernel's event log
-    kernel_evlog_init();
-
     // initialize the threading system
     dprintf(SPEW, "initializing mp\n");
     mp_init();
@@ -32,9 +26,5 @@ void kernel_init(void)
     // initialize kernel timers
     dprintf(SPEW, "initializing timers\n");
     timer_init();
-
-    // initialize ports
-    dprintf(SPEW, "initializing ports\n");
-    port_init();
 }
 

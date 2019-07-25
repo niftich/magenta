@@ -10,7 +10,7 @@
  * Main entry point to the OS. Initializes modules in order and creates
  * the default thread.
  */
-#include <compiler.h>
+#include <magenta/compiler.h>
 #include <debug.h>
 #include <string.h>
 #include <app.h>
@@ -23,11 +23,8 @@
 #include <lk/init.h>
 #include <lk/main.h>
 
-/* saved boot arguments from whoever loaded the system */
-ulong lk_boot_args[4];
-
-extern void *__ctor_list;
-extern void *__ctor_end;
+extern void (*const __init_array_start[])(void);
+extern void (*const __init_array_end[])(void);
 extern int __bss_start;
 extern int _end;
 
@@ -41,30 +38,18 @@ extern void kernel_init(void);
 
 static void call_constructors(void)
 {
-    void **ctor;
-
-    ctor = &__ctor_list;
-    while (ctor != &__ctor_end) {
-        void (*func)(void);
-
-        func = (void ( *)(void))*ctor;
-
-        func();
-        ctor++;
-    }
+    for (void (*const *a)(void) = __init_array_start; a != __init_array_end; a++)
+        (*a)();
 }
 
 /* called from arch code */
-void lk_main(ulong arg0, ulong arg1, ulong arg2, ulong arg3)
+void lk_main(void)
 {
-    // save the boot args
-    lk_boot_args[0] = arg0;
-    lk_boot_args[1] = arg1;
-    lk_boot_args[2] = arg2;
-    lk_boot_args[3] = arg3;
-
     // get us into some sort of thread context
     thread_init_early();
+
+    // deal with any static constructors
+    call_constructors();
 
     // early arch stuff
     lk_primary_cpu_init_level(LK_INIT_LEVEL_EARLIEST, LK_INIT_LEVEL_ARCH_EARLY - 1);
@@ -83,17 +68,11 @@ void lk_main(ulong arg0, ulong arg1, ulong arg2, ulong arg3)
 #else
     dprintf(INFO, "\nwelcome to lk\n\n");
 #endif
-    dprintf(INFO, "boot args 0x%lx 0x%lx 0x%lx 0x%lx\n",
-            lk_boot_args[0], lk_boot_args[1], lk_boot_args[2], lk_boot_args[3]);
 
     // bring up the kernel heap
     lk_primary_cpu_init_level(LK_INIT_LEVEL_TARGET_EARLY, LK_INIT_LEVEL_HEAP - 1);
     dprintf(SPEW, "initializing heap\n");
     heap_init();
-
-    // deal with any static constructors
-    dprintf(SPEW, "calling constructors\n");
-    call_constructors();
 
     // initialize the kernel
     lk_primary_cpu_init_level(LK_INIT_LEVEL_HEAP, LK_INIT_LEVEL_KERNEL - 1);
@@ -144,31 +123,31 @@ void lk_secondary_cpu_entry(void)
     uint cpu = arch_curr_cpu_num();
 
     if (cpu > secondary_idle_thread_count) {
-        dprintf(CRITICAL, "Invalid secondary cpu num %d, SMP_MAX_CPUS %d, secondary_idle_thread_count %d\n",
+        dprintf(CRITICAL, "Invalid secondary cpu num %u, SMP_MAX_CPUS %d, secondary_idle_thread_count %u\n",
                 cpu, SMP_MAX_CPUS, secondary_idle_thread_count);
         return;
     }
 
-    dprintf(SPEW, "running final init tasks on cpu %d\n", cpu);
+    dprintf(SPEW, "running final init tasks on cpu %u\n", cpu);
     /* secondary cpu initialize from threading level up. 0 to threading was handled in arch */
     lk_init_level(LK_INIT_FLAG_SECONDARY_CPUS, LK_INIT_LEVEL_THREADING, LK_INIT_LEVEL_LAST);
 
-    dprintf(SPEW, "entering scheduler on cpu %d\n", cpu);
+    dprintf(SPEW, "entering scheduler on cpu %u\n", cpu);
     thread_secondary_cpu_entry();
 }
 
 void lk_init_secondary_cpus(uint secondary_cpu_count)
 {
     if (secondary_cpu_count >= SMP_MAX_CPUS) {
-        dprintf(CRITICAL, "Invalid secondary_cpu_count %d, SMP_MAX_CPUS %d\n",
+        dprintf(CRITICAL, "Invalid secondary_cpu_count %u, SMP_MAX_CPUS %d\n",
                 secondary_cpu_count, SMP_MAX_CPUS);
         secondary_cpu_count = SMP_MAX_CPUS - 1;
     }
     for (uint i = 0; i < secondary_cpu_count; i++) {
-        dprintf(SPEW, "creating idle thread for cpu %d\n", i + 1);
+        dprintf(SPEW, "creating idle thread for cpu %u\n", i + 1);
         thread_t *t = thread_create_idle_thread(i + 1);
         if (!t) {
-            dprintf(CRITICAL, "could not allocate idle thread %d\n", i + 1);
+            dprintf(CRITICAL, "could not allocate idle thread %u\n", i + 1);
             secondary_idle_thread_count = i;
             break;
         }

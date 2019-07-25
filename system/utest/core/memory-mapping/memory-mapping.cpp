@@ -1,21 +1,13 @@
-// Copyright 2016 The Fuchsia Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
 
 #include <errno.h>
 #include <unistd.h>
 
+#include <magenta/process.h>
 #include <magenta/syscalls.h>
+#include <magenta/syscalls/object.h>
 #include <unittest/unittest.h>
 #include <sys/mman.h>
 
@@ -41,7 +33,8 @@ bool address_space_limits_test() {
 
 #if defined(__x86_64__)
     size_t page_size = getpagesize();
-    mx_handle_t vmo = mx_vm_object_create(page_size);
+    mx_handle_t vmo;
+    EXPECT_EQ(mx_vmo_create(page_size, 0, &vmo), NO_ERROR, "");
     EXPECT_LT(0, vmo, "vm_object_create");
 
     // This is the lowest non-canonical address on x86-64.  We want to
@@ -51,32 +44,42 @@ bool address_space_limits_test() {
     uintptr_t noncanon_addr =
         ((uintptr_t) 1) << (x86_linear_address_width() - 1);
 
+    mx_info_vmar_t vmar_info;
+    mx_status_t status = mx_object_get_info(mx_vmar_root_self(), MX_INFO_VMAR,
+                                            &vmar_info, sizeof(vmar_info),
+                                            NULL, NULL);
+    EXPECT_EQ(NO_ERROR, status, "get_info");
+
     // Check that we cannot map a page ending at |noncanon_addr|.
-    uintptr_t addr = noncanon_addr - page_size;
-    mx_status_t status = mx_process_vm_map(
-        0, vmo, 0, page_size, &addr,
-        MX_VM_FLAG_PERM_READ | MX_VM_FLAG_PERM_WRITE | MX_VM_FLAG_FIXED);
-    EXPECT_EQ(ERR_NO_MEMORY, status, "vm_map");
+    size_t offset = noncanon_addr - page_size - vmar_info.base;
+    uintptr_t addr;
+    status = mx_vmar_map(
+        mx_vmar_root_self(), offset, vmo, 0, page_size,
+        MX_VM_FLAG_PERM_READ | MX_VM_FLAG_PERM_WRITE | MX_VM_FLAG_SPECIFIC,
+        &addr);
+    EXPECT_EQ(ERR_INVALID_ARGS, status, "vm_map");
 
     // Check that we can map at the next address down.  This helps to
     // verify that the previous check didn't fail for some unexpected
     // reason.
-    addr = noncanon_addr - page_size * 2;
-    status = mx_process_vm_map(
-        0, vmo, 0, page_size, &addr,
-        MX_VM_FLAG_PERM_READ | MX_VM_FLAG_PERM_WRITE | MX_VM_FLAG_FIXED);
+    offset = noncanon_addr - page_size * 2 - vmar_info.base;
+    status = mx_vmar_map(
+        mx_vmar_root_self(), offset, vmo, 0, page_size,
+        MX_VM_FLAG_PERM_READ | MX_VM_FLAG_PERM_WRITE | MX_VM_FLAG_SPECIFIC,
+        &addr);
     EXPECT_EQ(NO_ERROR, status, "vm_map");
 
-    // Check that MX_VM_FLAG_FIXED fails on already-mapped locations.
+    // Check that MX_VM_FLAG_SPECIFIC fails on already-mapped locations.
     // Otherwise, the previous mapping could have overwritten
     // something that was in use, which could cause problems later.
-    status = mx_process_vm_map(
-        0, vmo, 0, page_size, &addr,
-        MX_VM_FLAG_PERM_READ | MX_VM_FLAG_PERM_WRITE | MX_VM_FLAG_FIXED);
+    status = mx_vmar_map(
+        mx_vmar_root_self(), offset, vmo, 0, page_size,
+        MX_VM_FLAG_PERM_READ | MX_VM_FLAG_PERM_WRITE | MX_VM_FLAG_SPECIFIC,
+        &addr);
     EXPECT_EQ(ERR_NO_MEMORY, status, "vm_map");
 
     // Clean up.
-    status = mx_process_vm_unmap(0, addr, 0);
+    status = mx_vmar_unmap(mx_vmar_root_self(), addr, page_size);
     EXPECT_EQ(NO_ERROR, status, "vm_unmap");
     status = mx_handle_close(vmo);
     EXPECT_EQ(NO_ERROR, status, "handle_close");
@@ -169,23 +172,24 @@ bool mprotect_test() {
     uint32_t* addr = (uint32_t*)mmap(NULL, sizeof(uint32_t), PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANON, -1, 0);
     ASSERT_NEQ(MAP_FAILED, addr, "mmap failed to map");
 
+    int page_size = getpagesize();
     // Should be able to write.
     *addr = 10;
     EXPECT_EQ(10u, *addr, "read after write failed");
 
-    int status = mprotect(addr, sizeof(uint32_t), PROT_READ);
+    int status = mprotect(addr, page_size, PROT_READ);
     EXPECT_EQ(0, status, "mprotect failed to downgrade to read-only");
 
     // TODO: catch page fault exceptions and confirm that the following line
     // fails
     //*addr = 12;
 
-    status = mprotect(addr, sizeof(uint32_t), PROT_WRITE);
+    status = mprotect(addr, page_size, PROT_WRITE);
     auto test_errno = errno;
     EXPECT_EQ(-1, status, "mprotect should fail for write-only");
     EXPECT_EQ(ENOTSUP, test_errno, "mprotect should return ENOTSUP for write-only");
 
-    status = mprotect(addr, sizeof(uint32_t), PROT_NONE);
+    status = mprotect(addr, page_size, PROT_NONE);
     test_errno = errno;
     EXPECT_EQ(-1, status, "mprotect should fail for PROT_NONE");
     EXPECT_EQ(ENOTSUP, test_errno, "mprotect should return ENOTSUP for PROT_NONE");

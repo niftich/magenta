@@ -1,18 +1,26 @@
-// Copyright 2016 The Fuchsia Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
 
-#define BLOCK_OP_GET_SIZE      1
-#define BLOCK_OP_GET_BLOCKSIZE 2
-#define BLOCK_OP_GET_GUID      3
-#define BLOCK_OP_GET_NAME      4
+#pragma once
+
+#include <ddk/driver.h>
+#include <magenta/device/block.h>
+
+typedef struct block_callbacks {
+    void (*complete)(void* cookie, mx_status_t status);
+} block_callbacks_t;
+
+typedef struct block_ops {
+    // Identify how the block device can propagate certain information, such as
+    // "operation completed".
+    void (*set_callbacks)(mx_device_t* dev, block_callbacks_t* cb);
+    // Get information about the underlying block device
+    void (*get_info)(mx_device_t* dev, block_info_t* info);
+    // Read to the VMO from the block device
+    void (*read)(mx_device_t* dev, mx_handle_t vmo, uint64_t length, uint64_t vmo_offset,
+                 uint64_t dev_offset, void* cookie);
+    // Write from the VMO to the block device
+    void (*write)(mx_device_t* dev, mx_handle_t vmo, uint64_t length, uint64_t vmo_offset,
+                  uint64_t dev_offset, void* cookie);
+} block_ops_t;

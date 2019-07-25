@@ -13,7 +13,7 @@ namespace {
 bool instantiate(void*) {
     BEGIN_TEST;
 
-    { Hash256 hash(); }
+    { Hash256 hash; }
 
     END_TEST;
 }
@@ -95,6 +95,6 @@ UNITTEST_START_TESTCASE(hash256_tests)
 UNITTEST("Instantiate", instantiate)
 UNITTEST("Compute", compute_hashes)
 UNITTEST_END_TESTCASE(hash256_tests, "sha256", "Test SHA256 implementation Tests",
-                      NULL, NULL);
+                      nullptr, nullptr);
 
 } // namespace crypto

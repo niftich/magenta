@@ -11,37 +11,24 @@ MODULE := $(LOCAL_DIR)
 
 MODULE_SRCS := \
     $(LOCAL_DIR)/userboot.cpp \
-    $(LOCAL_DIR)/vdso.S
+    $(LOCAL_DIR)/userboot-image.S \
 
-ifeq ($(call TOBOOL,$(EMBED_USER_BOOTFS)),true)
-MODULE_SRCDEPS += $(USER_BOOTFS)
-MODULE_DEFINES += EMBED_USER_BOOTFS=1
-MODULE_COMPILEFLAGS += -DUSER_BOOTFS_FILENAME="\"$(USER_BOOTFS)\""
-MODULE_SRCS += $(LOCAL_DIR)/bootfs.S
-endif
+MODULE_DEPS := kernel/lib/vdso
 
-vdso-filename := $(BUILDDIR)/ulib/magenta/libmagenta.so
-userboot-filename := $(BUILDDIR)/uapp/userboot/libuserboot.so
+userboot-filename := $(BUILDDIR)/system/core/userboot/libuserboot.so
 
-# vdso.S embeds those two files, so building it depends on them.
-MODULE_SRCDEPS += $(vdso-filename).strip $(userboot-filename).strip
-MODULE_COMPILEFLAGS += \
-    -DVDSO_FILENAME='"$(vdso-filename).strip"' \
-    -DUSERBOOT_FILENAME='"$(userboot-filename).strip"'
+# userboot-image.S embeds this file, so building depends on it.
+MODULE_SRCDEPS += $(userboot-filename).strip
 
 # This generated header file tells the userboot.cpp code
 # where the segment boundaries and entry points are.
-MODULE_SRCDEPS += $(BUILDDIR)/$(LOCAL_DIR)/code-start.h
-$(BUILDDIR)/$(LOCAL_DIR)/code-start.h: \
-    scripts/rodso-code.sh $(vdso-filename) $(userboot-filename)
+MODULE_SRCDEPS += $(BUILDDIR)/$(LOCAL_DIR)/userboot-code.h
+$(BUILDDIR)/$(LOCAL_DIR)/userboot-code.h: scripts/gen-rodso-code.sh $(userboot-filename)
 	@$(MKDIR)
-	@echo generating $@
-	$(NOECHO)$< '$(NM)' \
-	    VDSO $(BUILDDIR)/ulib/magenta/libmagenta.so \
-	    USERBOOT $(BUILDDIR)/uapp/userboot/libuserboot.so \
-	    > $@.new
+	$(call BUILDECHO,generating $@)
+	$(NOECHO)$(SHELLEXEC) $< '$(NM)' $@.new USERBOOT $(userboot-filename)
 	@mv -f $@.new $@
-GENERATED += $(BUILDDIR)/$(LOCAL_DIR)/code-start.h
+GENERATED += $(BUILDDIR)/$(LOCAL_DIR)/userboot-code.h
 MODULE_COMPILEFLAGS += -I$(BUILDDIR)/$(LOCAL_DIR)
 
 include make/module.mk

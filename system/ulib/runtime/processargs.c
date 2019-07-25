@@ -1,16 +1,6 @@
-// Copyright 2016 The Fuchsia Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
 
 #include <runtime/processargs.h>
 
@@ -31,10 +21,10 @@ mx_status_t mxr_processargs_read(mx_handle_t bootstrap,
     if ((uintptr_t)buffer % alignof(mx_proc_args_t) != 0)
         return ERR_INVALID_ARGS;
 
-    uint32_t got_bytes = nbytes;
-    uint32_t got_handles = nhandles;
-    mx_status_t status = mx_message_read(bootstrap, buffer, &got_bytes,
-                                         handles, &got_handles, 0);
+    uint32_t got_bytes = 0;
+    uint32_t got_handles = 0;
+    mx_status_t status = _mx_channel_read(bootstrap, 0, buffer, handles, nbytes,
+                                          nhandles, &got_bytes, &got_handles);
     if (status != NO_ERROR)
         return status;
     if (got_bytes != nbytes || got_handles != nhandles)
@@ -77,19 +67,23 @@ static mx_status_t unpack_strings(char* buffer, uint32_t bytes, char* result[],
                 return MALFORMED;
         } while (*p++ != '\0');
     }
+    result[num] = NULL;
     return NO_ERROR;
 }
 
 mx_status_t mxr_processargs_strings(void* msg, uint32_t bytes,
-                                    char* argv[], char* envp[]) {
+                                    char* argv[], char* envp[], char* names[]) {
     mx_proc_args_t* const pa = msg;
     mx_status_t status = NO_ERROR;
-    if (argv != NULL)
+    if (argv != NULL) {
         status = unpack_strings(msg, bytes, argv, pa->args_off, pa->args_num);
+    }
     if (envp != NULL && status == NO_ERROR) {
-        envp[pa->environ_num] = NULL;
         status = unpack_strings(msg, bytes, envp,
                                 pa->environ_off, pa->environ_num);
+    }
+    if (names != NULL && status == NO_ERROR) {
+        status = unpack_strings(msg, bytes, names, pa->names_off, pa->names_num);
     }
     return status;
 }

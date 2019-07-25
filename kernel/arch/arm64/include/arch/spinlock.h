@@ -9,7 +9,7 @@
 
 #include <arch/ops.h>
 #include <stdbool.h>
-#include <compiler.h>
+#include <magenta/compiler.h>
 
 __BEGIN_CDECLS
 
@@ -32,6 +32,10 @@ static inline void arch_spin_lock(spin_lock_t *lock)
 
 static inline int arch_spin_trylock(spin_lock_t *lock)
 {
+    if (*lock)
+        return 1;
+
+    *lock = 1;
     return 0;
 }
 

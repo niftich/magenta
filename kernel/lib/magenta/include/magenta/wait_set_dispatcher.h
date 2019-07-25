@@ -8,7 +8,7 @@
 
 #include <stdint.h>
 
-#include <kernel/cond.h>
+#include <kernel/event.h>
 #include <kernel/mutex.h>
 
 #include <magenta/dispatcher.h>
@@ -17,16 +17,16 @@
 
 #include <sys/types.h>
 
-#include <utils/intrusive_double_list.h>
-#include <utils/intrusive_hash_table.h>
-#include <utils/ref_ptr.h>
-#include <utils/unique_ptr.h>
+#include <mxtl/canary.h>
+#include <mxtl/intrusive_double_list.h>
+#include <mxtl/intrusive_wavl_tree.h>
+#include <mxtl/ref_ptr.h>
+#include <mxtl/unique_ptr.h>
 
 class WaitSetDispatcher final : public Dispatcher, public StateObserver {
 public:
-    // A wait set entry. It may be in two linked lists: it is always in a doubly-linked list in the
-    // hash table |entries_| (which owns it) and it is sometimes in the doubly-linked list
-    // |triggered_entries_|.
+    // A wait set entry. It is always in the tree |entries_| (which owns it) and it is sometimes in
+    // the doubly-linked list |triggered_entries_|.
     class Entry final : public StateObserver {
     public:
         // State transitions:
@@ -47,56 +47,55 @@ public:
         enum class State { UNINITIALIZED, ADD_PENDING, ADDED, REMOVED };
 
         struct TriggeredEntriesListTraits {
-            static utils::DoublyLinkedListNodeState<Entry*>& node_state(Entry& obj) {
+            static mxtl::DoublyLinkedListNodeState<Entry*>& node_state(Entry& obj) {
                 return obj.triggered_entries_node_state_;
             }
         };
 
-        using HashPtrType = utils::unique_ptr<Entry>;
-        struct HashBucketTraits {
-            static utils::DoublyLinkedListNodeState<HashPtrType>& node_state(Entry& obj) {
-                return obj.hash_bucket_node_state_;
+        using WAVLTreePtrType = mxtl::unique_ptr<Entry>;
+        struct WAVLTreeNodeTraits {
+            static mxtl::WAVLTreeNodeState<WAVLTreePtrType>& node_state(Entry& obj) {
+                return obj.wavl_node_state_;
             }
         };
 
         static status_t Create(mx_signals_t watched_signals,
                                uint64_t cookie,
-                               utils::unique_ptr<Entry>* entry);
+                               mxtl::unique_ptr<Entry>* entry);
 
         ~Entry();
 
         // Const, hence these don't care about locking:
         mx_signals_t watched_signals() const { return watched_signals_; }
 
-        void Init_NoLock(WaitSetDispatcher* wait_set, Handle* handle);
-        State GetState_NoLock() const;
-        void SetState_NoLock(State new_state);
-        Handle* GetHandle_NoLock() const;
-        const utils::RefPtr<Dispatcher>& GetDispatcher_NoLock() const;
-        bool IsTriggered_NoLock() const;
-        mx_signals_state_t GetSignalsState_NoLock() const;
+        void InitLocked(WaitSetDispatcher* wait_set, Handle* handle);
+        State GetStateLocked() const;
+        void SetStateLocked(State new_state);
+        Handle* GetHandleLocked() const;
+        const mxtl::RefPtr<Dispatcher>& GetDispatcherLocked() const;
+        bool IsTriggeredLocked() const;
+        mx_signals_t GetSignalsStateLocked() const;
 
-        bool InTriggeredEntriesList_NoLock() const {
+        bool InTriggeredEntriesListLocked() const {
             return triggered_entries_node_state_.InContainer();
         }
 
-        // Hash table support
+        // Used to be in the |entries_| tree.
         uint64_t GetKey() const { return cookie_; }
-        static uint64_t GetHash(uint64_t key) { return key; }
 
     private:
         Entry(mx_signals_t watched_signals, uint64_t cookie);
         Entry(const Entry&) = delete;
         Entry& operator=(const Entry&) = delete;
 
-        bool OnInitialize(mx_signals_state_t initial_state) final;
-        bool OnStateChange(mx_signals_state_t new_state) final;
-        bool OnCancel(Handle* handle, bool* should_remove, bool* call_uninitialize) final;
-        void OnDidCancel() final {}
+        bool OnInitialize(mx_signals_t initial_state,
+                          const StateObserver::CountInfo* cinfo) final;
+        bool OnStateChange(mx_signals_t new_state) final;
+        bool OnCancel(Handle* handle) final;
 
         // Triggers (including adding to the triggered list). It must not already be triggered
         // (i.e., |is_triggered_| must be false; this will set it to true).
-        bool Trigger_NoLock();
+        bool TriggerLocked();
 
         const mx_signals_t watched_signals_;
         const uint64_t cookie_;
@@ -109,39 +108,38 @@ public:
         Handle* handle_ = nullptr;
         // We mostly need |dispatcher|'s StateTracker, but we need a ref to keep it alive. (This may
         // be non-null even if |handle_| is null if |OnCancel()| has been called.)
-        utils::RefPtr<Dispatcher> dispatcher_;
+        mxtl::RefPtr<Dispatcher> dispatcher_;
 
         bool is_triggered_ = false;
-        mx_signals_state_t signals_state_ = {0u, 0u};
+        mx_signals_t signals_ = 0u;
 
-        utils::DoublyLinkedListNodeState<Entry*> triggered_entries_node_state_;
-        utils::DoublyLinkedListNodeState<HashPtrType> hash_bucket_node_state_;
+        mxtl::DoublyLinkedListNodeState<Entry*> triggered_entries_node_state_;
+        mxtl::WAVLTreeNodeState<WAVLTreePtrType> wavl_node_state_;
     };
 
-    static status_t Create(utils::RefPtr<Dispatcher>* dispatcher, mx_rights_t* rights);
+    static status_t Create(mxtl::RefPtr<Dispatcher>* dispatcher, mx_rights_t* rights);
 
     ~WaitSetDispatcher() final;
-    mx_obj_type_t GetType() const final { return MX_OBJ_TYPE_WAIT_SET; }
-    WaitSetDispatcher* get_wait_set_dispatcher() final { return this; }
-
+    mx_obj_type_t get_type() const final { return MX_OBJ_TYPE_WAIT_SET; }
     StateTracker* get_state_tracker() final { return &state_tracker_; }
 
     // Adds an entry (previously constructed using Entry::Create()) for the given handle.
     // Note: Since this takes a handle, it should be called under the handle table lock!
-    status_t AddEntry(utils::unique_ptr<Entry> entry, Handle* handle);
+    status_t AddEntry(mxtl::unique_ptr<Entry> entry, Handle* handle);
 
     // Removes an entry (previously added using AddEntry()).
     status_t RemoveEntry(uint64_t cookie);
 
     // Waits on the wait set. Note: This blocks.
-    status_t Wait(mx_time_t timeout,
+    status_t Wait(mx_time_t deadline,
                   uint32_t* num_results,
-                  mx_wait_set_result_t* results,
+                  mx_waitset_result_t* results,
                   uint32_t* max_results);
 
 private:
-    using HashPtrType    = Entry::HashPtrType;
-    using HashBucketType = utils::DoublyLinkedList<HashPtrType, Entry::HashBucketTraits>;
+    using WAVLTreePtrType = Entry::WAVLTreePtrType;
+    using WAVLTreeKeyTraits = mxtl::DefaultKeyedObjectTraits<uint64_t, Entry>;
+    using WAVLTreeNodeTraits = Entry::WAVLTreeNodeTraits;
 
     WaitSetDispatcher();
 
@@ -149,34 +147,28 @@ private:
     WaitSetDispatcher& operator=(const WaitSetDispatcher&) = delete;
 
     // StateObserver implementation:
-    bool OnInitialize(mx_signals_state_t initial_state) final;
-    bool OnStateChange(mx_signals_state_t new_state) final;
-    bool OnCancel(Handle* handle, bool* should_remove, bool* call_did_cancel) final;
-    void OnDidCancel() final {}
+    bool OnInitialize(mx_signals_t initial_state, const StateObserver::CountInfo* cinfo) final;
+    bool OnStateChange(mx_signals_t new_state) final;
+    bool OnCancel(Handle* handle) final;
 
-    // These do the wait on |cv_|. They do *not* check the condition first.
-    status_t DoWaitInfinite_NoLock();
-    status_t DoWaitTimeout_NoLock(lk_time_t timeout);
+    mxtl::Canary<mxtl::magic("WTSD")> canary_;
 
     // We are *not* waitable, but we need to observe handle "cancellation".
     StateTracker state_tracker_;
 
     // WARNING: No other locks may be taken under |mutex_|.
-    mutex_t mutex_;  // Protects the following members.
+    Mutex mutex_;  // Protects the following members.
 
-    // Associated to |mutex_|. This should be signaled (broadcast) when |triggered_entries_| becomes
+    // This should be signaled (broadcast) when |triggered_entries_| becomes
     // nonempty or |cancelled_| becomes set.
-    cond_t cv_;
-    // We count the number of waiters, so we can provide a slightly fake value about whether we
-    // awoke anyone or not when we signal |cv_| (since |cond_broadcast()| doesn't tell us anything).
-    size_t waiter_count_ = 0u;
+    event_t event_;
 
     // Whether our (only) handle has been cancelled.
     // TODO(vtl): If we ever allow wait set handles to be duplicated, we'll have to do much more
     // complicated accounting, both in Wait() and in OnCancel().
     bool cancelled_ = false;
 
-    utils::HashTable<uint64_t, HashPtrType, HashBucketType, uint64_t, 127u> entries_;
-    utils::DoublyLinkedList<Entry*, Entry::TriggeredEntriesListTraits> triggered_entries_;
+    mxtl::WAVLTree<uint64_t, WAVLTreePtrType, WAVLTreeKeyTraits, WAVLTreeNodeTraits> entries_;
+    mxtl::DoublyLinkedList<Entry*, Entry::TriggeredEntriesListTraits> triggered_entries_;
     uint32_t num_triggered_entries_ = 0u;
 };

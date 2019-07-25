@@ -9,98 +9,75 @@
 #include <stdint.h>
 
 #include <kernel/mutex.h>
-
-#include <magenta/types.h>
-#include <magenta/io_port_dispatcher.h>
+#include <kernel/spinlock.h>
 #include <magenta/state_observer.h>
-
-#include <utils/intrusive_double_list.h>
+#include <magenta/types.h>
+#include <mxtl/canary.h>
+#include <mxtl/intrusive_double_list.h>
 
 class Handle;
-class WaitEvent;
 
-// Magenta state tracker
-//
-// TODO(vtl): Update this comment once things have settle some more.
-//  Provides the interface between the syscall layer and the kernel object layer
-//  that allows waiting for object state changes. It connects the waitee (which
-//  owns the StateTracker object) and (possibly) many waiters.
-//
-//  The waitee uses Signal/ClearSignal to inform the waiters of state changes.
-//
-//  The StateTracker has two styles for notifying waiters. They are mutually exclusive.
-//
-//  In the examples that follow, assume a waitee pointed by |handle| and
-//  some |signals| to wait for.
-//
-//  Style 1: Using BeginWait / FinishWait. Assume an existing |event|
-//
-//      auto waiter = handle->dispatcher()->get_waiter();
-//      waiter->BeginWait(&event, handle, signals, 0);
-//
-//      event.Wait(timeout);
-//      waiter->FinishWait(&event);
-//
-//  Style 2: Using IOPorts. Assume an existing |io_port|.
-//
-//      auto waiter = handle->dispatcher()->get_waiter();
-//      waiter->BindIOPOrt(io_port, key, signals);
-//
-//      IOP_Packet pk;
-//      io_port->Wait(&pk);
-//
+class CookieJar {
+public:
+    CookieJar() : scope_(MX_KOID_INVALID), cookie_(0) {}
+    mx_koid_t scope_;
+    uint64_t cookie_;
+};
 
 class StateTracker {
 public:
-    // Note: The initial state can also be set using SetInitialSignalsState() if the default
-    // constructor must be used for some reason.
-    StateTracker(bool is_waitable = true,
-                 mx_signals_state_t signals_state = mx_signals_state_t{0u, 0u});
-    ~StateTracker();
+    StateTracker(mx_signals_t signals = 0u) : signals_(signals | MX_SIGNAL_LAST_HANDLE) { }
 
     StateTracker(const StateTracker& o) = delete;
     StateTracker& operator=(const StateTracker& o) = delete;
 
-    // Set the initial signals state. This is an alternative to provide the initial signals state to
-    // the constructor. This does no locking and does not notify anything.
-    void set_initial_signals_state(mx_signals_state_t signals_state) {
-        signals_state_ = signals_state;
-    }
-
-    bool is_waitable() const { return is_waitable_; }
-
     // Add an observer.
-    mx_status_t AddObserver(StateObserver* observer);
+    void AddObserver(StateObserver* observer, const StateObserver::CountInfo* cinfo);
 
     // Remove an observer (which must have been added).
-    mx_signals_state_t RemoveObserver(StateObserver* observer);
+    void RemoveObserver(StateObserver* observer);
 
     // Called when observers of the handle's state (e.g., waits on the handle) should be
     // "cancelled", i.e., when a handle (for the object that owns this StateTracker) is being
     // destroyed or transferred.
     void Cancel(Handle* handle);
 
-    // Notify others of a change in state (possibly waking them). (Clearing satisfied signals or
-    // setting satisfiable signals should not wake anyone.) Returns true if some thread was awoken.
-    void UpdateState(mx_signals_t satisfied_set_mask,
-                     mx_signals_t satisfied_clear_mask,
-                     mx_signals_t satisfiable_set_mask,
-                     mx_signals_t satisfiable_clear_mask);
+    // Like Cancel() but issued via via mx_port_cancel().
+    void CancelByKey(Handle* handle, const void* port, uint64_t key);
 
-    void UpdateSatisfied(mx_signals_t set_mask, mx_signals_t clear_mask) {
-        UpdateState(set_mask, clear_mask, 0u, 0u);
-    }
+    // Notify others of a change in state (possibly waking them). (Clearing satisfied signals or
+    // setting satisfiable signals should not wake anyone.)
+    void UpdateState(mx_signals_t clear_mask, mx_signals_t set_mask);
+
+    // Notify others of a change in state (possibly waking them) in an edge-triggered
+    // manner.  Waiters on strobe_mask will wake, but the tracked state is unmodified.
+    void StrobeState(mx_signals_t strobe_mask);
+
+    // Nofity others with MX_SIGNAL_LAST_HANDLE if the value pointed by |count| is 1. This
+    // value is allowed to mutate by other threads while this call is executing.
+    void UpdateLastHandleSignal(uint32_t* count);
+
+    mx_signals_t GetSignalsState() { return signals_; }
+
+    using ObserverList = mxtl::DoublyLinkedList<StateObserver*, StateObserverListTraits>;
+
+    // Accessors for CookieJars
+    // These live with the state tracker so they can make use of the state tracker's
+    // lock (since not all objects have their own locks, but all Dispatchers that are
+    // cookie-capable have state trackers)
+    mx_status_t SetCookie(CookieJar* cookiejar, mx_koid_t scope, uint64_t cookie);
+    mx_status_t GetCookie(CookieJar* cookiejar, mx_koid_t scope, uint64_t* cookie);
+    mx_status_t InvalidateCookie(CookieJar *cookiejar);
 
 private:
-    static bool SendIOPortPacket(IOPortDispatcher* io_port, uint64_t key, mx_signals_t signals);
+    // Returns true if one of the observers have been signaled. False otherwise.
+    bool UpdateInternalLocked(ObserverList* obs_to_remove, mx_signals_t signals) TA_REQ(lock_);
 
-    const bool is_waitable_;
+    mxtl::Canary<mxtl::magic("STRK")> canary_;
 
-    mutex_t lock_;  // Protects the members below.
+    mx_signals_t signals_;
+    Mutex lock_;
 
     // Active observers are elements in |observers_|.
-    utils::DoublyLinkedList<StateObserver*, StateObserverListTraits> observers_;
-
-    // mojo-style signaling.
-    mx_signals_state_t signals_state_;
+    ObserverList observers_ TA_GUARDED(lock_);
 };

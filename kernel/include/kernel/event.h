@@ -8,7 +8,7 @@
 #ifndef __KERNEL_EVENT_H
 #define __KERNEL_EVENT_H
 
-#include <compiler.h>
+#include <magenta/compiler.h>
 #include <stdbool.h>
 #include <sys/types.h>
 #include <kernel/thread.h>
@@ -19,7 +19,7 @@ __BEGIN_CDECLS;
 
 typedef struct event {
     int magic;
-    bool signalled;
+    bool signaled;
     uint flags;
     wait_queue_t wait;
 } event_t;
@@ -29,7 +29,7 @@ typedef struct event {
 #define EVENT_INITIAL_VALUE(e, initial, _flags) \
 { \
     .magic = EVENT_MAGIC, \
-    .signalled = initial, \
+    .signaled = initial, \
     .flags = _flags, \
     .wait = WAIT_QUEUE_INITIAL_VALUE((e).wait), \
 }
@@ -53,20 +53,23 @@ typedef struct event {
 void event_init(event_t *, bool initial, uint flags);
 void event_destroy(event_t *);
 
-/* Wait for up to timeout amount of time.
+/* Wait until deadline
  * Interruptable arg allows it to return early with ERR_INTERRUPTED if thread
  * is signaled for kill.
  */
-status_t event_wait_timeout(event_t *, lk_time_t, bool interruptable);
+status_t event_wait_deadline(event_t *, lk_time_t, bool interruptable);
 
-/* no timeout, non interruptable version of the above. */
-static inline status_t event_wait(event_t *e) { return event_wait_timeout(e, INFINITE_TIME, false); }
+/* no deadline, non interruptable version of the above. */
+static inline status_t event_wait(event_t *e) { return event_wait_deadline(e, INFINITE_TIME, false); }
 
 int event_signal_etc(event_t *, bool reschedule, status_t result);
 int event_signal(event_t *, bool reschedule);
+int event_signal_thread_locked(event_t *);
 status_t event_unsignal(event_t *);
 
-static inline bool event_initialized(event_t *e) { return e->magic == EVENT_MAGIC; }
+static inline bool event_initialized(const event_t *e) { return e->magic == EVENT_MAGIC; }
+
+static inline bool event_signaled(const event_t *e) { return e->signaled; }
 
 __END_CDECLS;
 

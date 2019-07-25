@@ -1,12 +1,10 @@
+#include "libc.h"
 #include "stdio_impl.h"
-#include "syscall.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <spawn.h>
 #include <string.h>
 #include <unistd.h>
-
-extern char** __environ;
 
 FILE* popen(const char* cmd, const char* mode) {
     int p[2], op, e;
@@ -27,8 +25,8 @@ FILE* popen(const char* cmd, const char* mode) {
         return NULL;
     f = fdopen(p[op], mode);
     if (!f) {
-        __syscall(SYS_close, p[0]);
-        __syscall(SYS_close, p[1]);
+        close(p[0]);
+        close(p[1]);
         return NULL;
     }
     FLOCK(f);
@@ -44,20 +42,20 @@ FILE* popen(const char* cmd, const char* mode) {
             e = errno;
             goto fail;
         }
-        __syscall(SYS_close, p[1 - op]);
+        close(p[1 - op]);
         p[1 - op] = tmp;
     }
 
     e = ENOMEM;
     if (!posix_spawn_file_actions_init(&fa)) {
         if (!posix_spawn_file_actions_adddup2(&fa, p[1 - op], 1 - op)) {
-            if (!(e = posix_spawn(&pid, "/bin/sh", &fa, 0, (char* []){"sh", "-c", (char*)cmd, 0},
+            if (!(e = posix_spawn(&pid, "/bin/sh", &fa, 0, (char* []){(char*)"sh", (char*)"-c", (char*)cmd, 0},
                                   __environ))) {
                 posix_spawn_file_actions_destroy(&fa);
                 f->pipe_pid = pid;
                 if (!strchr(mode, 'e'))
                     fcntl(p[op], F_SETFD, 0);
-                __syscall(SYS_close, p[1 - op]);
+                close(p[1 - op]);
                 FUNLOCK(f);
                 return f;
             }
@@ -66,7 +64,7 @@ FILE* popen(const char* cmd, const char* mode) {
     }
 fail:
     fclose(f);
-    __syscall(SYS_close, p[1 - op]);
+    close(p[1 - op]);
 
     errno = e;
     return 0;

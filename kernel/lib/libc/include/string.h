@@ -9,7 +9,7 @@
 #define __LIB_STRING_H
 
 #include <stddef.h>
-#include <compiler.h>
+#include <magenta/compiler.h>
 
 __BEGIN_CDECLS
 
@@ -39,8 +39,6 @@ size_t      strxfrm(char *dest, const char *src, size_t n) __PURE;
 char       *strdup(const char *str) __MALLOC;
 
 /* non standard */
-void   bcopy(void const *, void *, size_t);
-void   bzero(void *, size_t);
 size_t strlcat(char *, char const *, size_t);
 size_t strlcpy(char *, char const *, size_t);
 int    strncasecmp(char const *, char const *, size_t)  __PURE;

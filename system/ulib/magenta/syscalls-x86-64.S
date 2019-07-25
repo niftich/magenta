@@ -1,41 +1,18 @@
-// Copyright 2016 The Fuchsia Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
 
 /* define and implement the magenta syscall wrappers for x86-64 */
+
+#include "syscall-entry.h"
+#include "magenta-syscall-x86-64.S"
 
 .text
 
 .cfi_sections .eh_frame, .debug_frame
 
-.macro push_reg reg
-    push \reg
-    .cfi_adjust_cfa_offset 8
-    .cfi_rel_offset \reg, 0
-.endm
-.macro pop_reg reg
-    pop \reg
-    .cfi_adjust_cfa_offset -8
-    .cfi_same_value \reg
-.endm
-
-#define MAGENTA_SYSCALL_MAGIC 0x00ff00ff00000000
-
-.macro _syscall nargs, name, n
-.globl \name
-.type \name,STT_FUNC
-\name:
-    .cfi_startproc
+.macro m_syscall nargs, name, num, with_aliases
+syscall_entry_begin \name
     .cfi_same_value %r10
     .cfi_same_value %r11
     .cfi_same_value %r12
@@ -44,8 +21,7 @@
     push_reg %r10
     push_reg %r11
     mov      %rcx, %r10
-    movabs   $(MAGENTA_SYSCALL_MAGIC | \n), %rax
-    syscall
+    magenta_syscall \num, \name, \name
     pop_reg  %r11
     pop_reg  %r10
     ret
@@ -56,11 +32,10 @@
     push_reg %r12
     mov      0x20(%rsp), %r12
     mov      %rcx, %r10
-    movabs   $(MAGENTA_SYSCALL_MAGIC | \n), %rax
-    syscall
-    pop_reg  %r13
+    magenta_syscall \num, \name, \name
     pop_reg  %r12
     pop_reg  %r11
+    pop_reg  %r10
     ret
 .endif
 .if \nargs == 8
@@ -71,24 +46,16 @@
     mov      0x28(%rsp), %r12
     mov      0x30(%rsp), %r13
     mov      %rcx, %r10
-    movabs   $(MAGENTA_SYSCALL_MAGIC | \n), %rax
-    syscall
+    magenta_syscall \num, \name, \name
     pop_reg  %r13
     pop_reg  %r12
     pop_reg  %r11
     pop_reg  %r10
     ret
 .endif
-    .cfi_endproc
-.size \name, . - \name
+syscall_entry_end \name \with_aliases
 .endm
 
-#if LIBDDK
-#define MAGENTA_SYSCALL_DEF(a...)
-#define MAGENTA_DDKCALL_DEF(nargs64, nargs32, n, ret, name, args...) _syscall nargs64, mx_##name, n
-#else
-#define MAGENTA_DDKCALL_DEF(a...)
-#define MAGENTA_SYSCALL_DEF(nargs64, nargs32, n, ret, name, args...) _syscall nargs64, mx_##name, n
-#endif
+#include <magenta/syscalls-x86-64.S>
 
-#include <magenta/syscalls.inc>
+#include "syscalls-stubs.S"

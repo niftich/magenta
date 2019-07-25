@@ -1,22 +1,15 @@
-// Copyright 2016 The Fuchsia Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
 
+#include <assert.h>
 #include <launchpad/launchpad.h>
 #include <launchpad/vmo.h>
+#include <magenta/process.h>
 #include <magenta/processargs.h>
 #include <magenta/syscalls.h>
-#include <mxio/util.h>
+#include <magenta/syscalls/object.h>
+#include <mxio/loader-service.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -37,11 +30,13 @@ static _Noreturn void usage(const char* progname, bool error) {
     option_usage(out, "-f FILE", "execute FILE but pass PROGRAM as argv[0]");
     option_usage(out, "-F FD", "execute FD");
     option_usage(out, "-h", "display this usage message and exit");
+    option_usage(out, "-j", "start process in a new job");
     option_usage(out, "-l",
                  "pass mxio_loader_service handle in main bootstrap message");
     option_usage(out, "-L", "force initial loader bootstrap message");
     option_usage(out, "-r", "send mxio filesystem root");
     option_usage(out, "-s", "shorthand for -r -d 0 -d 1 -d 2");
+    option_usage(out, "-S BYTES", "set the initial stack size to BYTES");
     option_usage(out, "-v FILE", "send VMO of FILE as EXEC_VMO handle");
     option_usage(out, "-V FD", "send VMO of FD as EXEC_VMO handle");
     exit(error ? 1 : 0);
@@ -68,10 +63,12 @@ int main(int argc, char** argv) {
     size_t nfds = 0;
     bool send_loader_message = false;
     bool pass_loader_handle = false;
+    bool new_job = false;
     const char* exec_vmo_file = NULL;
     int exec_vmo_fd = -1;
+    size_t stack_size = -1;
 
-    for (int opt; (opt = getopt(argc, argv, "bd:e:f:F:hlLrsv:")) != -1;) {
+    for (int opt; (opt = getopt(argc, argv, "bd:e:f:F:hjlLrsS:v:")) != -1;) {
         switch (opt) {
         case 'b':
             basic = true;
@@ -115,6 +112,9 @@ int main(int argc, char** argv) {
         case 'h':
             usage(argv[0], false);
             break;
+        case 'j':
+            new_job = true;
+            break;
         case 'L':
             send_loader_message = true;
             break;
@@ -130,6 +130,12 @@ int main(int argc, char** argv) {
             for (int i = 0; i < 3; ++i)
                 fds[nfds + i].from = fds[nfds + i].to = i;
             nfds += 3;
+            break;
+        case 'S':
+            if (sscanf(optarg, "0x%zx", &stack_size) != 1 &&
+                sscanf(optarg, "0%zo", &stack_size) != 1 &&
+                sscanf(optarg, "%zu", &stack_size) != 1)
+                usage(argv[0], true);
             break;
         case 'v':
             exec_vmo_file = optarg;
@@ -165,19 +171,33 @@ int main(int argc, char** argv) {
         check("launchpad_vmo_from_file", vmo);
     }
 
+    mx_handle_t job = mx_job_default();
+    if (new_job) {
+        if (job == MX_HANDLE_INVALID) {
+            fprintf(stderr, "no mxio job handle found\n");
+            return 2;
+        }
+        check("launchpad job", job);
+        mx_handle_t child_job;
+        mx_status_t status = mx_job_create(job, 0u, &child_job);
+        check("launchpad child job", status);
+        mx_handle_close(job);
+        job = child_job;
+    }
+
     launchpad_t* lp;
-    mx_status_t status = launchpad_create(program, &lp);
+    mx_status_t status = launchpad_create(job, program, &lp);
     check("launchpad_create", status);
 
-    status = launchpad_arguments(lp, argc - optind,
-                                 (const char *const*) &argv[optind]);
+    status = launchpad_set_args(lp, argc - optind,
+                                (const char *const*) &argv[optind]);
     check("launchpad_arguments", status);
 
-    status = launchpad_environ(lp, env);
+    status = launchpad_set_environ(lp, env);
     check("launchpad_environ", status);
 
     if (send_root) {
-        status = launchpad_clone_mxio_root(lp);
+        status = launchpad_clone(lp, LP_CLONE_MXIO_ROOT);
         check("launchpad_clone_mxio_root", status);
     }
 
@@ -212,7 +232,7 @@ int main(int argc, char** argv) {
     if (pass_loader_handle) {
         mx_handle_t loader_svc = mxio_loader_service(NULL, NULL);
         check("mxio_loader_service", loader_svc);
-        status = launchpad_add_handle(lp, loader_svc, MX_HND_TYPE_LOADER_SVC);
+        status = launchpad_add_handle(lp, loader_svc, PA_SVC_LOADER);
         check("launchpad_add_handle", status);
     }
 
@@ -227,7 +247,7 @@ int main(int argc, char** argv) {
             return 2;
         }
         check("launchpad_vmo_from_file", exec_vmo);
-        status = launchpad_add_handle(lp, exec_vmo, MX_HND_TYPE_EXEC_VMO);
+        status = launchpad_add_handle(lp, exec_vmo, PA_VMO_EXECUTABLE);
     }
 
     if (exec_vmo_fd != -1) {
@@ -237,7 +257,13 @@ int main(int argc, char** argv) {
             return 2;
         }
         check("launchpad_vmo_from_fd", exec_vmo);
-        status = launchpad_add_handle(lp, exec_vmo, MX_HND_TYPE_EXEC_VMO);
+        status = launchpad_add_handle(lp, exec_vmo, PA_VMO_EXECUTABLE);
+    }
+
+    if (stack_size != (size_t)-1) {
+        size_t old_size = launchpad_set_stack_size(lp, stack_size);
+        assert(old_size > 0);
+        assert(old_size < (size_t)-1);
     }
 
     // This doesn't get ownership of the process handle.
@@ -252,20 +278,15 @@ int main(int argc, char** argv) {
     // The launchpad is done.  Clean it up.
     launchpad_destroy(lp);
 
-    mx_signals_state_t state;
-    status = mx_handle_wait_one(proc, MX_SIGNAL_SIGNALED,
-                                MX_TIME_INFINITE, &state);
-    check("mx_handle_wait_one", status);
+    status = mx_object_wait_one(proc, MX_PROCESS_TERMINATED, MX_TIME_INFINITE, NULL);
+    check("mx_object_wait_one", status);
 
-    mx_process_info_t info;
-    mx_ssize_t n = mx_handle_get_info(proc, MX_INFO_PROCESS,
-                                      &info, sizeof(info));
-    check("mx_handle_get_info", n);
-    if (n != (mx_ssize_t)sizeof(info)) {
-        fprintf(stderr, "mx_handle_get_info short read: %zu != %zu\n",
-                (size_t)n, sizeof(info));
-        exit(2);
-    }
+    mx_info_process_t info;
+    status = mx_object_get_info(proc, MX_INFO_PROCESS, &info, sizeof(info), NULL, NULL);
+    check("mx_object_get_info", status);
+
+    if (job)
+        mx_handle_close(job);
 
     printf("Process finished with return code %d\n", info.return_code);
     return info.return_code;

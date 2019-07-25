@@ -7,97 +7,216 @@
 #include <magenta/state_tracker.h>
 
 #include <kernel/auto_lock.h>
-
 #include <magenta/wait_event.h>
 
-#include <utils/intrusive_single_list.h>
+namespace {
 
-StateTracker::StateTracker(bool is_waitable, mx_signals_state_t signals_state)
-    : is_waitable_(is_waitable),
-      signals_state_(signals_state) {
-    mutex_init(&lock_);
-}
-
-StateTracker::~StateTracker() {
-    mutex_destroy(&lock_);
-}
-
-mx_status_t StateTracker::AddObserver(StateObserver* observer) {
+template <typename Func>
+void CancelWithFunc(StateTracker::ObserverList* observers, Mutex* observer_lock, Func f) {
     bool awoke_threads = false;
-    {
-        AutoLock lock(&lock_);
 
-        observers_.push_front(observer);
-        awoke_threads = observer->OnInitialize(signals_state_);
-    }
-    if (awoke_threads)
-        thread_yield();
-    return NO_ERROR;
-}
-
-mx_signals_state_t StateTracker::RemoveObserver(StateObserver* observer) {
-    AutoLock lock(&lock_);
-    DEBUG_ASSERT(observer != nullptr);
-    observers_.erase(*observer);
-    return signals_state_;
-}
-
-void StateTracker::UpdateState(mx_signals_t satisfied_set_mask,
-                               mx_signals_t satisfied_clear_mask,
-                               mx_signals_t satisfiable_set_mask,
-                               mx_signals_t satisfiable_clear_mask) {
-    bool awoke_threads = false;
-    {
-        AutoLock lock(&lock_);
-
-        auto previous_signals_state = signals_state_;
-        signals_state_.satisfied &= ~satisfied_clear_mask;
-        signals_state_.satisfied |= satisfied_set_mask;
-        signals_state_.satisfiable &= ~satisfiable_clear_mask;
-        signals_state_.satisfiable |= satisfiable_set_mask;
-
-        if (previous_signals_state.satisfied == signals_state_.satisfied &&
-            previous_signals_state.satisfiable == signals_state_.satisfiable)
-            return;
-
-        for (auto& observer : observers_) {
-            awoke_threads |= observer.OnStateChange(signals_state_);
-        }
-
-    }
-    if (awoke_threads)
-        thread_yield();
-}
-
-void StateTracker::Cancel(Handle* handle) {
-    bool awoke_threads = false;
-    StateObserver* observer = nullptr;
-
-    utils::DoublyLinkedList<StateObserver*, StateObserverListTraits> did_cancel_list;
+    StateTracker::ObserverList obs_to_remove;
 
     {
-        AutoLock lock(&lock_);
-        for (auto it = observers_.begin(); it != observers_.end();) {
-            bool should_remove = false;
-            bool call_did_cancel = false;
-            awoke_threads |= it->OnCancel(handle, &should_remove, &call_did_cancel);
-            if (should_remove) {
+        AutoLock lock(observer_lock);
+        for (auto it = observers->begin(); it != observers->end();) {
+            awoke_threads = f(it.CopyPointer()) || awoke_threads;
+            if (it->remove()) {
                 auto to_remove = it;
                 ++it;
-                observer = observers_.erase(to_remove);
-                if (call_did_cancel)
-                    did_cancel_list.push_front(observer);
+                obs_to_remove.push_back(observers->erase(to_remove));
             } else {
                 ++it;
             }
         }
     }
 
-    while (!did_cancel_list.is_empty()) {
-        auto observer = did_cancel_list.pop_front();
-        observer->OnDidCancel();
+    while (!obs_to_remove.is_empty()) {
+        obs_to_remove.pop_front()->OnRemoved();
     }
 
     if (awoke_threads)
-        thread_yield();
+        thread_preempt(false);
+}
+}  // namespace
+
+void StateTracker::AddObserver(StateObserver* observer, const StateObserver::CountInfo* cinfo) {
+    canary_.Assert();
+    DEBUG_ASSERT(observer != nullptr);
+
+    bool awoke_threads = false;
+    {
+        AutoLock lock(&lock_);
+
+        awoke_threads = observer->OnInitialize(signals_, cinfo);
+        if (!observer->remove())
+            observers_.push_front(observer);
+    }
+    if (awoke_threads)
+        thread_preempt(false);
+}
+
+void StateTracker::RemoveObserver(StateObserver* observer) {
+    canary_.Assert();
+
+    AutoLock lock(&lock_);
+    DEBUG_ASSERT(observer != nullptr);
+    observers_.erase(*observer);
+}
+
+void StateTracker::Cancel(Handle* handle) {
+    canary_.Assert();
+
+    CancelWithFunc(&observers_, &lock_, [handle](StateObserver* obs) {
+        return obs->OnCancel(handle);
+    });
+}
+
+void StateTracker::CancelByKey(Handle* handle, const void* port, uint64_t key) {
+    canary_.Assert();
+
+    CancelWithFunc(&observers_, &lock_, [handle, port, key](StateObserver* obs) {
+        return obs->OnCancelByKey(handle, port, key);
+    });
+}
+
+void StateTracker::UpdateState(mx_signals_t clear_mask,
+                               mx_signals_t set_mask) {
+    canary_.Assert();
+
+    bool awoke_threads;
+    ObserverList obs_to_remove;
+
+    {
+        AutoLock lock(&lock_);
+        auto previous_signals = signals_;
+        signals_ &= ~clear_mask;
+        signals_ |= set_mask;
+
+        if (previous_signals == signals_)
+            return;
+
+        awoke_threads = UpdateInternalLocked(&obs_to_remove, signals_);
+    }
+
+    while (!obs_to_remove.is_empty()) {
+        obs_to_remove.pop_front()->OnRemoved();
+    }
+
+    if (awoke_threads)
+        thread_preempt(false);
+}
+
+void StateTracker::StrobeState(mx_signals_t notify_mask) {
+    canary_.Assert();
+
+    bool awoke_threads;
+    ObserverList obs_to_remove;
+
+    {
+        AutoLock lock(&lock_);
+        // include currently active signals as well
+        notify_mask |= signals_;
+        awoke_threads = UpdateInternalLocked(&obs_to_remove, notify_mask);
+    }
+
+    while (!obs_to_remove.is_empty()) {
+        obs_to_remove.pop_front()->OnRemoved();
+    }
+
+    if (awoke_threads)
+        thread_preempt(false);
+}
+
+void StateTracker::UpdateLastHandleSignal(uint32_t* count) {
+    canary_.Assert();
+
+    if (count == nullptr)
+        return;
+
+    bool awoke_threads;
+    ObserverList obs_to_remove;
+
+    {
+        AutoLock lock(&lock_);
+
+        auto previous_signals = signals_;
+
+        // We assume here that the value pointed by |count| can mutate by
+        // other threads.
+        signals_ = (*count == 1u) ?
+            signals_ | MX_SIGNAL_LAST_HANDLE : signals_ & ~MX_SIGNAL_LAST_HANDLE;
+
+        if (previous_signals == signals_)
+            return;
+
+        awoke_threads = UpdateInternalLocked(&obs_to_remove, signals_);
+    }
+
+    while (!obs_to_remove.is_empty()) {
+        obs_to_remove.pop_front()->OnRemoved();
+    }
+
+    if (awoke_threads)
+        thread_preempt(false);
+}
+
+mx_status_t StateTracker::SetCookie(CookieJar* cookiejar, mx_koid_t scope, uint64_t cookie) {
+    if (cookiejar == nullptr)
+        return ERR_NOT_SUPPORTED;
+
+    AutoLock lock(&lock_);
+
+    if (cookiejar->scope_ == MX_KOID_INVALID) {
+        cookiejar->scope_ = scope;
+        cookiejar->cookie_ = cookie;
+        return NO_ERROR;
+    }
+
+    if (cookiejar->scope_ == scope) {
+        cookiejar->cookie_ = cookie;
+        return NO_ERROR;
+    }
+
+    return ERR_ACCESS_DENIED;
+}
+
+mx_status_t StateTracker::GetCookie(CookieJar* cookiejar, mx_koid_t scope, uint64_t* cookie) {
+    if (cookiejar == nullptr)
+        return ERR_NOT_SUPPORTED;
+
+    AutoLock lock(&lock_);
+
+    if (cookiejar->scope_ == scope) {
+        *cookie = cookiejar->cookie_;
+        return NO_ERROR;
+    }
+
+    return ERR_ACCESS_DENIED;
+}
+
+mx_status_t StateTracker::InvalidateCookie(CookieJar* cookiejar) {
+    if (cookiejar == nullptr)
+        return ERR_NOT_SUPPORTED;
+
+    AutoLock lock(&lock_);
+
+    cookiejar->scope_ = MX_KOID_KERNEL;
+    return NO_ERROR;
+}
+
+bool StateTracker::UpdateInternalLocked(ObserverList* obs_to_remove, mx_signals_t signals) {
+    bool awoke_threads = false;
+
+    for (auto it = observers_.begin(); it != observers_.end();) {
+        awoke_threads = it->OnStateChange(signals) || awoke_threads;
+        if (it->remove()) {
+            auto to_remove = it;
+            ++it;
+            obs_to_remove->push_back(observers_.erase(to_remove));
+        } else {
+            ++it;
+        }
+    }
+    return awoke_threads;
 }

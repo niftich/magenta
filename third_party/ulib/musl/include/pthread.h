@@ -54,23 +54,11 @@ extern "C" {
 #define PTHREAD_PROCESS_PRIVATE 0
 
 #define PTHREAD_MUTEX_INITIALIZER \
-    {                             \
-        {                         \
-            { 0 }                 \
-        }                         \
-    }
+    {}
 #define PTHREAD_RWLOCK_INITIALIZER \
-    {                              \
-        {                          \
-            { 0 }                  \
-        }                          \
-    }
+    {}
 #define PTHREAD_COND_INITIALIZER \
-    {                            \
-        {                        \
-            { 0 }                \
-        }                        \
-    }
+    {}
 #define PTHREAD_ONCE_INIT 0
 
 #define PTHREAD_CANCEL_ENABLE 0
@@ -163,7 +151,8 @@ int pthread_attr_setstacksize(pthread_attr_t*, size_t);
 int pthread_attr_getdetachstate(const pthread_attr_t*, int*);
 int pthread_attr_setdetachstate(pthread_attr_t*, int);
 int pthread_attr_getstack(const pthread_attr_t* __restrict, void** __restrict, size_t* __restrict);
-int pthread_attr_setstack(pthread_attr_t*, void*, size_t);
+int pthread_attr_setstack(pthread_attr_t*, void*, size_t)
+    __attribute__((__deprecated__("pthread_attr_setstack is not available in Fuchsia; perhaps pthread_attr_setstacksize and/or pthread_attr_setguardsize is sufficient for your needs?")));
 int pthread_attr_getscope(const pthread_attr_t* __restrict, int* __restrict);
 int pthread_attr_setscope(pthread_attr_t*, int);
 int pthread_attr_getschedpolicy(const pthread_attr_t* __restrict, int* __restrict);
@@ -202,23 +191,8 @@ int pthread_setconcurrency(int);
 
 int pthread_getcpuclockid(pthread_t, clockid_t*);
 
-struct __ptcb {
-    void (*__f)(void*);
-    void* __x;
-    struct __ptcb* __next;
-};
-
-void _pthread_cleanup_push(struct __ptcb*, void (*)(void*), void*);
-void _pthread_cleanup_pop(struct __ptcb*, int);
-
-#define pthread_cleanup_push(f, x) \
-    do {                           \
-        struct __ptcb __cb;        \
-        _pthread_cleanup_push(&__cb, f, x);
-#define pthread_cleanup_pop(r)        \
-    _pthread_cleanup_pop(&__cb, (r)); \
-    }                                 \
-    while (0)
+#define pthread_cleanup_push(f, x)
+#define pthread_cleanup_pop(r)
 
 #ifdef _GNU_SOURCE
 struct cpu_set_t;

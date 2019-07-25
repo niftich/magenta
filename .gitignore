@@ -1,6 +1,7 @@
 .DS_Store
 build-*/
 *.swp
+*.swo
 *~
 tags
 TAGS
@@ -13,12 +14,17 @@ blk.bin
 *.dSYM
 scripts/toolpaths.local
 clang-format
+compile_commands.json
+.vscode
 *_BACKUP_*
 *_REMOTE_*
 *_LOCAL_*
 *_BASE_*
 *.sublime-*
+/benchmarks/
+/infra/.recipe_deps
 /out*
-/prebuilt/downloads/*
+/prebuilt/downloads/
 /prebuilt/config.mk
 /prebuilt/config.mk.bak
+/AnalysisResult/

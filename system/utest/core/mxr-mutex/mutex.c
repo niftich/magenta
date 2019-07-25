@@ -1,31 +1,23 @@
-// Copyright 2016 The Fuchsia Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
 
 #include <magenta/syscalls.h>
 #include <runtime/mutex.h>
-#include <runtime/thread.h>
 #include <unittest/unittest.h>
+#include <inttypes.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <threads.h>
 
 static mxr_mutex_t mutex = MXR_MUTEX_INIT;
 
 static void xlog(const char* str) {
-    uint64_t now = mx_current_time();
-    unittest_printf("[%08llu.%08llu]: %s", now / 1000000000, now % 1000000000, str);
+    uint64_t now = mx_time_get(MX_CLOCK_MONOTONIC);
+    unittest_printf("[%08" PRIu64 ".%08" PRIu64 "]: %s",
+                    now / 1000000000, now % 1000000000, str);
 }
 
 static int mutex_thread_1(void* arg) {
@@ -33,7 +25,7 @@ static int mutex_thread_1(void* arg) {
 
     for (int times = 0; times < 300; times++) {
         mxr_mutex_lock(&mutex);
-        mx_nanosleep(1000);
+        mx_nanosleep(mx_deadline_after(MX_USEC(1)));
         mxr_mutex_unlock(&mutex);
     }
 
@@ -46,7 +38,7 @@ static int mutex_thread_2(void* arg) {
 
     for (int times = 0; times < 150; times++) {
         mxr_mutex_lock(&mutex);
-        mx_nanosleep(2000);
+        mx_nanosleep(mx_deadline_after(MX_USEC(2)));
         mxr_mutex_unlock(&mutex);
     }
 
@@ -59,7 +51,7 @@ static int mutex_thread_3(void* arg) {
 
     for (int times = 0; times < 100; times++) {
         mxr_mutex_lock(&mutex);
-        mx_nanosleep(3000);
+        mx_nanosleep(mx_deadline_after(MX_USEC(3)));
         mxr_mutex_unlock(&mutex);
     }
 
@@ -76,7 +68,7 @@ static int mutex_try_thread_1(void* arg) {
 
     for (int times = 0; times < 300 || !got_lock_1; times++) {
         mx_status_t status = mxr_mutex_trylock(&mutex);
-        mx_nanosleep(1000);
+        mx_nanosleep(mx_deadline_after(MX_USEC(1)));
         if (status == NO_ERROR) {
             got_lock_1 = true;
             mxr_mutex_unlock(&mutex);
@@ -92,7 +84,7 @@ static int mutex_try_thread_2(void* arg) {
 
     for (int times = 0; times < 150 || !got_lock_2; times++) {
         mx_status_t status = mxr_mutex_trylock(&mutex);
-        mx_nanosleep(2000);
+        mx_nanosleep(mx_deadline_after(MX_USEC(2)));
         if (status == NO_ERROR) {
             got_lock_2 = true;
             mxr_mutex_unlock(&mutex);
@@ -108,7 +100,7 @@ static int mutex_try_thread_3(void* arg) {
 
     for (int times = 0; times < 100 || !got_lock_3; times++) {
         mx_status_t status = mxr_mutex_trylock(&mutex);
-        mx_nanosleep(3000);
+        mx_nanosleep(mx_deadline_after(MX_USEC(3)));
         if (status == NO_ERROR) {
             got_lock_3 = true;
             mxr_mutex_unlock(&mutex);
@@ -131,30 +123,30 @@ static bool test_initializer(void) {
 
 static bool test_mutexes(void) {
     BEGIN_TEST;
-    mxr_thread_t *handle1, *handle2, *handle3;
+    thrd_t thread1, thread2, thread3;
 
-    mxr_thread_create(mutex_thread_1, NULL, "thread 1", &handle1);
-    mxr_thread_create(mutex_thread_2, NULL, "thread 2", &handle2);
-    mxr_thread_create(mutex_thread_3, NULL, "thread 3", &handle3);
+    thrd_create_with_name(&thread1, mutex_thread_1, NULL, "thread 1");
+    thrd_create_with_name(&thread2, mutex_thread_2, NULL, "thread 2");
+    thrd_create_with_name(&thread3, mutex_thread_3, NULL, "thread 3");
 
-    mxr_thread_join(handle1, NULL);
-    mxr_thread_join(handle2, NULL);
-    mxr_thread_join(handle3, NULL);
+    thrd_join(thread1, NULL);
+    thrd_join(thread2, NULL);
+    thrd_join(thread3, NULL);
 
     END_TEST;
 }
 
 static bool test_try_mutexes(void) {
     BEGIN_TEST;
-    mxr_thread_t *handle1, *handle2, *handle3;
+    thrd_t thread1, thread2, thread3;
 
-    mxr_thread_create(mutex_try_thread_1, NULL, "thread 1", &handle1);
-    mxr_thread_create(mutex_try_thread_2, NULL, "thread 2", &handle2);
-    mxr_thread_create(mutex_try_thread_3, NULL, "thread 3", &handle3);
+    thrd_create_with_name(&thread1, mutex_try_thread_1, NULL, "thread 1");
+    thrd_create_with_name(&thread2, mutex_try_thread_2, NULL, "thread 2");
+    thrd_create_with_name(&thread3, mutex_try_thread_3, NULL, "thread 3");
 
-    mxr_thread_join(handle1, NULL);
-    mxr_thread_join(handle2, NULL);
-    mxr_thread_join(handle3, NULL);
+    thrd_join(thread1, NULL);
+    thrd_join(thread2, NULL);
+    thrd_join(thread3, NULL);
 
     EXPECT_TRUE(got_lock_1, "failed to get lock 1");
     EXPECT_TRUE(got_lock_2, "failed to get lock 2");

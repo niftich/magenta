@@ -10,6 +10,7 @@
 #include <assert.h>
 #include <debug.h>
 #include <err.h>
+#include <inttypes.h>
 #include <kernel/thread.h>
 #include <kernel/vm.h>
 #include <kernel/vm/vm_aspace.h>
@@ -32,33 +33,77 @@ extern int __data_end;
 extern int __bss_start;
 extern int __bss_end;
 
+// boot time allocated page full of zeros
+vm_page_t* zero_page;
+paddr_t zero_page_paddr;
+
+namespace {
+
 // mark the physical pages backing a range of virtual as in use.
 // allocate the physical pages and throw them away
-static void mark_pages_in_use(vaddr_t va, size_t len) {
-    LTRACEF("va 0x%lx, len 0x%zx\n", va, len);
+void MarkPagesInUse(vaddr_t va, size_t len) {
+    LTRACEF("va %#" PRIxPTR ", len %#zx\n", va, len);
 
     // make sure we are inclusive of all of the pages in the address range
     len = PAGE_ALIGN(len + (va & (PAGE_SIZE - 1)));
     va = ROUNDDOWN(va, PAGE_SIZE);
 
-    LTRACEF("aligned va 0x%lx, len 0x%zx\n", va, len);
+    LTRACEF("aligned va %#" PRIxPTR ", len 0x%zx\n", va, len);
 
+    list_node list = LIST_INITIAL_VALUE(list);
+
+    paddr_t start_pa = ULONG_MAX;
+    paddr_t runlen = 0;
     for (size_t offset = 0; offset < len; offset += PAGE_SIZE) {
         uint flags;
         paddr_t pa;
 
-        status_t err = arch_mmu_query(&vmm_aspace_to_obj(vmm_get_kernel_aspace())->arch_aspace(),
-                                      va + offset, &pa, &flags);
+        status_t err = arch_mmu_query(&vmm_aspace_to_obj(vmm_get_kernel_aspace())->arch_aspace(), va + offset,
+                                      &pa, &flags);
         if (err >= 0) {
-            // LTRACEF("va 0x%x, pa 0x%x, flags 0x%x, err %d\n", va + offset, pa, flags, err);
+            LTRACEF("va %#" PRIxPTR ", pa %#" PRIxPTR ", flags %#x, err %d, start_pa %#" PRIxPTR
+                    " runlen %#" PRIxPTR "\n",
+                    va + offset, pa, flags, err, start_pa, runlen);
 
-            // alloate the range, throw the results away
-            pmm_alloc_range(pa, 1, nullptr);
+            // see if we continue the run
+            if (pa == start_pa + runlen) {
+                runlen += PAGE_SIZE;
+            } else {
+                if (start_pa != ULONG_MAX) {
+                    // we just completed the run
+                    pmm_alloc_range(start_pa, runlen / PAGE_SIZE, &list);
+                }
+
+                // starting a new run
+                start_pa = pa;
+                runlen = PAGE_SIZE;
+            }
         } else {
-            panic("Could not find pa for va 0x%lx\n", va);
+            panic("Could not find pa for va %#" PRIxPTR "\n", va);
         }
     }
+
+    if (start_pa != ULONG_MAX && runlen > 0)
+        pmm_alloc_range(start_pa, runlen / PAGE_SIZE, &list);
+
+    // mark all of the pages we allocated as WIRED
+    vm_page_t* p;
+    list_for_every_entry (&list, p, vm_page_t, free.node) { p->state = VM_PAGE_STATE_WIRED; }
 }
+
+status_t ProtectRegion(VmAspace* aspace, vaddr_t va, uint arch_mmu_flags) {
+    auto r = aspace->FindRegion(va);
+    if (!r)
+        return ERR_NOT_FOUND;
+
+    auto vm_mapping = r->as_vm_mapping();
+    if (!vm_mapping)
+        return ERR_NOT_FOUND;
+
+    return vm_mapping->Protect(vm_mapping->base(), vm_mapping->size(), arch_mmu_flags);
+}
+
+} // namespace {}
 
 void vm_init_preheap(uint level) {
     LTRACE_ENTRY;
@@ -68,24 +113,30 @@ void vm_init_preheap(uint level) {
 
     // mark all of the kernel pages in use
     LTRACEF("marking all kernel pages as used\n");
-    mark_pages_in_use((vaddr_t)&_start, ((uintptr_t)&_end - (uintptr_t)&_start));
+    MarkPagesInUse((vaddr_t)&_start, ((uintptr_t)&_end - (uintptr_t)&_start));
 
     // mark the physical pages used by the boot time allocator
     if (boot_alloc_end != boot_alloc_start) {
-        LTRACEF("marking boot alloc used from 0x%lx to 0x%lx\n", boot_alloc_start, boot_alloc_end);
+        LTRACEF("marking boot alloc used from %#" PRIxPTR " to %#" PRIxPTR "\n", boot_alloc_start,
+                boot_alloc_end);
 
-        mark_pages_in_use(boot_alloc_start, boot_alloc_end - boot_alloc_start);
+        MarkPagesInUse(boot_alloc_start, boot_alloc_end - boot_alloc_start);
     }
-}
 
-void vm_init_post_ctors(uint level) {
-    VmAspace::KernelAspaceInitPostCtors();
+    // grab a page and mark it as the zero page
+    zero_page = pmm_alloc_page(0, &zero_page_paddr);
+    DEBUG_ASSERT(zero_page);
+
+    void* ptr = paddr_to_kvaddr(zero_page_paddr);
+    DEBUG_ASSERT(ptr);
+
+    arch_zero_page(ptr);
 }
 
 void vm_init_postheap(uint level) {
     LTRACE_ENTRY;
 
-    vmm_aspace_t* aspace = vmm_get_kernel_aspace();
+    VmAspace* aspace = VmAspace::kernel_aspace();
 
     // we expect the kernel to be in a temporary mapping, define permanent
     // regions for those now
@@ -99,40 +150,44 @@ void vm_init_postheap(uint level) {
             .name = "kernel_code",
             .base = (vaddr_t)&__code_start,
             .size = ROUNDUP((size_t)&__code_end - (size_t)&__code_start, PAGE_SIZE),
-            .arch_mmu_flags = ARCH_MMU_FLAG_PERM_RO,
+            .arch_mmu_flags = ARCH_MMU_FLAG_PERM_READ | ARCH_MMU_FLAG_PERM_EXECUTE,
         },
         {
             .name = "kernel_rodata",
             .base = (vaddr_t)&__rodata_start,
             .size = ROUNDUP((size_t)&__rodata_end - (size_t)&__rodata_start, PAGE_SIZE),
-            .arch_mmu_flags = ARCH_MMU_FLAG_PERM_RO | ARCH_MMU_FLAG_PERM_NO_EXECUTE,
+            .arch_mmu_flags = ARCH_MMU_FLAG_PERM_READ,
         },
         {
             .name = "kernel_data",
             .base = (vaddr_t)&__data_start,
             .size = ROUNDUP((size_t)&__data_end - (size_t)&__data_start, PAGE_SIZE),
-            .arch_mmu_flags = ARCH_MMU_FLAG_PERM_NO_EXECUTE,
+            .arch_mmu_flags = ARCH_MMU_FLAG_PERM_READ | ARCH_MMU_FLAG_PERM_WRITE,
         },
         {
             .name = "kernel_bss",
             .base = (vaddr_t)&__bss_start,
             .size = ROUNDUP((size_t)&__bss_end - (size_t)&__bss_start, PAGE_SIZE),
-            .arch_mmu_flags = ARCH_MMU_FLAG_PERM_NO_EXECUTE,
+            .arch_mmu_flags = ARCH_MMU_FLAG_PERM_READ | ARCH_MMU_FLAG_PERM_WRITE,
         },
         {
             .name = "kernel_bootalloc",
             .base = (vaddr_t)boot_alloc_start,
             .size = ROUNDUP(boot_alloc_end - boot_alloc_start, PAGE_SIZE),
-            .arch_mmu_flags = ARCH_MMU_FLAG_PERM_NO_EXECUTE,
+            .arch_mmu_flags = ARCH_MMU_FLAG_PERM_READ | ARCH_MMU_FLAG_PERM_WRITE,
         },
     };
 
     for (uint i = 0; i < countof(regions); ++i) {
         temp_region* region = &regions[i];
         ASSERT(IS_PAGE_ALIGNED(region->base));
-        status_t status = vmm_reserve_space(aspace, region->name, region->size, region->base);
+
+        dprintf(INFO, "VM: reserving kernel region [%016" PRIxPTR ", %016" PRIxPTR ") flags %#x name '%s'\n",
+                region->base, region->base + region->size, region->arch_mmu_flags, region->name);
+
+        status_t status = aspace->ReserveSpace(region->name, region->size, region->base);
         ASSERT(status == NO_ERROR);
-        status = vmm_protect_region(aspace, region->base, region->arch_mmu_flags);
+        status = ProtectRegion(aspace, region->base, region->arch_mmu_flags);
         ASSERT(status == NO_ERROR);
     }
 
@@ -145,7 +200,7 @@ void vm_init_postheap(uint level) {
         // Unmap temporary mappings except where they intersect with the
         // kernel code/data regions.
         vaddr_t vaddr = map->virt;
-        LTRACEF("vaddr 0x%lx, virt + size 0x%lx\n", vaddr, map->virt + map->size);
+        LTRACEF("vaddr %#" PRIxPTR ", virt + size %#" PRIxPTR "\n", vaddr, map->virt + map->size);
         while (vaddr != map->virt + map->size) {
             vaddr_t next_kernel_region = map->virt + map->size;
             vaddr_t next_kernel_region_end = map->virt + map->size;
@@ -166,21 +221,17 @@ void vm_init_postheap(uint level) {
             // If vaddr isn't the start of a kernel code/data region, then we should make
             // a mapping between it and the next closest one.
             if (next_kernel_region != vaddr) {
-                status_t status =
-                    vmm_reserve_space(aspace, map->name, next_kernel_region - vaddr, vaddr);
+                status_t status = aspace->ReserveSpace(map->name, next_kernel_region - vaddr, vaddr);
                 ASSERT(status == NO_ERROR);
 
                 if (map->flags & MMU_INITIAL_MAPPING_TEMPORARY) {
                     // If the region is part of a temporary mapping, immediately unmap it
-                    LTRACEF("Freeing region [%016lx, %016lx)\n", vaddr, next_kernel_region);
-                    status = vmm_free_region(aspace, vaddr);
+                    dprintf(INFO, "VM: freeing region [%016" PRIxPTR ", %016" PRIxPTR ")\n", vaddr, next_kernel_region);
+                    status = aspace->FreeRegion(vaddr);
                     ASSERT(status == NO_ERROR);
                 } else {
                     // Otherwise, mark it no-exec since it's not explicitly code
-                    status = vmm_protect_region(
-                        aspace,
-                        vaddr,
-                        ARCH_MMU_FLAG_PERM_NO_EXECUTE);
+                    status = ProtectRegion(aspace, vaddr, ARCH_MMU_FLAG_PERM_READ | ARCH_MMU_FLAG_PERM_WRITE);
                     ASSERT(status == NO_ERROR);
                 }
             }
@@ -202,7 +253,7 @@ void* paddr_to_kvaddr(paddr_t pa) {
     return nullptr;
 }
 
-paddr_t vaddr_to_paddr(void* ptr) {
+paddr_t vaddr_to_paddr(const void* ptr) {
     vmm_aspace_t* _aspace = vaddr_to_aspace(ptr);
     if (!_aspace)
         return (paddr_t) nullptr;
@@ -217,7 +268,7 @@ paddr_t vaddr_to_paddr(void* ptr) {
     return pa;
 }
 
-vmm_aspace_t* vaddr_to_aspace(void* ptr) {
+vmm_aspace_t* vaddr_to_aspace(const void* ptr) {
     if (is_kernel_address((vaddr_t)ptr)) {
         return vmm_get_kernel_aspace();
     } else if (is_user_address((vaddr_t)ptr)) {
@@ -227,7 +278,7 @@ vmm_aspace_t* vaddr_to_aspace(void* ptr) {
     }
 }
 
-static int cmd_vm(int argc, const cmd_args* argv) {
+static int cmd_vm(int argc, const cmd_args* argv, uint32_t flags) {
     if (argc < 2) {
     notenoughargs:
         printf("not enough arguments\n");
@@ -263,7 +314,7 @@ static int cmd_vm(int argc, const cmd_args* argv) {
         status_t err = arch_mmu_query(&aspace->arch_aspace(), argv[2].u, &pa, &flags);
         printf("arch_mmu_query returns %d\n", err);
         if (err >= 0) {
-            printf("\tpa 0x%lx, flags 0x%x\n", pa, flags);
+            printf("\tpa %#" PRIxPTR ", flags %#x\n", pa, flags);
         }
     } else if (!strcmp(argv[1].str, "map")) {
         if (argc < 6)
@@ -277,9 +328,10 @@ static int cmd_vm(int argc, const cmd_args* argv) {
 
         VmAspace* aspace = vmm_aspace_to_obj(_aspace);
 
-        int err = arch_mmu_map(&aspace->arch_aspace(), argv[3].u, argv[2].u, (uint)argv[4].u,
-                               (uint)argv[5].u);
-        printf("arch_mmu_map returns %d\n", err);
+        size_t mapped;
+        auto err =
+            arch_mmu_map(&aspace->arch_aspace(), argv[3].u, argv[2].u, (uint)argv[4].u, (uint)argv[5].u, &mapped);
+        printf("arch_mmu_map returns %d, mapped %zu\n", err, mapped);
     } else if (!strcmp(argv[1].str, "unmap")) {
         if (argc < 4)
             goto notenoughargs;
@@ -292,8 +344,9 @@ static int cmd_vm(int argc, const cmd_args* argv) {
 
         VmAspace* aspace = vmm_aspace_to_obj(_aspace);
 
-        int err = arch_mmu_unmap(&aspace->arch_aspace(), argv[2].u, (uint)argv[3].u);
-        printf("arch_mmu_unmap returns %d\n", err);
+        size_t unmapped;
+        auto err = arch_mmu_unmap(&aspace->arch_aspace(), argv[2].u, (uint)argv[3].u, &unmapped);
+        printf("arch_mmu_unmap returns %d, unmapped %zu\n", err, unmapped);
     } else {
         printf("unknown command\n");
         goto usage;
@@ -309,5 +362,4 @@ STATIC_COMMAND("vm", "vm commands", &cmd_vm)
 STATIC_COMMAND_END(vm);
 
 LK_INIT_HOOK(vm_preheap, &vm_init_preheap, LK_INIT_LEVEL_HEAP - 1);
-LK_INIT_HOOK(vm_post_ctors, &vm_init_post_ctors, LK_INIT_LEVEL_HEAP);
 LK_INIT_HOOK(vm, &vm_init_postheap, LK_INIT_LEVEL_VM);

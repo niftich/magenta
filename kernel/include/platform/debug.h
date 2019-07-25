@@ -11,12 +11,15 @@
 #include <sys/types.h>
 #include <stdbool.h>
 #include <stdarg.h>
-#include <compiler.h>
+#include <magenta/compiler.h>
 
 __BEGIN_CDECLS
 
-void platform_dputc(char c);
+void platform_dputs(const char* str, size_t len);
 int platform_dgetc(char *c, bool wait);
+static inline void platform_dputc(char c) {
+    platform_dputs(&c, 1);
+}
 
 // Should be available even if the system has panicked.
 void platform_pputc(char c);

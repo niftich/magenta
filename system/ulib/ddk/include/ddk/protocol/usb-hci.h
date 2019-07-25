@@ -1,41 +1,34 @@
-// Copyright 2016 The Fuchsia Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
 
 #pragma once
 
 #include <ddk/driver.h>
-#include <ddk/protocol/usb-device.h>
+#include <magenta/compiler.h>
+#include <magenta/hw/usb.h>
+#include <magenta/hw/usb-hub.h>
+#include <stdbool.h>
+
+__BEGIN_CDECLS;
 
 typedef struct usb_hci_protocol {
-    usb_request_t* (*alloc_request)(mx_device_t* dev, uint16_t size);
-    void (*free_request)(mx_device_t* dev, usb_request_t* request);
+    void (*set_bus_device)(mx_device_t* dev, mx_device_t* busdev);
+    size_t (*get_max_device_count)(mx_device_t* dev);
+    // enables or disables an endpoint using parameters derived from ep_desc
+    mx_status_t (*enable_endpoint)(mx_device_t* hci_device, uint32_t device_id,
+                                   usb_endpoint_descriptor_t* ep_desc, bool enable);
 
-    int (*queue_request)(mx_device_t* hcidev, int devaddr, usb_request_t* request);
-    int (*control)(mx_device_t* hcidev, int devaddr, usb_setup_t* devreq, int data_length,
-                   uint8_t* data);
+    // returns the current frame (in milliseconds), used for isochronous transfers
+    uint64_t (*get_current_frame)(mx_device_t* hci_device);
 
-    /* set_address(): Tell the usb device its address
-                      Also, allocate the usbdev structure, initialize enpoint 0
-                      (including MPS) and return its address. */
-    int (*set_address)(mx_device_t* hcidev, usb_speed_t speed, int hubport, int hubaddr);
-
-    /* finish_device_config(): Another hook for xHCI, returns 0 on success. */
-    int (*finish_device_config)(mx_device_t* hcidev, int devaddr, usb_device_config_t* config);
-
-    /* destroy_device(): Finally, destroy all structures that were allocated during set_address()
-                         and finish_device_config(). */
-    void (*destroy_device)(mx_device_t* hcidev, int devaddr);
-
-    void (*set_bus_device)(mx_device_t* hcidev, mx_device_t* busdev);
+    // Hub support
+    mx_status_t (*configure_hub)(mx_device_t* dev, uint32_t device_id, usb_speed_t speed,
+                 usb_hub_descriptor_t* descriptor);
+    mx_status_t (*hub_device_added)(mx_device_t* dev, uint32_t device_id, int port, usb_speed_t speed);
+    mx_status_t (*hub_device_removed)(mx_device_t* dev, uint32_t device_id, int port);
+    mx_status_t (*reset_endpoint)(mx_device_t* device, uint32_t device_id, uint8_t ep_address);
+    size_t (*get_max_transfer_size)(mx_device_t* device, uint32_t device_id, uint8_t ep_address);
 } usb_hci_protocol_t;
+
+__END_CDECLS;

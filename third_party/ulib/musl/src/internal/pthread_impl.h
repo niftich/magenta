@@ -1,106 +1,118 @@
 #pragma once
 
 #include "atomic.h"
+#include "ksigaction.h"
 #include "libc.h"
-#include "syscall.h"
+#include "pthread_arch.h"
+#include <assert.h>
 #include <errno.h>
 #include <limits.h>
+#include <locale.h>
 #include <pthread.h>
 #include <signal.h>
+#include <sys/uio.h>
+#include <threads.h>
 
-#include <runtime/mutex.h>
+#include <magenta/stack.h>
+#include <magenta/tls.h>
+#include <runtime/thread.h>
 #include <runtime/tls.h>
 
 #define pthread __pthread
 
-struct __mx_thread_info {
-    void* (*func)(void*);
-    void* arg;
-    void* tls;
-    int errno_value;
-};
+// This is what the thread pointer points to directly.  On TLS_ABOVE_TP
+// machines, the size of this is part of the ABI known to the compiler
+// and linker.
+typedef struct {
+    // The position of this pointer is part of the ABI on x86.
+    // It has the same value as the thread pointer itself.
+    uintptr_t tp;
+    void** dtv;
+} tcbhead_t;
+
+// The locations of these fields is part of the ABI known to the compiler.
+typedef struct {
+    uintptr_t stack_guard;
+    uintptr_t unsafe_sp;
+} tp_abi_t;
+
+struct tls_dtor;
 
 struct pthread {
-    struct pthread* self;
-    void **dtv, *unused1, *unused2;
-    uintptr_t canary, canary2;
-    pid_t tid, pid;
+#ifndef TLS_ABOVE_TP
+    // These must be the very first members.
+    tcbhead_t head;
+    tp_abi_t abi;
+#endif
+
+    mxr_thread_t mxr_thread;
+
+    // The *_region fields describe whole memory regions reserved,
+    // including guard pages (for deallocation).  safe_stack and
+    // unsafe_stack describe just the actual stack block between the
+    // guards.
+    struct iovec tcb_region;
+    struct iovec safe_stack, safe_stack_region;
+    struct iovec unsafe_stack, unsafe_stack_region;
+
+    struct tls_dtor* tls_dtors;
+    void* tsd[PTHREAD_KEYS_MAX];
     int tsd_used;
-    volatile int cancel, canceldisable, cancelasync;
-    int detached;
-    unsigned char* map_base;
-    size_t map_size;
-    void* stack;
-    size_t stack_size;
+    int errno_value;
+
     void* start_arg;
     void* (*start)(void*);
     void* result;
-    struct __ptcb* cancelbuf;
-    void** tsd;
-    pthread_attr_t attr;
-    volatile int dead;
-    int unblock_cancel;
-    volatile int timer_id;
     locale_t locale;
-    mxr_mutex_t killlock;
-    mxr_mutex_t exitlock;
-    mxr_mutex_t startlock;
-    unsigned long sigmask[_NSIG / 8 / sizeof(long)];
     char* dlerror_buf;
     int dlerror_flag;
-    void* stdio_locks;
-    uintptr_t canary_at_end;
-    void** dtv_copy;
-    mx_handle_t handle;
-    struct __mx_thread_info mx_thread_info;
-};
 
-struct __timer {
-    int timerid;
-    pthread_t thread;
-};
-
-#define __SU (sizeof(size_t) / sizeof(int))
-
-#define _a_stacksize __u.__s[0]
-#define _a_guardsize __u.__s[1]
-#define _a_stackaddr __u.__s[2]
-#define _a_detach __u.__i[3 * __SU + 0]
-#define _a_sched __u.__i[3 * __SU + 1]
-#define _a_policy __u.__i[3 * __SU + 2]
-#define _a_prio __u.__i[3 * __SU + 3]
-#define _m_type __u.__i[0]
-#define _m_lock __u.__vi[1]
-#define _m_waiters __u.__vi[2]
-#define _m_count __u.__i[5]
-#define _c_seq __u.__vi[2]
-#define _c_waiters __u.__vi[3]
-#define _c_clock __u.__i[4]
-#define _c_lock __u.__vi[8]
-#define _c_head __u.__p[1]
-#define _c_tail __u.__p[5]
-#define _rw_lock __u.__vi[0]
-#define _rw_waiters __u.__vi[1]
-#define _b_lock __u.__vi[0]
-#define _b_waiters __u.__vi[1]
-#define _b_limit __u.__i[2]
-#define _b_count __u.__vi[3]
-#define _b_waiters2 __u.__vi[4]
-#define _b_inst __u.__p[3]
-
-#include "pthread_arch.h"
-
-#ifndef CANARY
-#define CANARY canary
+#ifdef TLS_ABOVE_TP
+    // These must be the very last members.
+    tp_abi_t abi;
+    tcbhead_t head;
 #endif
+};
+
+#ifdef TLS_ABOVE_TP
+#define PTHREAD_TP_OFFSET offsetof(struct pthread, head)
+#else
+#define PTHREAD_TP_OFFSET 0
+#endif
+
+#define TP_OFFSETOF(field) \
+    ((ptrdiff_t)offsetof(struct pthread, field) - PTHREAD_TP_OFFSET)
+
+static_assert(TP_OFFSETOF(head) == 0,
+              "ABI tcbhead_t misplaced in struct pthread");
+
+#ifdef ABI_TCBHEAD_SIZE
+static_assert((sizeof(struct pthread) -
+               offsetof(struct pthread, head)) == ABI_TCBHEAD_SIZE,
+              "ABI tcbhead_t misplaced in struct pthread");
+#endif
+
+#if defined(__x86_64__) || defined(__aarch64__)
+// The tlsdesc.s assembly code assumes this, though it's not part of the ABI.
+static_assert(TP_OFFSETOF(head.dtv) == 8, "dtv misplaced in struct pthread");
+#endif
+
+static_assert(TP_OFFSETOF(abi.stack_guard) == MX_TLS_STACK_GUARD_OFFSET,
+              "stack_guard not at ABI-mandated offset from thread pointer");
+static_assert(TP_OFFSETOF(abi.unsafe_sp) == MX_TLS_UNSAFE_SP_OFFSET,
+              "unsafe_sp not at ABI-mandated offset from thread pointer");
+
+static inline void* pthread_to_tp(struct pthread* thread) {
+    return (void*)((char*)thread + PTHREAD_TP_OFFSET);
+}
+
+static inline struct pthread* tp_to_pthread(void* tp) {
+    return (struct pthread*)((char*)tp - PTHREAD_TP_OFFSET);
+}
 
 #ifndef DTP_OFFSET
 #define DTP_OFFSET 0
 #endif
-
-#define SIGTIMER 32
-#define SIGCANCEL 33
-#define SIGSYNCCALL 34
 
 #define SIGALL_SET ((sigset_t*)(const unsigned long long[2]){-1, -1})
 #define SIGPT_SET                                                                     \
@@ -109,41 +121,92 @@ struct __timer {
                                                                     << (32 * (sizeof(long) > 4))})
 #define SIGTIMER_SET ((sigset_t*)(const unsigned long[_NSIG / 8 / sizeof(long)]){0x80000000})
 
-pthread_t __pthread_self_init(void);
+#define PTHREAD_MUTEX_MASK (PTHREAD_MUTEX_RECURSIVE | PTHREAD_MUTEX_ERRORCHECK)
+// The bit used in the recursive and errorchecking cases, which track thread owners.
+#define PTHREAD_MUTEX_OWNED_LOCK_BIT 0x80000000
+#define PTHREAD_MUTEX_OWNED_LOCK_MASK 0x7fffffff
 
-extern mxr_tls_t __pthread_key;
-static inline struct pthread* __pthread_self(void) {
-    return mxr_tls_get(__pthread_key);
+extern void* __pthread_tsd_main[];
+extern volatile size_t __pthread_tsd_size;
+
+static inline pthread_t __pthread_self(void) {
+    return tp_to_pthread(mxr_tp_get());
 }
 
 static inline pid_t __thread_get_tid(void) {
-    // TODO(kulakowski) Replace this with the current thread handle's
-    // ID when magenta exposes those.
-    return (pid_t)(intptr_t)mxr_tls_root_get();
+    // We rely on the fact that the high bit is not set. For now,
+    // let's incur the cost of this check, until we consider the
+    // userspace handle value representation completely baked.
+    pid_t id = __pthread_self()->mxr_thread.handle;
+    if (id & PTHREAD_MUTEX_OWNED_LOCK_BIT) {
+        __builtin_trap();
+    }
+    return id;
 }
 
-int __clone(int (*)(void*), void*, int, void*, ...);
+// Signal n (or all, for -1) threads on a pthread_cond_t or cnd_t.
+void __private_cond_signal(void* condvar, int n);
+
 int __libc_sigaction(int, const struct sigaction*, struct sigaction*);
 int __libc_sigprocmask(int, const sigset_t*, sigset_t*);
-void __unmapself(void*, size_t);
 
-void __vm_wait(void);
-void __vm_lock(void);
-void __vm_unlock(void);
+// This is guaranteed to only return 0, EINVAL, or ETIMEDOUT.
+int __timedwait(atomic_int*, int, clockid_t, const struct timespec*)
+    ATTR_LIBC_VISIBILITY;
 
-// These are guaranteed to only return 0, EINVAL, or ETIMEDOUT.
-int __timedwait(volatile int*, int, clockid_t, const struct timespec*);
-int __timedwait_cp(volatile int*, int, clockid_t, const struct timespec*);
+// Loading a library can introduce more thread_local variables. Thread
+// allocation bases bookkeeping decisions based on the current state
+// of thread_locals in the program, so thread creation needs to be
+// inhibited by a concurrent dlopen. This lock implements that
+// exclusion.
+void __thread_allocation_inhibit(void) ATTR_LIBC_VISIBILITY;
+void __thread_allocation_release(void) ATTR_LIBC_VISIBILITY;
 
-void __acquire_ptc(void);
-void __release_ptc(void);
-void __inhibit_ptc(void);
+void __block_all_sigs(void*) ATTR_LIBC_VISIBILITY;
+void __block_app_sigs(void*) ATTR_LIBC_VISIBILITY;
+void __restore_sigs(void*) ATTR_LIBC_VISIBILITY;
 
-void __block_all_sigs(void*);
-void __block_app_sigs(void*);
-void __restore_sigs(void*);
+void __pthread_tsd_run_dtors(void) ATTR_LIBC_VISIBILITY;
 
-#define DEFAULT_STACK_SIZE 81920
-#define DEFAULT_GUARD_SIZE PAGE_SIZE
+static inline int __sigaltstack(const stack_t* restrict ss, stack_t* restrict old) {
+    return 0;
+}
 
-#define __ATTRP_C11_THREAD ((void*)(uintptr_t)-1)
+static inline int __rt_sigprocmask(int how, const sigset_t* restrict set,
+                                   sigset_t* restrict old_set, size_t sigmask_size) {
+    return 0;
+}
+
+static inline int __rt_sigaction(int sig, const struct k_sigaction* restrict action,
+                                 struct k_sigaction* restrict old_action,
+                                 size_t sigaction_mask_size) {
+    return 0;
+}
+
+static inline int __rt_sigpending(sigset_t* set, size_t sigset_size) {
+    return 0;
+}
+
+static inline int __rt_sigsuspend(const sigset_t* set, size_t sigset_size) {
+    return 0;
+}
+
+static inline int __rt_sigtimedwait(const sigset_t* restrict set, siginfo_t* restrict info,
+                                    const struct timespec* restrict timeout, size_t sigset_size) {
+    return 0;
+}
+
+static inline int __rt_sigqueueinfo(pid_t pid, int sig, siginfo_t* info) {
+    return 0;
+}
+
+#define DEFAULT_PTHREAD_ATTR                                                  \
+    ((pthread_attr_t){                                                        \
+        ._a_stacksize = MAGENTA_DEFAULT_STACK_SIZE,                           \
+        ._a_guardsize = PAGE_SIZE,                                            \
+    })
+
+pthread_t __allocate_thread(const pthread_attr_t* attr)
+    __attribute__((nonnull(1))) ATTR_LIBC_VISIBILITY;
+
+pthread_t __init_main_thread(mx_handle_t thread_self) ATTR_LIBC_VISIBILITY;

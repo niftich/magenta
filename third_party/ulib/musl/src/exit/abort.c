@@ -3,8 +3,8 @@
 #include <magenta/syscalls.h>
 
 _Noreturn void abort(void) {
-    // TODO(kulakowski) This can (and should) be more robust.
     for (;;) {
-        mx_exit(-1);
+        __builtin_trap();
+        _mx_process_exit(-1);
     }
 }

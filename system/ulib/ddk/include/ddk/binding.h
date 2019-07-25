@@ -1,21 +1,14 @@
-// Copyright 2016 The Fuchsia Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
 
 #pragma once
 
+#include <ddk/driver.h>
+#include <magenta/compiler.h>
 #include <stdint.h>
 
+__BEGIN_CDECLS;
 
 // COAABBBB VVVVVVVV  Condition Opcode paramA paramB Value
 
@@ -64,10 +57,13 @@
 #define BI_SET_IF(c,b,v,f)    BINDINST(COND_##c,OP_SET,f,b,v)
 #define BI_CLEAR_IF(c,b,v,f)  BINDINST(COND_##c,OP_CLEAR,f,b,v)
 
+// for drivers that only want to be bound on user request
+#define BI_ABORT_IF_AUTOBIND  BI_ABORT_IF(NE, BIND_AUTOBIND, 0)
 
 // global binding variables at 0x00XX
 #define BIND_FLAGS            0x0000 // value of the flags register
 #define BIND_PROTOCOL         0x0001 // primary protcol of the device
+#define BIND_AUTOBIND         0x0002 // if this is an automated bind/load
 
 // pci binding variables at 0x01XX
 #define BIND_PCI_VID          0x0100
@@ -76,6 +72,17 @@
 #define BIND_PCI_SUBCLASS     0x0103
 #define BIND_PCI_INTERFACE    0x0104
 #define BIND_PCI_REVISION     0x0105
+#define BIND_PCI_BDF_ADDR     0x0106
+
+// pci binding variable utils
+#define BIND_PCI_BDF_PACK(bus, dev, func) \
+    ((((uint32_t)(bus)  & 0xFF) << 8) |   \
+     (((uint32_t)(dev)  & 0x1F) << 3) |   \
+      ((uint32_t)(func) & 0x07))
+
+#define BIND_PCI_BDF_UNPACK_BUS(bdf) (((uint32_t)(bdf) >> 8) & 0xFF)
+#define BIND_PCI_BDF_UNPACK_DEV(bdf) (((uint32_t)(bdf) >> 3) & 0x1F)
+#define BIND_PCI_BDF_UNPACK_FUNC(bdf) ((uint32_t)(bdf) & 0x07)
 
 // usb binding variables at 0x02XX
 #define BIND_USB_VID          0x0200
@@ -83,9 +90,31 @@
 #define BIND_USB_CLASS        0x0202
 #define BIND_USB_SUBCLASS     0x0203
 #define BIND_USB_PROTOCOL     0x0204
-#define BIND_USB_IFC_CLASS    0x0205
-#define BIND_USB_IFC_SUBCLASS 0x0206
-#define BIND_USB_IFC_PROTOCOL 0x0207
+
+// Platform device binding variables at 0x03XX
+#define BIND_PLATFORM_DEV_VID 0x0300
+#define BIND_PLATFORM_DEV_PID 0x0301
+#define BIND_PLATFORM_DEV_DID 0x0302
+
+// ACPI binding variables at 0x04XX
+// The _HID is a 7- or 8-byte string. Because a bind property is 32-bit, use 2
+// properties to bind using the _HID. They are encoded in big endian order for
+// human readability. In the case of 7-byte _HID's, the 8th-byte shall be 0.
+#define BIND_ACPI_HID_0_3      0x0400 // char 0-3
+#define BIND_ACPI_HID_4_7      0x0401 // char 4-7
+
+// Intel HDA Codec binding variables at 0x05XX
+#define BIND_IHDA_CODEC_VID         0x0500
+#define BIND_IHDA_CODEC_DID         0x0501
+#define BIND_IHDA_CODEC_MAJOR_REV   0x0502
+#define BIND_IHDA_CODEC_MINOR_REV   0x0503
+#define BIND_IHDA_CODEC_VENDOR_REV  0x0504
+#define BIND_IHDA_CODEC_VENDOR_STEP 0x0505
+
+// TEMPORARY binding variables at 0xfXX
+// I2C_ADDR is a temporary way to bind the i2c touchscreen on the Acer12. This
+// binding will eventually be made via some sort of ACPI device enumeration.
+#define BIND_I2C_ADDR         0x0f00
 
 typedef struct mx_bind_inst {
     uint32_t op;
@@ -108,3 +137,94 @@ mx_bind_inst_t i915_binding[] = {
     BI_ABORT(),
 };
 #endif
+
+#define MAGENTA_NOTE_DRIVER 0x00010000
+
+typedef struct __attribute__((packed)) {
+    uint32_t namesz;
+    uint32_t descsz;
+    uint32_t type;
+    char name[8];
+} magenta_note_header_t;
+
+typedef struct __attribute__((packed)) {
+    uint32_t bindcount;
+    uint32_t reserved;
+    char name[32];
+    char vendor[16];
+    char version[16];
+} magenta_note_driver_t;
+
+typedef struct mx_driver {
+    const char* name;
+    mx_driver_ops_t* ops;
+    uint32_t flags;
+} mx_driver_t;
+
+typedef struct magenta_driver_info {
+    const mx_driver_t* driver;
+    const magenta_note_driver_t* note;
+} magenta_driver_info_t;
+
+#define MAGENTA_DRIVER_PASTE(a,b) a##b
+#define MAGENTA_STRINGIFY(x) #x
+#define MAGENTA_TOSTRING(x) MAGENTA_STRINGIFY(x)
+
+#if MAGENTA_BUILTIN_DRIVERS
+#define MAGENTA_DRIVER_ATTR_DECL
+#define MAGENTA_DRIVER_ATTR_DEF __ALIGNED(sizeof(void*)) __SECTION("magenta_drivers")
+#define MAGENTA_DRIVER_SYMBOL(Driver) MAGENTA_DRIVER_PASTE(__magenta_driver_info__,Driver)
+#define MAGENTA_DRIVER_NOTE(Driver)
+#else
+// GCC has a quirk about how '__attribute__((visibility("default")))'
+// (__EXPORT here) works for const variables in C++.  The attribute has no
+// effect when used on the definition of a const variable, and GCC gives a
+// warning/error about that.  The attribute must appear on the "extern"
+// declaration of the variable instead.
+#define MAGENTA_DRIVER_ATTR_DECL __EXPORT
+#define MAGENTA_DRIVER_ATTR_DEF
+#define MAGENTA_DRIVER_NOTE(Driver) __attribute__((section(".note.magenta.driver." #Driver)))
+#define MAGENTA_DRIVER_SYMBOL(Driver) __magenta_driver__
+#endif
+
+#define MAGENTA_DRIVER_DEF(Driver,Ops,Flags) \
+mx_driver_t MAGENTA_DRIVER_PASTE(_driver_,Driver) = {\
+    /* .name */ MAGENTA_TOSTRING(Driver),\
+    /* .ops */ &Ops,\
+    /* .flags */ Flags,\
+};
+
+#define MAGENTA_DRIVER_BEGIN_ETC(Driver,Ops,Flags,VendorName,Version,BindCount) \
+MAGENTA_DRIVER_DEF(Driver, Ops, Flags) \
+MAGENTA_DRIVER_NOTE(Driver)\
+const struct __attribute__((packed)) {\
+    magenta_note_header_t note;\
+    magenta_note_driver_t driver;\
+    mx_bind_inst_t binding[BindCount];\
+} MAGENTA_DRIVER_PASTE(__magenta_driver_note__,Driver) = {\
+    /* .note = */ {\
+        /* .namesz = */ 7,\
+        /* .descsz = */ sizeof(magenta_note_driver_t) + sizeof(mx_bind_inst_t) * (BindCount),\
+        /* .type = */ MAGENTA_NOTE_DRIVER,\
+        /* .name = */ "Magenta",\
+    },\
+    /* .driver = */ {\
+        /* .bindcount = */ (BindCount),\
+        /* .reserved = */ 0,\
+        /* .name = */ MAGENTA_TOSTRING(Driver),\
+        /* .vendor = */ VendorName,\
+        /* .version = */ Version,\
+    },\
+    /* .binding = */ {
+
+#define MAGENTA_DRIVER_BEGIN(Driver,Ops,VendorName,Version,BindCount) \
+    MAGENTA_DRIVER_BEGIN_ETC(Driver,Ops,0,VendorName,Version,BindCount) \
+
+#define MAGENTA_DRIVER_END(Driver) }};\
+extern const magenta_driver_info_t MAGENTA_DRIVER_SYMBOL(Driver) MAGENTA_DRIVER_ATTR_DECL; \
+const magenta_driver_info_t MAGENTA_DRIVER_SYMBOL(Driver) MAGENTA_DRIVER_ATTR_DEF = { \
+    /* .driver = */ &MAGENTA_DRIVER_PASTE(_driver_,Driver),\
+    /* .note = */ &MAGENTA_DRIVER_PASTE(__magenta_driver_note__,Driver).driver,\
+};
+
+__END_CDECLS;

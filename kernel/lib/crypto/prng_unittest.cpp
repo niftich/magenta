@@ -20,6 +20,47 @@ bool instantiate(void*) {
     END_TEST;
 }
 
+bool non_thread_safe_prng_same_behavior(void*) {
+    BEGIN_TEST;
+
+    static const char kSeed1[32] = {'1', '2', '3'};
+    static const int kSeed1Size = sizeof(kSeed1);
+    static const char kSeed2[32] = {'a', 'b', 'c'};
+    static const int kSeed2Size = sizeof(kSeed2);
+    static const int kDrawSize = 13;
+
+    PRNG prng1(kSeed1, kSeed1Size, PRNG::NonThreadSafeTag());
+    PRNG prng2(kSeed1, kSeed1Size);
+
+    EXPECT_FALSE(prng1.is_thread_safe(), "unexpected PRNG state");
+    EXPECT_TRUE(prng2.is_thread_safe(), "unexpected PRNG state");
+
+    uint8_t out1[kDrawSize];
+    uint8_t out2[kDrawSize];
+    prng1.Draw(out1, sizeof(out1));
+    prng2.Draw(out2, sizeof(out2));
+    EXPECT_EQ(0, memcmp(out1, out2, sizeof(out1)), "inconsistent prng");
+
+    // Verify they stay in sync after adding entropy
+    prng1.AddEntropy(kSeed2, kSeed2Size);
+    prng2.AddEntropy(kSeed2, kSeed2Size);
+
+    prng1.Draw(out1, sizeof(out1));
+    prng2.Draw(out2, sizeof(out2));
+    EXPECT_EQ(0, memcmp(out1, out2, sizeof(out1)), "inconsistent prng");
+
+    // Verify they stay in sync after the non-thread-safe one transitions
+    // to being thread-safe.
+    prng1.BecomeThreadSafe();
+    EXPECT_TRUE(prng1.is_thread_safe(), "unexpected PRNG state");
+
+    prng1.Draw(out1, sizeof(out1));
+    prng2.Draw(out2, sizeof(out2));
+    EXPECT_EQ(0, memcmp(out1, out2, sizeof(out1)), "inconsistent prng");
+
+    END_TEST;
+}
+
 bool prng_output(void*) {
     BEGIN_TEST;
 
@@ -67,13 +108,45 @@ bool prng_output(void*) {
     END_TEST;
 }
 
+bool prng_randint(void*) {
+    BEGIN_TEST;
+
+    static const char kSeed[32] = {'a', 'b', 'c'};
+    static const int kSeedSize = sizeof(kSeed);
+
+    PRNG prng(kSeed, kSeedSize);
+
+    // Technically could fall out of the log2 loop below, but let's be explicit
+    // about this case.
+    for (int i = 0; i < 100; ++i) {
+        EXPECT_EQ(prng.RandInt(1), 0u, "RandInt(1) must equal 0");
+    }
+
+    for (int log2 = 1; log2 < 64; ++log2) {
+        for (int i = 0; i < 100; ++i) {
+            uint64_t bound = 1ull << log2;
+            EXPECT_LT(prng.RandInt(bound), bound, "RandInt(2^i) must be less than 2^i");
+        }
+    }
+
+    bool high_bit = false;
+    for (int i = 0; i < 100; ++i) {
+        high_bit |= !!(prng.RandInt(UINT64_MAX) & (1ull<<63));
+    }
+    EXPECT_TRUE(high_bit, "RandInt(UINT64_MAX) should have high bit set sometimes");
+
+    END_TEST;
+}
+
 } // namespace
 
 UNITTEST_START_TESTCASE(prng_tests)
 UNITTEST("Instantiate", instantiate)
+UNITTEST("NonThreadSafeMode", non_thread_safe_prng_same_behavior)
 UNITTEST("Test Output", prng_output)
+UNITTEST("Test RandInt", prng_randint)
 UNITTEST_END_TESTCASE(prng_tests, "prng",
                       "Test pseudo-random number generator implementation.",
-                      NULL, NULL);
+                      nullptr, nullptr);
 
 } // namespace crypto

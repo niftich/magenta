@@ -9,30 +9,12 @@ LOCAL_DIR := $(GET_LOCAL_DIR)
 
 MODULE := $(LOCAL_DIR)
 
-WITH_KERNEL_VM=1
-WITH_LINKER_GC ?= 1
-
-ifeq ($(SUBARCH),x86-32)
-MEMBASE ?= 0x00000000
-KERNEL_BASE ?= 0x80000000
-KERNEL_SIZE ?= 0x40000000 # 1GB
-KERNEL_LOAD_OFFSET ?= 0x00100000
-HEADER_LOAD_OFFSET ?= 0x00010000
-PHYS_HEADER_LOAD_OFFSET ?= 0x00002000
-KERNEL_ASPACE_BASE ?= 0x80000000
-KERNEL_ASPACE_SIZE ?= 0x7ff00000
-USER_ASPACE_BASE   ?= 0x01000000 # 16MB
-USER_ASPACE_SIZE   ?= 0x7e000000 # full 2GB - 32MB
-
-SUBARCH_DIR := $(LOCAL_DIR)/32
-endif
-ifeq ($(SUBARCH),x86-64)
 MEMBASE ?= 0
 KERNEL_BASE ?= 0xffffffff80000000
 KERNEL_SIZE ?= 0x40000000 # 1GB
 KERNEL_LOAD_OFFSET ?= 0x00100000
 HEADER_LOAD_OFFSET ?= 0x00010000
-PHYS_HEADER_LOAD_OFFSET ?= 0x00002000
+PHYS_HEADER_LOAD_OFFSET ?= 0
 KERNEL_ASPACE_BASE ?= 0xffffff8000000000UL # -512GB
 KERNEL_ASPACE_SIZE ?= 0x0000008000000000UL
 USER_ASPACE_BASE   ?= 0x0000000001000000UL # 16MB
@@ -42,7 +24,6 @@ USER_ASPACE_BASE   ?= 0x0000000001000000UL # 16MB
 # USER_ASPACE_SIZE below.
 USER_ASPACE_SIZE   ?= 0x00007ffffefff000UL
 SUBARCH_DIR := $(LOCAL_DIR)/64
-endif
 
 SUBARCH_BUILDDIR := $(call TOBUILDDIR,$(SUBARCH_DIR))
 
@@ -65,75 +46,69 @@ MODULE_SRCS += \
 	$(SUBARCH_DIR)/start.S \
 	$(SUBARCH_DIR)/asm.S \
 	$(SUBARCH_DIR)/exceptions.S \
+	$(SUBARCH_DIR)/hypervisor.S \
 	$(SUBARCH_DIR)/ops.S \
-\
-	$(LOCAL_DIR)/arch.c \
-	$(LOCAL_DIR)/cache.c \
-	$(LOCAL_DIR)/descriptor.c \
-	$(LOCAL_DIR)/faults.c \
-	$(LOCAL_DIR)/feature.c \
-	$(LOCAL_DIR)/gdt.S \
-	$(LOCAL_DIR)/header.S \
-	$(LOCAL_DIR)/idt.c \
-	$(LOCAL_DIR)/ioapic.c \
-	$(LOCAL_DIR)/ioport.c \
-	$(LOCAL_DIR)/lapic.c \
-	$(LOCAL_DIR)/mmu.cpp \
-	$(LOCAL_DIR)/mmu_mem_types.c \
-	$(LOCAL_DIR)/mp.c \
-	$(LOCAL_DIR)/registers.c \
-	$(LOCAL_DIR)/thread.c \
-	$(LOCAL_DIR)/tsc.c \
-	$(LOCAL_DIR)/user_copy.c \
-
-ifeq ($(SUBARCH),x86-64)
-MODULE_SRCS += \
 	$(SUBARCH_DIR)/syscall.S \
-	$(SUBARCH_DIR)/user_copy.S
-endif
+	$(SUBARCH_DIR)/user_copy.S \
+	$(SUBARCH_DIR)/uspace_entry.S \
+\
+	$(LOCAL_DIR)/arch.cpp \
+	$(LOCAL_DIR)/cache.cpp \
+	$(LOCAL_DIR)/cpu_topology.cpp \
+	$(LOCAL_DIR)/debugger.cpp \
+	$(LOCAL_DIR)/descriptor.cpp \
+	$(LOCAL_DIR)/faults.cpp \
+	$(LOCAL_DIR)/feature.cpp \
+	$(LOCAL_DIR)/gdt.S \
+	$(LOCAL_DIR)/mexec.S \
+	$(LOCAL_DIR)/header.S \
+	$(LOCAL_DIR)/hypervisor.cpp \
+	$(LOCAL_DIR)/idt.cpp \
+	$(LOCAL_DIR)/ioapic.cpp \
+	$(LOCAL_DIR)/ioport.cpp \
+	$(LOCAL_DIR)/lapic.cpp \
+	$(LOCAL_DIR)/mmu.cpp \
+	$(LOCAL_DIR)/mmu_mem_types.cpp \
+	$(LOCAL_DIR)/mmu_tests.cpp \
+	$(LOCAL_DIR)/mp.cpp \
+	$(LOCAL_DIR)/proc_trace.cpp \
+	$(LOCAL_DIR)/registers.cpp \
+	$(LOCAL_DIR)/thread.cpp \
+	$(LOCAL_DIR)/tsc.cpp \
+	$(LOCAL_DIR)/user_copy.cpp \
+	$(LOCAL_DIR)/vmexit.cpp \
+
+MODULE_DEPS += \
+	kernel/lib/bitmap \
+	kernel/lib/hypervisor \
 
 include $(LOCAL_DIR)/toolchain.mk
 
-# Enable SMP for x86-64
-ifeq ($(SUBARCH),x86-64)
+# enable more if smp is requested
+ifeq ($(call TOBOOL,$(WITH_SMP)),true)
+
+SMP_MAX_CPUS ?= 16
 KERNEL_DEFINES += \
-	WITH_SMP=1 \
-	SMP_MAX_CPUS=16
+	WITH_SMP=1
 MODULE_SRCS += \
-	$(SUBARCH_DIR)/bootstrap16.c \
-	$(SUBARCH_DIR)/smp.c \
-	$(SUBARCH_DIR)/start16.S \
-	$(SUBARCH_DIR)/suspend.S \
-	$(SUBARCH_DIR)/uspace_entry.S
-endif # SUBARCH x86-64
-ifeq ($(SUBARCH),x86-32)
+	$(SUBARCH_DIR)/bootstrap16.cpp \
+	$(SUBARCH_DIR)/smp.cpp \
+	$(SUBARCH_DIR)/start16.S
+
+endif
+
+# always set this to something
 KERNEL_DEFINES += \
-	SMP_MAX_CPUS=1
-endif # SUBARCH x86-32
+	SMP_MAX_CPUS=$(SMP_MAX_CPUS)
 
 # set the default toolchain to x86 elf and set a #define
-ifeq ($(SUBARCH),x86-32)
-ifndef TOOLCHAIN_PREFIX
-TOOLCHAIN_PREFIX := $(ARCH_x86_TOOLCHAIN_PREFIX)
-endif
-endif # SUBARCH x86-32
-ifeq ($(SUBARCH),x86-64)
 ifndef TOOLCHAIN_PREFIX
 TOOLCHAIN_PREFIX := $(ARCH_x86_64_TOOLCHAIN_PREFIX)
 endif
-endif # SUBARCH x86-64
 
 #$(warning ARCH_x86_TOOLCHAIN_PREFIX = $(ARCH_x86_TOOLCHAIN_PREFIX))
 #$(warning ARCH_x86_64_TOOLCHAIN_PREFIX = $(ARCH_x86_64_TOOLCHAIN_PREFIX))
 #$(warning TOOLCHAIN_PREFIX = $(TOOLCHAIN_PREFIX))
-
-ifeq ($(CLANG),1)
-ifeq ($(LIBGCC),)
-$(error cannot find runtime library, please set LIBGCC)
-endif
-else
-LIBGCC := $(shell $(TOOLCHAIN_PREFIX)gcc $(CFLAGS) -print-libgcc-file-name)
-endif
 
 cc-option = $(shell if test -z "`$(1) $(2) -S -o /dev/null -xc /dev/null 2>&1`"; \
 	then echo "$(2)"; else echo "$(3)"; fi ;)
@@ -141,49 +116,50 @@ cc-option = $(shell if test -z "`$(1) $(2) -S -o /dev/null -xc /dev/null 2>&1`";
 # disable SSP if the compiler supports it; it will break stuff
 GLOBAL_CFLAGS += $(call cc-option,$(CC),-fno-stack-protector,)
 
-GLOBAL_COMPILEFLAGS += -gdwarf-2
-ifeq ($(CLANG),1)
+ifeq ($(call TOBOOL,$(USE_CLANG)),true)
 GLOBAL_LDFLAGS += -m elf_x86_64
 GLOBAL_MODULE_LDFLAGS += -m elf_x86_64
 endif
 GLOBAL_LDFLAGS += -z max-page-size=4096
-ifneq ($(CLANG),1)
+ifeq ($(call TOBOOL,$(USE_CLANG)),false)
 KERNEL_COMPILEFLAGS += -falign-jumps=1 -falign-loops=1 -falign-functions=4
 endif
 
 # hard disable floating point in the kernel
-KERNEL_COMPILEFLAGS += -msoft-float -mno-mmx -mno-sse -mno-sse2 -mno-3dnow -mno-avx -mno-avx2 -DWITH_NO_FP=1
-ifneq ($(CLANG),1)
+KERNEL_COMPILEFLAGS += -msoft-float -mno-mmx -mno-sse -mno-sse2 -mno-3dnow -mno-avx -mno-avx2
+ifeq ($(call TOBOOL,$(USE_CLANG)),false)
 KERNEL_COMPILEFLAGS += -mno-80387 -mno-fp-ret-in-387
 endif
+KERNEL_DEFINES += WITH_NO_FP=1
 
-ifeq ($(CLANG),1)
-ifeq ($(FUCHSIA),1)
-GLOBAL_COMPILEFLAGS += --target=x86_64-fuchsia
-else
-GLOBAL_COMPILEFLAGS += --target=x86_64-fuchsia -integrated-as
+ifeq ($(call TOBOOL,$(USE_CLANG)),true)
+ifndef ARCH_x86_64_CLANG_TARGET
+ARCH_x86_64_CLANG_TARGET := x86_64-fuchsia
 endif
-endif
-
-ifeq ($(SUBARCH),x86-32)
-# get at least 686 so builtin atomic routines are picked up
-GLOBAL_COMPILEFLAGS += -march=i686
+GLOBAL_COMPILEFLAGS += --target=$(ARCH_x86_64_CLANG_TARGET)
 endif
 
-ifeq ($(SUBARCH),x86-64)
 KERNEL_COMPILEFLAGS += -mcmodel=kernel
 KERNEL_COMPILEFLAGS += -mno-red-zone
 
+# Clang now supports -fsanitize=safe-stack with -mcmodel=kernel.
+KERNEL_COMPILEFLAGS += $(SAFESTACK)
+
 # optimization: since fpu is disabled, do not pass flag in rax to varargs routines
 # that floating point args are in use.
-ifneq ($(CLANG),1)
+ifeq ($(call TOBOOL,$(USE_CLANG)),false)
 KERNEL_COMPILEFLAGS += -mskip-rax-setup
 endif
-endif # SUBARCH x86-64
+
+# Turn on -fasynchronous-unwind-tables to get .eh_frame.
+# [While this is the default on x86 we make this explicit.]
+# This is necessary for unwinding through optimized code.
+# Note: If you wish to turn off .eh_frame on x86 you need to both
+# -fno-exceptions and -fno-asynchronous-unwind-tables.
+GLOBAL_COMPILEFLAGS += -fasynchronous-unwind-tables
 
 ARCH_OPTFLAGS := -O2
 
-USER_LINKER_SCRIPT := $(SUBARCH_DIR)/user.ld
 LINKER_SCRIPT += $(SUBARCH_BUILDDIR)/kernel.ld
 
 # potentially generated files that should be cleaned out with clean make rule
@@ -191,9 +167,12 @@ GENERATED += $(SUBARCH_BUILDDIR)/kernel.ld
 
 # rules for generating the linker scripts
 $(SUBARCH_BUILDDIR)/kernel.ld: $(SUBARCH_DIR)/kernel.ld $(wildcard arch/*.ld)
-	@echo generating $@
+	$(call BUILDECHO,generating $@)
 	@$(MKDIR)
 	$(NOECHO)sed "s/%MEMBASE%/$(MEMBASE)/;s/%MEMSIZE%/$(MEMSIZE)/;s/%KERNEL_BASE%/$(KERNEL_BASE)/;s/%KERNEL_LOAD_OFFSET%/$(KERNEL_LOAD_OFFSET)/;s/%HEADER_LOAD_OFFSET%/$(HEADER_LOAD_OFFSET)/;s/%PHYS_HEADER_LOAD_OFFSET%/$(PHYS_HEADER_LOAD_OFFSET)/;" < $< > $@.tmp
 	@$(call TESTANDREPLACEFILE,$@.tmp,$@)
+
+# force a rebuild every time in case something changes
+$(SUBARCH_BUILDDIR)/kernel.ld: FORCE
 
 include make/module.mk

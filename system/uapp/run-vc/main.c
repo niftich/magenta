@@ -1,111 +1,88 @@
-// Copyright 2016 The Fuchsia Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
 
 #include <fcntl.h>
 #include <launchpad/launchpad.h>
 #include <launchpad/vmo.h>
 #include <limits.h>
+#include <magenta/device/console.h>
+#include <magenta/process.h>
 #include <magenta/processargs.h>
+#include <magenta/syscalls.h>
 #include <magenta/types.h>
+#include <mxio/io.h>
 #include <mxio/util.h>
+#include <mxio/watcher.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
-int main(int argc, const char* const* argv, const char* const* envp) {
-    int fd = open("/dev/class/console/vc", O_RDWR);
-    if (fd < 0) {
-        printf("Error %d opening a new vc\n", fd);
-        return fd;
+static int g_argc;
+static const char* const* g_argv;
+
+static mx_status_t console_device_added(int dirfd, int event, const char* name, void* cookie) {
+    if (event != WATCH_EVENT_ADD_FILE) {
+        return NO_ERROR;
     }
 
-    // start mxsh if no arguments
+    if (strcmp(name, "vc")) {
+        return NO_ERROR;
+    }
+
+    int fd = openat(dirfd, name, O_RDWR);
+    if (fd < 0) {
+        printf("Error %d opening a new vc\n", fd);
+        return 1;
+    }
+
+    ioctl_console_set_active_vc(fd);
+
+    // start shell if no arguments
     char pname[128];
     int pargc;
-    bool mxsh;
-    const char* pargv[1] = { "/boot/bin/mxsh" };
-    if ((mxsh = argc == 1)) {
-        strcpy(pname, "mxsh:vc");
+    bool shell;
+    const char* pargv[1] = { "/boot/bin/sh" };
+    if ((shell = g_argc == 1)) {
+        strcpy(pname, "sh:vc");
         pargc = 1;
     } else {
-        char* bname = strrchr(argv[1], '/');
-        snprintf(pname, sizeof(pname), "%s:vc", bname ? bname + 1 : argv[1]);
-        pargc = argc - 1;
+        char* bname = strrchr(g_argv[1], '/');
+        snprintf(pname, sizeof(pname), "%s:vc", bname ? bname + 1 : g_argv[1]);
+        pargc = g_argc - 1;
     }
 
     launchpad_t* lp;
-    mx_status_t status = launchpad_create(pname, &lp);
-    if (status != NO_ERROR) {
-        printf("Error %d in launchpad_create\n", status);
-        return status;
-    }
+    launchpad_create(0, pname, &lp);
+    launchpad_clone(lp, LP_CLONE_MXIO_ROOT | LP_CLONE_ENVIRON);
+    launchpad_clone_fd(lp, fd, 0);
+    launchpad_clone_fd(lp, fd, 1);
+    launchpad_clone_fd(lp, fd, 2);
+    launchpad_set_args(lp, pargc, shell ? pargv : &g_argv[1]);
+    launchpad_load_from_file(lp, shell ? pargv[0] : g_argv[1]);
 
-    status = launchpad_clone_mxio_root(lp);
-    if (status != NO_ERROR) {
-        printf("Error %d in launchpad_clone_mxio_root\n", status);
-        return status;
+    mx_status_t status;
+    const char* errmsg;
+    if ((status = launchpad_go(lp, NULL, &errmsg)) < 0) {
+        fprintf(stderr, "error %d launching: %s\n", status, errmsg);
     }
-
-    mx_handle_t handles[MXIO_MAX_HANDLES];
-    uint32_t types[MXIO_MAX_HANDLES];
-    mx_status_t n = mxio_clone_fd(fd, fd, handles, types);
-    if (n < 0) {
-        printf("Error %d in mxio_clone_fd\n", n);
-        return n;
-    }
-    for (int i = 0; i < n; ++i) {
-        types[i] |= MX_HND_INFO(
-            MX_HND_INFO_TYPE(types[i]),
-            MX_HND_INFO_ARG(types[i]) | MXIO_FLAG_USE_FOR_STDIO);
-    }
-
-    status = launchpad_add_handles(lp, n, handles, types);
-    if (status != NO_ERROR) {
-        printf("Error %d in launchpad_add_handles\n", status);
-        return status;
-    }
-
-    printf("starting process %s\n", pargv[0]);
-
-    status = launchpad_arguments(lp, pargc, mxsh ? pargv : &argv[1]);
-    if (status != NO_ERROR) {
-        printf("Error %d in launchpad_arguments\n", status);
-        return status;
-    }
-
-    status = launchpad_environ(lp, envp);
-    if (status != NO_ERROR) {
-        printf("Error %d in launchpad_environ\n", status);
-        return status;
-    }
-
-    status = launchpad_elf_load(
-        lp, launchpad_vmo_from_file(mxsh ? pargv[0] : argv[1]));
-    if (status != NO_ERROR) {
-        printf("Error %d in launchpad_elf_load\n", status);
-        return status;
-    }
-
-    mx_handle_t proc = launchpad_start(lp);
-    if (proc < 0) {
-        printf("Error %d in launchpad_start\n", proc);
-        return proc;
-    }
-    launchpad_destroy(lp);
 
     close(fd);
+
+    // stop polling
+    return 1;
+}
+
+int main(int argc, const char* const* argv) {
+    g_argc = argc;
+    g_argv = argv;
+
+    int dirfd;
+    if ((dirfd = open("/dev/class/console", O_DIRECTORY|O_RDONLY)) >= 0) {
+        mxio_watch_directory(dirfd, console_device_added, NULL);
+    }
+    close(dirfd);
     return 0;
 }

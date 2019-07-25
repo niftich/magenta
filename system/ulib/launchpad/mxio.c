@@ -1,48 +1,76 @@
-// Copyright 2016 The Fuchsia Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
 
-// <unistd.h> declares environ only under _GNU_SOURCE.
-#define _GNU_SOURCE
-
-#include <launchpad/launchpad.h>
+#include "launch.h"
 #include <launchpad/vmo.h>
 
+#include <magenta/process.h>
+#include <magenta/processargs.h>
 #include <magenta/syscalls.h>
 #include <mxio/io.h>
+#include <mxio/namespace.h>
 #include <mxio/util.h>
 
+#include <stdlib.h>
 #include <unistd.h>
 
 static mx_status_t add_mxio(launchpad_t* lp,
                             mx_handle_t handles[MXIO_MAX_HANDLES],
                             uint32_t types[MXIO_MAX_HANDLES],
                             mx_status_t status) {
+    if (status == ERR_BAD_HANDLE)
+        return NO_ERROR;
+    if (status == ERR_NOT_SUPPORTED)
+        return NO_ERROR;
     if (status > 0) {
-        size_t n = status;
-        status = launchpad_add_handles(lp, n, handles, types);
-        if (status != NO_ERROR) {
-            for (size_t i = 0; i < n; ++i)
-                mx_handle_close(handles[i]);
-        }
+        return launchpad_add_handles(lp, status, handles, types);
+    } else {
+        launchpad_abort(lp, status, "add_mxio: failed");
+        return status;
     }
-    return status;
 }
 
-mx_status_t launchpad_clone_mxio_root(launchpad_t* lp) {
+mx_status_t launchpad_clone(launchpad_t* lp, uint32_t what) {
     mx_handle_t handles[MXIO_MAX_HANDLES];
     uint32_t types[MXIO_MAX_HANDLES];
-    return add_mxio(lp, handles, types, mxio_clone_root(handles, types));
+
+    if (what & LP_CLONE_MXIO_ROOT) {
+        mxio_flat_namespace_t* flat;
+        mx_status_t status = mxio_ns_export_root(&flat);
+        if (status == NO_ERROR) {
+            launchpad_set_nametable(lp, flat->count, flat->path);
+            launchpad_add_handles(lp, flat->count, flat->handle, flat->type);
+            free(flat);
+        } else {
+            if (status == ERR_NOT_FOUND) {
+                // if there's no root namespace, fail back to the legacy handles
+                add_mxio(lp, handles, types, mxio_clone_root(handles, types));
+                add_mxio(lp, handles, types, mxio_clone_svcroot(handles, types));
+            } else {
+                launchpad_abort(lp, status, "clone: error cloning namespace");
+                return status;
+            }
+        }
+    }
+    if (what & LP_CLONE_MXIO_CWD) {
+        add_mxio(lp, handles, types, mxio_clone_cwd(handles, types));
+    }
+    if (what & LP_CLONE_MXIO_STDIO) {
+        for (int fd = 0; fd < 3; fd++) {
+            add_mxio(lp, handles, types, mxio_clone_fd(fd, fd, handles, types));
+        }
+    }
+    if (what & LP_CLONE_ENVIRON) {
+        launchpad_set_environ(lp, (const char* const*)environ);
+    }
+    if (what & LP_CLONE_DEFAULT_JOB) {
+        mx_handle_t job;
+        if (mx_handle_duplicate(mx_job_default(), MX_RIGHT_SAME_RIGHTS, &job) == NO_ERROR) {
+            launchpad_add_handle(lp, job, PA_HND(PA_JOB_DEFAULT, 0));
+        }
+    }
+    return launchpad_get_status(lp);
 }
 
 mx_status_t launchpad_clone_fd(launchpad_t* lp, int fd, int target_fd) {
@@ -52,56 +80,9 @@ mx_status_t launchpad_clone_fd(launchpad_t* lp, int fd, int target_fd) {
                     mxio_clone_fd(fd, target_fd, handles, types));
 }
 
-static mx_status_t add_all_mxio(launchpad_t* lp) {
-    mx_status_t status = launchpad_clone_mxio_root(lp);
-    for (int fd = 0; status == NO_ERROR && fd < MAX_MXIO_FD; ++fd) {
-        status = launchpad_clone_fd(lp, fd, fd);
-        if (status == ERR_BAD_HANDLE)
-            status = NO_ERROR;
-        if (status == ERR_NOT_SUPPORTED)
-            status = NO_ERROR;
-    }
-    return status;
-}
-
-mx_handle_t launchpad_launch_mxio_etc(const char* name,
-                                      int argc, const char* const* argv,
-                                      const char* const* envp,
-                                      size_t hnds_count, mx_handle_t* handles,
-                                      uint32_t* ids) {
-    launchpad_t* lp;
-
-    const char* filename = argv[0];
-    if (name == NULL)
-        name = filename;
-
-    mx_handle_t proc = MX_HANDLE_INVALID;
-    mx_status_t status = launchpad_create(name, &lp);
-    if (status == NO_ERROR) {
-        status = launchpad_elf_load(lp, launchpad_vmo_from_file(filename));
-        if (status == NO_ERROR)
-            status = launchpad_load_vdso(lp, MX_HANDLE_INVALID);
-        if (status == NO_ERROR)
-            status = launchpad_add_vdso_vmo(lp);
-        if (status == NO_ERROR)
-            status = launchpad_arguments(lp, argc, argv);
-        if (status == NO_ERROR)
-            status = launchpad_environ(lp, envp);
-        if (status == NO_ERROR)
-            status = add_all_mxio(lp);
-        if (status == NO_ERROR)
-            status = launchpad_add_handles(lp, hnds_count, handles, ids);
-        if (status == NO_ERROR)
-            proc = launchpad_start(lp);
-    }
-    launchpad_destroy(lp);
-
-    return status == NO_ERROR ? proc : status;
-}
-
-mx_handle_t launchpad_launch_mxio(const char* name,
-                                  int argc, const char* const* argv) {
-    return launchpad_launch_mxio_etc(name, argc, argv,
-                                     (const char* const*)environ,
-                                     0, NULL, NULL);
+mx_status_t launchpad_transfer_fd(launchpad_t* lp, int fd, int target_fd) {
+    mx_handle_t handles[MXIO_MAX_HANDLES];
+    uint32_t types[MXIO_MAX_HANDLES];
+    return add_mxio(lp, handles, types,
+                    mxio_transfer_fd(fd, target_fd, handles, types));
 }

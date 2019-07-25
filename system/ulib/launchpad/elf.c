@@ -1,22 +1,12 @@
-// Copyright 2016 The Fuchsia Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
 
 #include "elf.h"
 
 #include <elfload/elfload.h>
-#include <elfload/elf-defines.h>
 
+#include <magenta/process.h>
 #include <magenta/syscalls.h>
 #include <stdlib.h>
 
@@ -29,10 +19,11 @@ void elf_load_destroy(elf_load_info_t* info) {
     free(info);
 }
 
-mx_status_t elf_load_start(mx_handle_t vmo, elf_load_info_t** infop) {
+mx_status_t elf_load_start(mx_handle_t vmo, const void* hdr_buf, size_t buf_sz,
+                           elf_load_info_t** infop) {
     elf_load_header_t header;
     uintptr_t phoff;
-    mx_status_t status = elf_load_prepare(vmo, &header, &phoff);
+    mx_status_t status = elf_load_prepare(vmo, hdr_buf, buf_sz, &header, &phoff);
     if (status == NO_ERROR) {
         // Now allocate the data structure and read in the phdrs.
         size_t phdrs_size = (size_t)header.e_phnum * sizeof(elf_phdr_t);
@@ -59,12 +50,13 @@ mx_status_t elf_load_get_interp(elf_load_info_t* info, mx_handle_t vmo,
         buffer = malloc(*interp_len + 1);
         if (buffer == NULL)
             return ERR_NO_MEMORY;
-        mx_ssize_t n = mx_vm_object_read(vmo, buffer, offset, *interp_len);
-        if (n < 0) {
+        size_t n;
+        mx_status_t status = mx_vmo_read(vmo, buffer, offset, *interp_len, &n);
+        if (status < 0) {
             free(buffer);
-            return n;
+            return status;
         }
-        if (n != (mx_ssize_t)*interp_len) {
+        if (n != *interp_len) {
             free(buffer);
             return ERR_ELF_BAD_FORMAT;
         }
@@ -74,9 +66,18 @@ mx_status_t elf_load_get_interp(elf_load_info_t* info, mx_handle_t vmo,
     return NO_ERROR;
 }
 
-mx_status_t elf_load_finish(mx_handle_t proc, elf_load_info_t* info,
+mx_status_t elf_load_finish(mx_handle_t vmar, elf_load_info_t* info,
                             mx_handle_t vmo,
+                            mx_handle_t* segments_vmar,
                             mx_vaddr_t* base, mx_vaddr_t* entry) {
-    return elf_load_map_segments(proc, &info->header, info->phdrs, vmo,
-                                 base, entry);
+    return elf_load_map_segments(vmar, &info->header, info->phdrs, vmo,
+                                 segments_vmar, base, entry);
+}
+
+size_t elf_load_get_stack_size(elf_load_info_t* info) {
+    for (uint_fast16_t i = 0; i < info->header.e_phnum; ++i) {
+        if (info->phdrs[i].p_type == PT_GNU_STACK)
+            return info->phdrs[i].p_memsz;
+    }
+    return 0;
 }

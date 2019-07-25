@@ -1,17 +1,9 @@
-// Copyright 2016 The Fuchsia Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
 
+#include <stdarg.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -35,23 +27,31 @@ ssize_t mxio_default_write(mxio_t* io, const void* _data, size_t len) {
     return len;
 }
 
+ssize_t mxio_default_recvmsg(mxio_t* io, struct msghdr* msg, int flags) {
+    return ERR_WRONG_TYPE;
+}
+
+ssize_t mxio_default_sendmsg(mxio_t* io, const struct msghdr* msg, int flags) {
+    return ERR_WRONG_TYPE;
+}
+
 off_t mxio_default_seek(mxio_t* io, off_t offset, int whence) {
     return ERR_NOT_SUPPORTED;
 }
 
-mx_status_t mxio_default_misc(mxio_t* io, uint32_t op, uint32_t arg, void* data, size_t len) {
+mx_status_t mxio_default_misc(mxio_t* io, uint32_t op, int64_t off, uint32_t arg, void* data, size_t len) {
     return ERR_NOT_SUPPORTED;
 }
 
-mx_status_t mxio_default_open(mxio_t* io, const char* path, int32_t flags, mxio_t** out) {
+mx_status_t mxio_default_open(mxio_t* io, const char* path, int32_t flags, uint32_t mode, mxio_t** out) {
     return ERR_NOT_SUPPORTED;
 }
 
-mx_handle_t mxio_default_clone(mxio_t* io, mx_handle_t* handles, uint32_t* types) {
+mx_status_t mxio_default_clone(mxio_t* io, mx_handle_t* handles, uint32_t* types) {
     return ERR_NOT_SUPPORTED;
 }
 
-mx_status_t mxio_default_wait(mxio_t* io, uint32_t events, uint32_t* pending, mx_time_t timeout) {
+mx_status_t mxio_default_unwrap(mxio_t* io, mx_handle_t* handles, uint32_t* types) {
     return ERR_NOT_SUPPORTED;
 }
 
@@ -64,16 +64,38 @@ ssize_t mxio_default_ioctl(mxio_t* io, uint32_t op, const void* in_buf,
     return ERR_NOT_SUPPORTED;
 }
 
+void mxio_default_wait_begin(mxio_t* io, uint32_t events,
+                             mx_handle_t* handle, mx_signals_t* _signals) {
+    *handle = MX_HANDLE_INVALID;
+}
+
+void mxio_default_wait_end(mxio_t* io, mx_signals_t signals, uint32_t* _events) {
+}
+
+ssize_t mxio_default_posix_ioctl(mxio_t* io, int req, va_list va) {
+    return ERR_NOT_SUPPORTED;
+}
+
+mx_status_t mxio_default_get_vmo(mxio_t* io, mx_handle_t* out, size_t* off, size_t* len) {
+    return ERR_NOT_SUPPORTED;
+}
+
 static mxio_ops_t mx_null_ops = {
     .read = mxio_default_read,
     .write = mxio_default_write,
+    .recvmsg = mxio_default_recvmsg,
+    .sendmsg = mxio_default_sendmsg,
     .seek = mxio_default_seek,
     .misc = mxio_default_misc,
     .close = mxio_default_close,
     .open = mxio_default_open,
     .clone = mxio_default_clone,
-    .wait = mxio_default_wait,
     .ioctl = mxio_default_ioctl,
+    .wait_begin = mxio_default_wait_begin,
+    .wait_end = mxio_default_wait_end,
+    .unwrap = mxio_default_unwrap,
+    .posix_ioctl = mxio_default_posix_ioctl,
+    .get_vmo = mxio_default_get_vmo,
 };
 
 mxio_t* mxio_null_create(void) {
@@ -83,6 +105,6 @@ mxio_t* mxio_null_create(void) {
     }
     io->ops = &mx_null_ops;
     io->magic = MXIO_MAGIC;
-    io->refcount = 1;
+    atomic_init(&io->refcount, 1);
     return io;
 }

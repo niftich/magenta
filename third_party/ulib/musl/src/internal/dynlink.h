@@ -2,6 +2,7 @@
 
 #include <elf.h>
 #include <features.h>
+#include <link.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -55,7 +56,6 @@ enum {
 #define DT_DEBUG_INDIRECT 0
 #endif
 
-#define AUX_CNT 32
 #define DYN_CNT 32
 
 // This is the return value of the dynamic linker startup functions.
@@ -69,8 +69,18 @@ typedef struct {
     void* arg;
     void* entry;
 } dl_start_return_t;
-#define DL_START_RETURN(entry, arg) (dl_start_return_t) { (arg), (entry) }
+#define DL_START_RETURN(entry, arg) \
+    (dl_start_return_t) { (arg), (entry) }
 #endif
 
-typedef dl_start_return_t (*stage2_func)(unsigned char*, void*);
-typedef dl_start_return_t (*stage3_func)(void*);
+dl_start_return_t _dl_start(void* start_arg, void* vdso)
+    __attribute__((__visibility__("hidden")));
+dl_start_return_t __dls2(void* start_arg, void* vdso)
+    __attribute__((visibility("hidden")));
+
+// We can access these with simple PC-relative relocs.
+// Both of these symbols are defined automagically by the linker.
+// Since we use a standard 0-based DSO layout, __ehdr_start matches
+// the lowest address in the DSO image.
+extern const ElfW(Ehdr) __ehdr_start[] __attribute__((visibility("hidden")));
+extern ElfW(Dyn) _DYNAMIC[] __attribute__((visibility("hidden")));

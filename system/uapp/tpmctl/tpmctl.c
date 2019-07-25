@@ -1,18 +1,8 @@
-// Copyright 2016 The Fuchsia Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
 
-#include <ddk/protocol/tpm.h>
+#include <magenta/device/tpm.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <magenta/syscalls.h>
@@ -34,9 +24,9 @@ void print_usage(void) {
 }
 
 int cmd_save_state(int fd, int argc, const char** argv) {
-    int ret = mxio_ioctl(fd, TPM_IOCTL_SAVE_STATE, NULL, 0, NULL, 0);
+    ssize_t ret = ioctl_tpm_save_state(fd);
     if (ret < 0) {
-        printf("Error when saving state: (%d)\n", ret);
+        printf("Error when saving state: (%zd)\n", ret);
         return 1;
     }
 
@@ -59,7 +49,7 @@ int main(int argc, const char** argv) {
     argc -= 2;
     argv += 2;
 
-    int fd = open("/dev/tpm", O_RDWR);
+    int fd = open("/dev/misc/tpm", O_RDWR);
     if (fd < 0) {
         printf("Error opening TPM device.\n");
         return 1;

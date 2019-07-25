@@ -1,16 +1,6 @@
-// Copyright 2016 The Fuchsia Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
 
 /**
  * @defgroup graphics Graphics
@@ -26,7 +16,7 @@
 
 #include <assert.h>
 #include <err.h>
-#include <system/compiler.h>
+#include <magenta/compiler.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -191,7 +181,7 @@ static void putpixel8(gfx_surface* surface, unsigned x, unsigned y, unsigned col
 #define MKPUTCHAR(FUNC,TYPE) \
 static void FUNC(gfx_surface* surface, const gfx_font* font, unsigned ch, unsigned x, unsigned y, unsigned fg, unsigned bg) { \
     TYPE* dest = &((TYPE*)surface->ptr)[x + y * surface->stride]; \
-    uint16_t* cdata = font->data + ch * font->height; \
+    const uint16_t* cdata = font->data + ch * font->height; \
     unsigned fw = font->width; \
     for (unsigned i = font->height; i > 0; i--) { \
         uint16_t xdata = *cdata++; \
@@ -243,8 +233,8 @@ static void copyrect8(gfx_surface* surface, unsigned x, unsigned y, unsigned wid
         }
     } else {
         // copy backwards
-        src += height * surface->stride + width;
-        dest += height * surface->stride + width;
+        src += (height-1) * surface->stride + (width-1);
+        dest += (height-1) * surface->stride + (width-1);
 
         unsigned i, j;
         for (i = 0; i < height; i++) {
@@ -294,8 +284,8 @@ static void copyrect16(gfx_surface* surface, unsigned x, unsigned y, unsigned wi
         }
     } else {
         // copy backwards
-        src += height * surface->stride + width;
-        dest += height * surface->stride + width;
+        src += (height-1) * surface->stride + (width-1);
+        dest += (height-1) * surface->stride + (width-1);
 
         unsigned i, j;
         for (i = 0; i < height; i++) {
@@ -345,8 +335,8 @@ static void copyrect32(gfx_surface* surface, unsigned x, unsigned y, unsigned wi
         }
     } else {
         // copy backwards
-        src += height * surface->stride + width;
-        dest += height * surface->stride + width;
+        src += (height-1) * surface->stride + (width-1);
+        dest += (height-1) * surface->stride + (width-1);
 
         unsigned i, j;
         for (i = 0; i < height; i++) {
@@ -500,7 +490,7 @@ void gfx_blend(gfx_surface* target, gfx_surface* source, unsigned srcx, unsigned
         height = source->height - srcy;
 
     // XXX total hack to deal with various blends
-    if (source->format == GFX_FORMAT_RGB_565 && target->format == GFX_FORMAT_RGB_565) {
+    if (source->format == MX_PIXEL_FORMAT_RGB_565 && target->format == MX_PIXEL_FORMAT_RGB_565) {
         // 16 bit to 16 bit
         const uint16_t* src = &((const uint16_t*)source->ptr)[srcx + srcy * source->stride];
         uint16_t* dest = &((uint16_t*)target->ptr)[destx + desty * target->stride];
@@ -519,7 +509,7 @@ void gfx_blend(gfx_surface* target, gfx_surface* source, unsigned srcx, unsigned
             dest += dest_stride_diff;
             src += source_stride_diff;
         }
-    } else if (source->format == GFX_FORMAT_ARGB_8888 && target->format == GFX_FORMAT_ARGB_8888) {
+    } else if (source->format == MX_PIXEL_FORMAT_ARGB_8888 && target->format == MX_PIXEL_FORMAT_ARGB_8888) {
         // both are 32 bit modes, both alpha
         const uint32_t* src = &((const uint32_t*)source->ptr)[srcx + srcy * source->stride];
         uint32_t* dest = &((uint32_t*)target->ptr)[destx + desty * target->stride];
@@ -539,7 +529,7 @@ void gfx_blend(gfx_surface* target, gfx_surface* source, unsigned srcx, unsigned
             dest += dest_stride_diff;
             src += source_stride_diff;
         }
-    } else if (source->format == GFX_FORMAT_RGB_x888 && target->format == GFX_FORMAT_RGB_x888) {
+    } else if (source->format == MX_PIXEL_FORMAT_RGB_x888 && target->format == MX_PIXEL_FORMAT_RGB_x888) {
         // both are 32 bit modes, no alpha
         const uint32_t* src = &((const uint32_t*)source->ptr)[srcx + srcy * source->stride];
         uint32_t* dest = &((uint32_t*)target->ptr)[destx + desty * target->stride];
@@ -558,7 +548,7 @@ void gfx_blend(gfx_surface* target, gfx_surface* source, unsigned srcx, unsigned
             dest += dest_stride_diff;
             src += source_stride_diff;
         }
-    } else if (source->format == GFX_FORMAT_MONO && target->format == GFX_FORMAT_MONO) {
+    } else if (source->format == MX_PIXEL_FORMAT_MONO_1 && target->format == MX_PIXEL_FORMAT_MONO_1) {
         // both are 8 bit modes, no alpha
         const uint8_t* src = &((const uint8_t*)source->ptr)[srcx + srcy * source->stride];
         uint8_t* dest = &((uint8_t*)target->ptr)[destx + desty * target->stride];
@@ -625,7 +615,8 @@ void gfx_flush_rows(struct gfx_surface* surface, unsigned start, unsigned end) {
 /**
  * @brief  Create a new graphics surface object
  */
-gfx_surface* gfx_create_surface(void* ptr, unsigned width, unsigned height, unsigned stride, gfx_format format, uint32_t flags) {
+gfx_surface* gfx_create_surface(void* ptr, unsigned width, unsigned height,
+                                unsigned stride, unsigned format, uint32_t flags) {
     gfx_surface* surface = calloc(1, sizeof(*surface));
     if (surface == NULL)
         return NULL;
@@ -636,11 +627,11 @@ gfx_surface* gfx_create_surface(void* ptr, unsigned width, unsigned height, unsi
     return surface;
 }
 
-int gfx_init_surface(gfx_surface* surface, void* ptr, unsigned width, unsigned height, unsigned stride, gfx_format format, uint32_t flags) {
+int gfx_init_surface(gfx_surface* surface, void* ptr, unsigned width, unsigned height,
+                     unsigned stride, unsigned format, uint32_t flags) {
     assert(width > 0);
     assert(height > 0);
     assert(stride >= width);
-    assert(format < GFX_FORMAT_MAX);
 
     surface->flags = flags;
     surface->format = format;
@@ -651,7 +642,7 @@ int gfx_init_surface(gfx_surface* surface, void* ptr, unsigned width, unsigned h
 
     // set up some function pointers
     switch (format) {
-    case GFX_FORMAT_RGB_565:
+    case MX_PIXEL_FORMAT_RGB_565:
         surface->translate_color = &ARGB8888_to_RGB565;
         surface->copyrect = &copyrect16;
         surface->fillrect = &fillrect16;
@@ -660,8 +651,8 @@ int gfx_init_surface(gfx_surface* surface, void* ptr, unsigned width, unsigned h
         surface->pixelsize = 2;
         surface->len = (surface->height * surface->stride * surface->pixelsize);
         break;
-    case GFX_FORMAT_RGB_x888:
-    case GFX_FORMAT_ARGB_8888:
+    case MX_PIXEL_FORMAT_RGB_x888:
+    case MX_PIXEL_FORMAT_ARGB_8888:
         surface->translate_color = NULL;
         surface->copyrect = &copyrect32;
         surface->fillrect = &fillrect32;
@@ -670,7 +661,7 @@ int gfx_init_surface(gfx_surface* surface, void* ptr, unsigned width, unsigned h
         surface->pixelsize = 4;
         surface->len = (surface->height * surface->stride * surface->pixelsize);
         break;
-    case GFX_FORMAT_MONO:
+    case MX_PIXEL_FORMAT_MONO_1:
         surface->translate_color = &ARGB8888_to_Luma;
         surface->copyrect = &copyrect8;
         surface->fillrect = &fillrect8;
@@ -679,7 +670,7 @@ int gfx_init_surface(gfx_surface* surface, void* ptr, unsigned width, unsigned h
         surface->pixelsize = 1;
         surface->len = (surface->height * surface->stride * surface->pixelsize);
         break;
-    case GFX_FORMAT_RGB_332:
+    case MX_PIXEL_FORMAT_RGB_332:
         surface->translate_color = &ARGB8888_to_RGB332;
         surface->copyrect = &copyrect8;
         surface->fillrect = &fillrect8;
@@ -688,7 +679,7 @@ int gfx_init_surface(gfx_surface* surface, void* ptr, unsigned width, unsigned h
         surface->pixelsize = 1;
         surface->len = (surface->height * surface->stride * surface->pixelsize);
         break;
-    case GFX_FORMAT_RGB_2220:
+    case MX_PIXEL_FORMAT_RGB_2220:
         surface->translate_color = &ARGB8888_to_RGB2220;
         surface->copyrect = &copyrect8;
         surface->fillrect = &fillrect8;

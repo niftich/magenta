@@ -5,8 +5,9 @@
 // license that can be found in the LICENSE file or at
 // https://opensource.org/licenses/MIT
 
-#if ARM_WITH_CACHE
+#include "tests.h"
 
+#include <inttypes.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,7 +19,7 @@
 
 static void bench_cache(size_t bufsize, uint8_t *buf)
 {
-    lk_bigtime_t t;
+    lk_time_t t;
     bool do_free;
 
     if (buf == 0) {
@@ -33,25 +34,25 @@ static void bench_cache(size_t bufsize, uint8_t *buf)
     if (!buf)
         return;
 
-    t = current_time_hires();
+    t = current_time();
     arch_clean_cache_range((addr_t)buf, bufsize);
-    t = current_time_hires() - t;
+    t = current_time() - t;
 
-    printf("took %llu usecs to clean %d bytes (cold)\n", t, bufsize);
+    printf("took %" PRIu64 " nsecs to clean %zu bytes (cold)\n", t, bufsize);
 
     memset(buf, 0x99, bufsize);
 
-    t = current_time_hires();
+    t = current_time();
     arch_clean_cache_range((addr_t)buf, bufsize);
-    t = current_time_hires() - t;
+    t = current_time() - t;
 
     if (do_free)
         free(buf);
 
-    printf("took %llu usecs to clean %d bytes (hot)\n", t, bufsize);
+    printf("took %" PRIu64 " nsecs to clean %zu bytes (hot)\n", t, bufsize);
 }
 
-static int cache_tests(int argc, const cmd_args *argv)
+static int cache_tests(int argc, const cmd_args *argv, uint32_t flags)
 {
     uint8_t *buf;
     buf = (uint8_t *)((argc > 1) ? argv[1].u : 0UL);
@@ -69,5 +70,3 @@ static int cache_tests(int argc, const cmd_args *argv)
 STATIC_COMMAND_START
 STATIC_COMMAND("cache_tests", "test/bench the cpu cache", &cache_tests)
 STATIC_COMMAND_END(cache_tests);
-
-#endif

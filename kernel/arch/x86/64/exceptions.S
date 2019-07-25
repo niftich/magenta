@@ -39,12 +39,12 @@ FUNCTION(_isr_\@)
     jmp interrupt_common
 .endif
 .popsection
-.pushsection .data
+.pushsection .rodata
 .quad _isr_\@
 .popsection
 .endm
 
-.pushsection .data
+.pushsection .rodata
 /* build a table of isr entry points */
 DATA(_isr_table)
 .popsection
@@ -86,7 +86,7 @@ FUNCTION(interrupt_common)
 
 /* A label to assist gdb's backtracing through kernel exceptions.
    When gdb sees this as the return address it knows it can fetch
-   x86_iframe_t from $rsp. See scripts/lk.elf-gdb.py. */
+   x86_iframe_t from $rsp. See scripts/magenta.elf-gdb.py. */
 interrupt_common_iframe_set_up_for_debugger:
 
     /* restore general purpose registers */

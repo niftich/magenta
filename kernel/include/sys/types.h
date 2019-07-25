@@ -29,24 +29,24 @@ typedef uintptr_t addr_t;
 typedef uintptr_t vaddr_t;
 typedef uintptr_t paddr_t;
 
-typedef int kobj_id;
+typedef uint64_t lk_time_t; // nanoseconds
+#define INFINITE_TIME UINT64_MAX
+#define LK_USEC(n) ((lk_time_t)(1000ULL * (n)))
+#define LK_MSEC(n) ((lk_time_t)(1000000ULL * (n)))
+#define LK_SEC(n)  ((lk_time_t)(1000000000ULL * (n)))
 
-typedef uint32_t lk_time_t;
-typedef unsigned long long lk_bigtime_t;
-#define INFINITE_TIME UINT32_MAX
-
-#define TIME_GTE(a, b) ((int32_t)((a) - (b)) >= 0)
-#define TIME_LTE(a, b) ((int32_t)((a) - (b)) <= 0)
-#define TIME_GT(a, b) ((int32_t)((a) - (b)) > 0)
-#define TIME_LT(a, b) ((int32_t)((a) - (b)) < 0)
+#define TIME_GTE(a, b) ((int64_t)((a) - (b)) >= 0)
+#define TIME_LTE(a, b) ((int64_t)((a) - (b)) <= 0)
+#define TIME_GT(a, b) ((int64_t)((a) - (b)) > 0)
+#define TIME_LT(a, b) ((int64_t)((a) - (b)) < 0)
 
 enum handler_return {
     INT_NO_RESCHEDULE = 0,
     INT_RESCHEDULE,
 };
 
-typedef signed long int ssize_t;
-#define SSIZE_MAX LONG_MAX
+typedef intptr_t ssize_t;
+#define SSIZE_MAX INTPTR_MAX
 
 typedef uint8_t u8;
 typedef uint16_t u16;
@@ -62,5 +62,9 @@ typedef uint8_t u_int8_t;
 typedef uint16_t u_int16_t;
 typedef uint32_t u_int32_t;
 typedef uint64_t u_int64_t;
+
+#define KB (1024UL)
+#define MB (1024UL * KB)
+#define GB (1024UL * MB)
 
 #endif

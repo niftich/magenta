@@ -10,23 +10,28 @@
 
 /* top level defines for the x86 mmu */
 /* NOTE: the top part can be included from assembly */
-#define KB                (1024UL)
-#define MB                (1024UL*1024UL)
-#define GB                (1024UL*1024UL*1024UL)
-
-#define X86_MMU_PG_P            0x0001           /* P    Valid                   */
-#define X86_MMU_PG_RW           0x0002           /* R/W  Read/Write              */
-#define X86_MMU_PG_U            0x0004           /* U/S  User/Supervisor         */
-#define X86_MMU_PG_WT           0x0008           /* WT   Write-through           */
-#define X86_MMU_PG_CD           0x0010           /* CD   Cache disable           */
-#define X86_MMU_PG_A            0x0020           /* A    Accessed                */
-#define X86_MMU_PG_D            0x0040           /* D    Dirty                   */
-#define X86_MMU_PG_PS           0x0080           /* PS   Page size (0=4k,1=4M)   */
-#define X86_MMU_PG_PTE_PAT      0x0080           /* PAT  PAT index for 4k pages  */
-#define X86_MMU_PG_LARGE_PAT    0x1000           /* PAT  PAT index otherwise     */
-#define X86_MMU_PG_G            0x0100           /* G    Global                  */
+#define X86_MMU_PG_P            0x0001          /* P    Valid                   */
+#define X86_MMU_PG_RW           0x0002          /* R/W  Read/Write              */
+#define X86_MMU_PG_U            0x0004          /* U/S  User/Supervisor         */
+#define X86_MMU_PG_WT           0x0008          /* WT   Write-through           */
+#define X86_MMU_PG_CD           0x0010          /* CD   Cache disable           */
+#define X86_MMU_PG_A            0x0020          /* A    Accessed                */
+#define X86_MMU_PG_D            0x0040          /* D    Dirty                   */
+#define X86_MMU_PG_PS           0x0080          /* PS   Page size (0=4k,1=4M)   */
+#define X86_MMU_PG_PTE_PAT      0x0080          /* PAT  PAT index for 4k pages  */
+#define X86_MMU_PG_LARGE_PAT    0x1000          /* PAT  PAT index otherwise     */
+#define X86_MMU_PG_G            0x0100          /* G    Global                  */
 #define X86_MMU_CLEAR           0x0
 #define X86_DIRTY_ACCESS_MASK   0xf9f
+
+#define X86_EPT_R               (1u << 0)       /* R    Read        */
+#define X86_EPT_W               (1u << 1)       /* W    Write       */
+#define X86_EPT_X               (1u << 2)       /* X    Execute     */
+#define X86_EPT_A               (1u << 8)       /* A    Accessed    */
+#define X86_EPT_D               (1u << 9)       /* D    Dirty       */
+
+/* From Volume 3, Section 28.2.6: EPT and Memory Typing */
+#define X86_EPT_WB              (6u << 3)       /* WB   Write-back memory type  */
 
 /* Page Attribute Table memory types, defined in Table 11-10 of Intel 3A */
 #define X86_PAT_UC              0x00 /* Uncached */
@@ -84,16 +89,16 @@
 #define IS_PAGE_PRESENT(pte)    ((pte) & X86_MMU_PG_P)
 #define IS_LARGE_PAGE(pte)      ((pte) & X86_MMU_PG_PS)
 
-#if defined(PAE_MODE_ENABLED) || ARCH_X86_64
 #define X86_MMU_PG_NX           (1UL << 63)
 
-#if ARCH_X86_64
+// NOTE(abdulla): We assume that PT and EPT paging levels match, specifically:
+// - PML4 entries refer to 512GB pages
+// - PDP entries refer to 1GB pages
+// - PD entries refer to 2MB pages
+// - PT entries refer to 4KB pages
+
 #define X86_PAGING_LEVELS       4
 #define PML4_SHIFT              39
-#else
-#define X86_PAGING_LEVELS       3
-#endif
-
 #define PDP_SHIFT               30
 #define PD_SHIFT                21
 #define PT_SHIFT                12
@@ -114,26 +119,8 @@
 #define VADDR_TO_PML4_INDEX(vaddr) ((vaddr) >> PML4_SHIFT) & ((1ul << ADDR_OFFSET) - 1)
 #define VADDR_TO_PDP_INDEX(vaddr)  ((vaddr) >> PDP_SHIFT) & ((1ul << ADDR_OFFSET) - 1)
 
-#else
-/* non PAE mode */
-#define X86_PG_FRAME            (0xfffff000)
-#define X86_FLAGS_MASK          (0x00000fff)
-#define X86_LARGE_FLAGS_MASK    (0x00001fff)
-#define X86_LARGE_PAGE_FRAME    (0xffc00000)
-#define NO_OF_PT_ENTRIES        1024
-#define X86_PAGING_LEVELS       2
-#define PD_SHIFT                22
-#define PT_SHIFT                12
-#define ADDR_OFFSET             10
-#define PAGE_OFFSET_MASK_4KB    ((1 << PT_SHIFT) - 1)
-#define PAGE_OFFSET_MASK_LARGE  ((1 << PD_SHIFT) - 1)
-#endif
-
 #define VADDR_TO_PD_INDEX(vaddr)  ((vaddr) >> PD_SHIFT) & ((1ul << ADDR_OFFSET) - 1)
 #define VADDR_TO_PT_INDEX(vaddr)  ((vaddr) >> PT_SHIFT) & ((1ul << ADDR_OFFSET) - 1)
-
-#define VADDR_TO_PML4_INDEX(vaddr) ((vaddr) >> PML4_SHIFT) & ((1ul << ADDR_OFFSET) - 1)
-#define VADDR_TO_PDP_INDEX(vaddr)  ((vaddr) >> PDP_SHIFT) & ((1ul << ADDR_OFFSET) - 1)
 
 /* on both x86-32 and x86-64 physical memory is mapped at the base of the kernel address space */
 #define X86_PHYS_TO_VIRT(x)     ((uintptr_t)(x) + KERNEL_ASPACE_BASE)
@@ -152,7 +139,7 @@
 #ifndef ASSEMBLY
 
 #include <sys/types.h>
-#include <compiler.h>
+#include <magenta/compiler.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <inttypes.h>
@@ -163,12 +150,8 @@ __BEGIN_CDECLS
 enum page_table_levels {
     PT_L,
     PD_L,
-#if defined(PAE_MODE_ENABLED) || ARCH_X86_64
     PDP_L,
-#endif
-#if ARCH_X86_64
     PML4_L,
-#endif
 };
 
 #define MAX_PAGING_LEVEL        (enum page_table_levels)(X86_PAGING_LEVELS - 1)
@@ -179,13 +162,8 @@ struct map_range {
     size_t size;
 };
 
-#if defined(PAE_MODE_ENABLED) || ARCH_X86_64
 typedef uint64_t pt_entry_t;
 #define PRIxPTE PRIx64
-#else
-typedef uint32_t pt_entry_t;
-#define PRIxPTE PRIx32
-#endif
 
 typedef pt_entry_t arch_flags_t;
 
@@ -194,6 +172,8 @@ bool x86_is_vaddr_canonical(vaddr_t vaddr);
 void x86_mmu_percpu_init(void);
 void x86_mmu_early_init(void);
 void x86_mmu_init(void);
+
+paddr_t x86_kernel_cr3(void);
 
 __END_CDECLS
 

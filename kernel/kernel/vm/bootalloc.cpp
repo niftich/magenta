@@ -22,6 +22,25 @@ extern int _end;
 uintptr_t boot_alloc_start = (uintptr_t)&_end;
 uintptr_t boot_alloc_end = (uintptr_t)&_end;
 
+void boot_alloc_reserve(uintptr_t start, size_t len) {
+    uintptr_t end = ALIGN((start + len), PAGE_SIZE);
+
+    // Adjust physical addresses to kernel memory map
+    start += KERNEL_BASE;
+    end += KERNEL_BASE;
+
+    if (end >= boot_alloc_start) {
+        if ((start > boot_alloc_start) &&
+            ((start - boot_alloc_start) > (128 * 1024 * 1024))) {
+            // if we've got 128MB of space, that's good enough
+            // it's possible that the start may be *way* far up
+            // (gigabytes) and there may not be space after it...
+            return;
+        }
+        boot_alloc_start = boot_alloc_end = end;
+    }
+}
+
 void* boot_alloc_mem(size_t len) {
     uintptr_t ptr;
 

@@ -5,33 +5,28 @@
 // license that can be found in the LICENSE file or at
 // https://opensource.org/licenses/MIT
 
+#include "tests.h"
+
 #include <stdio.h>
 #include <rand.h>
 #include <err.h>
-#include <app/tests.h>
+#include <inttypes.h>
 #include <kernel/thread.h>
 #include <kernel/mutex.h>
-#include <kernel/semaphore.h>
 #include <kernel/event.h>
+#include <kernel/mp.h>
 #include <platform.h>
 
 void clock_tests(void)
 {
-    uint32_t c;
-    lk_time_t t;
-    lk_bigtime_t t2;
+    uint64_t c;
+    lk_time_t t2;
 
-    thread_sleep(100);
+    thread_sleep_relative(LK_MSEC(100));
     c = arch_cycle_count();
-    t = current_time();
+    current_time();
     c = arch_cycle_count() - c;
-    printf("%u cycles per current_time()\n", c);
-
-    thread_sleep(100);
-    c = arch_cycle_count();
-    t2 = current_time_hires();
-    c = arch_cycle_count() - c;
-    printf("%u cycles per current_time_hires()\n", c);
+    printf("%" PRIu64 " cycles per current_time()\n", c);
 
     printf("making sure time never goes backwards\n");
     {
@@ -39,63 +34,48 @@ void clock_tests(void)
         lk_time_t start = current_time();
         lk_time_t last = start;
         for (;;) {
-            t = current_time();
-            //printf("%lu %lu\n", last, t);
-            if (TIME_LT(t, last)) {
-                printf("WARNING: time ran backwards: %lu < %lu\n", t, last);
-                last = t;
-                continue;
-            }
-            last = t;
-            if (last - start > 5000)
-                break;
-        }
-    }
-    {
-        printf("testing current_time_hires()\n");
-        lk_bigtime_t start = current_time_hires();
-        lk_bigtime_t last = start;
-        for (;;) {
-            t2 = current_time_hires();
+            t2 = current_time();
             //printf("%llu %llu\n", last, t2);
             if (t2 < last) {
-                printf("WARNING: time ran backwards: %llu < %llu\n", t2, last);
+                printf("WARNING: time ran backwards: %" PRIu64 " < %" PRIu64 "\n", t2, last);
                 last = t2;
                 continue;
             }
             last = t2;
-            if (last - start > 5000000)
-                break;
-        }
-    }
-
-    printf("making sure current_time() and current_time_hires() are always the same base\n");
-    {
-        lk_time_t start = current_time();
-        for (;;) {
-            t = current_time();
-            t2 = current_time_hires();
-            if (t > ((t2 + 500) / 1000)) {
-                printf("WARNING: current_time() ahead of current_time_hires() %lu %llu\n", t, t2);
-            }
-            if (t - start > 5000)
+            if (last - start > LK_MSEC(5))
                 break;
         }
     }
 
     printf("counting to 5, in one second intervals\n");
     for (int i = 0; i < 5; i++) {
-        thread_sleep(1000);
+        thread_sleep_relative(LK_SEC(1));
         printf("%d\n", i + 1);
     }
 
-    printf("measuring cpu clock against current_time_hires()\n");
-    for (int i = 0; i < 5; i++) {
-        uint cycles = arch_cycle_count();
-        lk_bigtime_t start = current_time_hires();
-        while ((current_time_hires() - start) < 1000000)
-            ;
-        cycles = arch_cycle_count() - cycles;
-        printf("%u cycles per second\n", cycles);
+    int old_affinity = thread_pinned_cpu(get_current_thread());
+
+    for (int cpu = 0; cpu < SMP_MAX_CPUS; cpu++) {
+        if (!mp_is_cpu_online(cpu))
+            continue;
+
+        printf("measuring cpu clock against current_time() on cpu %u\n", cpu);
+
+        thread_set_pinned_cpu(get_current_thread(), cpu);
+        mp_reschedule(1 << cpu, 0);
+        thread_yield();
+
+        for (int i = 0; i < 3; i++) {
+            uint64_t cycles = arch_cycle_count();
+            lk_time_t start = current_time();
+            while ((current_time() - start) < LK_SEC(1))
+                ;
+            cycles = arch_cycle_count() - cycles;
+            printf("cpu %u: %" PRIu64 " cycles per second\n", cpu, cycles);
+        }
     }
+
+    thread_set_pinned_cpu(get_current_thread(), old_affinity);
+    mp_reschedule(MP_CPU_ALL_BUT_LOCAL, 0);
+    thread_yield();
 }

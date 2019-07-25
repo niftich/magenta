@@ -9,7 +9,7 @@
 
 #include <stddef.h>
 #include <stdio.h>
-#include <compiler.h>
+#include <magenta/compiler.h>
 #include <platform/debug.h>
 
 #if !defined(LK_DEBUGLEVEL)
@@ -27,9 +27,6 @@ __BEGIN_CDECLS
 typedef int(hexdump_print_fn_t)(const char* fmt, ...);
 
 #if !DISABLE_DEBUG_OUTPUT
-
-/* Obtain the panic file descriptor. */
-FILE *get_panic_fd(void);
 
 /* dump memory */
 void hexdump_very_ex(const void *ptr,
@@ -81,10 +78,14 @@ static inline void hexdump8(const void *ptr, size_t len)
 #define dprintf(level, x...) do { if ((level) <= LK_DEBUGLEVEL) { printf(x); } } while (0)
 
 /* systemwide halts */
-void _panic(void *caller, const char *fmt, ...) __PRINTFLIKE(2, 3) __NO_RETURN;
-#define panic(x...) _panic(__GET_CALLER(), x)
+void _panic(void *caller, void *frame, const char *fmt, ...) __PRINTFLIKE(3, 4) __NO_RETURN;
+#define panic(x...) _panic(__GET_CALLER(), __GET_FRAME(), x)
 
 #define PANIC_UNIMPLEMENTED panic("%s unimplemented\n", __PRETTY_FUNCTION__)
+
+void __stack_chk_fail(void) __NO_RETURN;
+
+uintptr_t choose_stack_guard(void);
 
 /* spin the cpu for a period of (short) time */
 void spin(uint32_t usecs);

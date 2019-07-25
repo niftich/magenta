@@ -7,35 +7,52 @@
 #pragma once
 
 #include <kernel/mutex.h>
+#include <kernel/spinlock.h>
+#include <mxtl/auto_lock.h>
+#include <mxtl/macros.h>
 
-class AutoLock {
+// Various lock guard wrappers for kernel only locks
+// NOTE: wrapper for mutex_t is in mxtl/auto_lock.h
+
+class TA_SCOPED_CAP AutoSpinLock {
 public:
-    AutoLock(mutex_t* mutex)
-        :   mutex_(mutex) {
-        mutex_acquire(mutex_);
-    }
+    explicit AutoSpinLock(spin_lock_t& lock) : spinlock_(&lock) { acquire(); }
+    explicit AutoSpinLock(SpinLock& lock) : spinlock_(lock.GetInternal()) { acquire(); }
+    ~AutoSpinLock() { release(); }
 
-    AutoLock(mutex_t& mutex)
-        :   AutoLock(&mutex) {}
-
-    ~AutoLock() {
-        release();
-    }
-
-    // early release the mutex before the object goes out of scope
-    void release() {
-        if (mutex_) {
-            mutex_release(mutex_);
-            mutex_ = nullptr;
+    void release() TA_REL() {
+        if (spinlock_) {
+            spin_unlock(spinlock_);
+            spinlock_ = nullptr;
         }
     }
 
     // suppress default constructors
-    AutoLock(const AutoLock& am) = delete;
-    AutoLock& operator=(const AutoLock& am) = delete;
-    AutoLock(AutoLock&& c) = delete;
-    AutoLock& operator=(AutoLock&& c) = delete;
+    DISALLOW_COPY_ASSIGN_AND_MOVE(AutoSpinLock);
 
 private:
-    mutex_t* mutex_;
+    void acquire() TA_ACQ() { spin_lock(spinlock_); }
+    spin_lock_t* spinlock_;
+};
+
+class AutoSpinLockIrqSave {
+public:
+    explicit AutoSpinLockIrqSave(spin_lock_t& lock) : spinlock_(&lock) { acquire(); }
+    explicit AutoSpinLockIrqSave(SpinLock& lock) : spinlock_(lock.GetInternal()) { acquire(); }
+    ~AutoSpinLockIrqSave() { release(); }
+
+    void release() {
+        if (spinlock_) {
+            spin_unlock_irqrestore(spinlock_, state_);
+            spinlock_ = nullptr;
+        }
+    }
+
+    // suppress default constructors
+    DISALLOW_COPY_ASSIGN_AND_MOVE(AutoSpinLockIrqSave);
+
+private:
+    void acquire() { spin_lock_irqsave(spinlock_, state_); }
+    spin_lock_t* spinlock_;
+    spin_lock_saved_state_t state_;
 };

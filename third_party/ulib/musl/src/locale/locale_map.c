@@ -1,8 +1,7 @@
-#include "atomic.h"
-#include "libc.h"
 #include "locale_impl.h"
 #include <locale.h>
 #include <string.h>
+#include <threads.h>
 
 const char* __lctrans_impl(const char* msg, const struct __locale_map* lm) {
     const char* trans = 0;
@@ -20,11 +19,11 @@ static const char envvars[][12] = {
 };
 
 const struct __locale_map* __get_locale(int cat, const char* val) {
-    static mxr_mutex_t lock;
+    static mtx_t lock;
     static void* volatile loc_head;
     const struct __locale_map* p;
     struct __locale_map* new = 0;
-    const char *path = 0, *z;
+    const char* z;
     char buf[256];
     size_t l, n;
 
@@ -50,16 +49,15 @@ const struct __locale_map* __get_locale(int cat, const char* val) {
         if (!strcmp(val, p->name))
             return p;
 
-    mxr_mutex_lock(&lock);
+    mtx_lock(&lock);
 
     for (p = loc_head; p; p = p->next)
         if (!strcmp(val, p->name)) {
-            mxr_mutex_unlock(&lock);
+            mtx_unlock(&lock);
             return p;
         }
 
-    if (!libc.secure)
-        path = getenv("MUSL_LOCPATH");
+    const char* path = getenv("MUSL_LOCPATH");
     /* FIXME: add a default path? */
 
     if (path)
@@ -108,6 +106,6 @@ const struct __locale_map* __get_locale(int cat, const char* val) {
     if (!new&& cat == LC_CTYPE)
         new = (void*)&__c_dot_utf8;
 
-    mxr_mutex_unlock(&lock);
+    mtx_unlock(&lock);
     return new;
 }

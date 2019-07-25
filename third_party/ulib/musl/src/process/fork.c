@@ -1,6 +1,5 @@
 #include "libc.h"
 #include "pthread_impl.h"
-#include "syscall.h"
 #include <signal.h>
 #include <string.h>
 #include <unistd.h>
@@ -14,11 +13,9 @@ pid_t fork(void) {
     sigset_t set;
     __fork_handler(-1);
     __block_all_sigs(&set);
-#ifdef SYS_fork
-    ret = syscall(SYS_fork);
-#else
-    ret = syscall(SYS_clone, SIGCHLD, 0);
-#endif
+    // TODO(kulakowski) Some level of fork emulation.
+    ret = ENOSYS;
+
     if (!ret) {
         // TODO(kulakowski): NB: fork assumes that the calling thread
         // is a pthread, and that the created thread in the new

@@ -3,26 +3,47 @@
 [TOC]
 
 Magenta is a object-based kernel. User mode code almost exclusively interacts
-with OS resources via object handles which map kernel objects to processes.
+with OS resources via object handles. A handle can be thought of as an active
+session with a specific OS subsystem scoped to a particular resource.
 
-## Kernel objects in progress
+Magenta actively manages the following resources:
+
++ processor time
++ memory
++ device-io memory
++ interrupts
++ signaling and waiting
+
+## Kernel objects for applications
+
++ [Channel](objects/channel.md)
++ [Socket](objects/socket.md)
++ [FIFO](objects/fifo.md)
 
 + [Process](objects/process.md)
 + [Thread](objects/thread.md)
++ [Job](objects/job.md)
++ [Task](objects/task.md)
+
 + [Event](objects/event.md)
-+ [Message pipe](objects/message_pipe.md)
++ [Event Pair](objects/eventpair.md)
++ [Futex](objects/futex.md)
+
++ [Virtual Memory Object](objects/vm_object.md)
++ [Virtual Memory Address Region](objects/vm_address_region.md)
+
++ [Port](objects/port.md)
++ [Waitset](objects/waitset.md)
+
+## Kernel objects for drivers
+
 + [Interrupt request](objects/interrupt_request.md)
-+ [VMObject](objects/vm_object.md)
-
-## Kernel objects planned
-
-+ Data pipe
-+ Job
-+ IOPort
++ [Resource](objects/resource.md)
++ [Log](objects/log.md)
 
 ## Kernel Object and LK
 Some kernel objects wrap one or more LK-level constructs. For example the
-Thread object wraps one `thread_t`. However the Message Pipe does not wrap
+Thread object wraps one `thread_t`. However the Channel does not wrap
 any LK-level objects.
 
 ## Kernel object lifetime
@@ -44,7 +65,7 @@ A kernel object is implemented as a C++ class that derives from `Dispatcher`
 and that overrides the methods it implements. Thus, for example, the code
 of the Thread object is found in `ThreadDispatcher`. There is plenty of
 code that only cares about kernel objects in the generic sense, in that case
-the name you'll see is `utils::RefPtr<Dispatcher>`.
+the name you'll see is `mxtl::RefPtr<Dispatcher>`.
 
 ## Kernel Object security
 In principle, kernel objects do not have an intrinsic notion of security and

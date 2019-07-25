@@ -1,23 +1,15 @@
-// Copyright 2016 The Fuchsia Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
 
+#include <inttypes.h>
 #include <stdint.h>
-#include <system/listnode.h>
+#include <magenta/listnode.h>
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <threads.h>
 
 #if _KERNEL
 //TODO: proper includes/defines kernel driver
@@ -27,7 +19,7 @@
 #include <magenta/syscalls.h>
 #include <ddk/driver.h>
 typedef int status_t;
-#define __nanosleep(x) mx_nanosleep(x);
+#define __nanosleep(x) mx_nanosleep(mx_deadline_after(x));
 #define REG32(addr) ((volatile uint32_t *)(uintptr_t)(addr))
 #define writel(v, a) (*REG32(eth->iobase + (a)) = (v))
 #define readl(a) (*REG32(eth->iobase + (a)))
@@ -53,36 +45,41 @@ unsigned eth_handle_irq(ethdev_t* eth) {
     return readl(IE_ICR);
 }
 
-status_t eth_rx(ethdev_t* eth, void* data) {
+status_t eth_rx(ethdev_t* eth, void** data, size_t* len) {
     uint32_t n = eth->rx_rd_ptr;
     uint64_t info = eth->rxd[n].info;
 
     if (!(info & IE_RXD_DONE)) {
-        return ERR_BAD_STATE;
+        return ERR_SHOULD_WAIT;
     }
 
     // copy out packet
     mx_status_t r = IE_RXD_LEN(info);
-    if (r > ETH_RXBUF_SIZE) {
-        // should not be possible, but...
-        r = ERR_BAD_STATE;
-    } else {
-        memcpy(data, eth->rxb + ETH_RXBUF_SIZE * n, r);
-    }
+
+    *data = eth->rxb + ETH_RXBUF_SIZE * n;
+    *len = r;
+
+    return NO_ERROR;
+}
+
+void eth_rx_ack(ethdev_t* eth) {
+    uint32_t n = eth->rx_rd_ptr;
 
     // make buffer available to hw
     eth->rxd[n].info = 0;
     writel(n, IE_RDT);
     n = (n + 1) & (ETH_RXBUF_COUNT - 1);
     eth->rx_rd_ptr = n;
-
-    return r;
 }
 
 status_t eth_tx(ethdev_t* eth, const void* data, size_t len) {
-    if ((len < 64) || (len > ETH_TXBUF_DSIZE)) {
+    if ((len < 60) || (len > ETH_TXBUF_DSIZE)) {
         return ERR_INVALID_ARGS;
     }
+
+    mx_status_t status = NO_ERROR;
+
+    mtx_lock(&eth->send_lock);
 
     // reclaim completed buffers from hw
     uint32_t n = eth->tx_rd_ptr;
@@ -105,7 +102,8 @@ status_t eth_tx(ethdev_t* eth, const void* data, size_t len) {
     // obtain buffer, copy into it, setup descriptor
     framebuf_t *frame = list_remove_head_type(&eth->free_frames, framebuf_t, node);
     if (frame == NULL) {
-        return ERR_NO_MEMORY;
+        status = ERR_NO_MEMORY;
+        goto out;
     }
 
     n = eth->tx_wr_ptr;
@@ -119,7 +117,9 @@ status_t eth_tx(ethdev_t* eth, const void* data, size_t len) {
     eth->tx_wr_ptr = n;
     writel(n, IE_TDT);
 
-    return len;
+out:
+    mtx_unlock(&eth->send_lock);
+    return status;
 }
 
 status_t eth_reset_hw(ethdev_t* eth) {
@@ -177,7 +177,7 @@ void eth_init_hw(ethdev_t* eth) {
 }
 
 void eth_setup_buffers(ethdev_t* eth, void* iomem, mx_paddr_t iophys) {
-    printf("eth: iomem @%p (phys %lx)\n", iomem, iophys);
+    printf("eth: iomem @%p (phys %" PRIxPTR ")\n", iomem, iophys);
 
     list_initialize(&eth->free_frames);
     list_initialize(&eth->busy_frames);

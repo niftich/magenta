@@ -24,5 +24,27 @@
 #define PAGE_SIZE (1L << PAGE_SIZE_SHIFT)
 #define USER_PAGE_SIZE (1L << USER_PAGE_SIZE_SHIFT)
 
-#define CACHE_LINE 32
+#if ARM64_CPU_CORTEX_A53
+#define CACHE_LINE 64
+#elif ARM64_CPU_CORTEX_A57
+#define CACHE_LINE 64
+#elif ARM64_CPU_CORTEX_A72
+#define CACHE_LINE 64
+#elif ARM64_CPU_CORTEX_A73
+#define CACHE_LINE 64
+#else
+#error "define CACHE_LINE for the specific core"
+#endif
+
+#ifndef ASSEMBLY
+#define BM(base, count, val) (((val) & ((1UL << (count)) - 1)) << (base))
+#else
+#define BM(base, count, val) (((val) & ((0x1 << (count)) - 1)) << (base))
+#endif
+
+#define ARM64_MMFR0_ASIDBITS_16     BM(4,4,2)
+#define ARM64_MMFR0_ASIDBITS_8      BM(4,4,0)
+#define ARM64_MMFR0_ASIDBITS_MASK   BM(4,4,15)
+
+#define ARCH_DEFAULT_STACK_SIZE 8192
 

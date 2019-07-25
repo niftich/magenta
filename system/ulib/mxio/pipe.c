@@ -1,119 +1,113 @@
-// Copyright 2016 The Fuchsia Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
 
+#include <limits.h>
+#include <stdarg.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/epoll.h>
+#include <sys/ioctl.h>
 
 #include <magenta/processargs.h>
 #include <magenta/syscalls.h>
 #include <mxio/io.h>
+#include <mxio/remoteio.h>
 #include <mxio/util.h>
+#include <mxio/vfs.h>
 
 #include "private.h"
 
 typedef struct mx_pipe {
     mxio_t io;
     mx_handle_t h;
-    uint32_t avail;
-    uint32_t flags;
-    uint8_t* next;
-    uint8_t data[MXIO_CHUNK_SIZE];
 } mx_pipe_t;
 
-static mx_status_t mxu_blocking_read(mx_handle_t h, void* data, size_t len) {
-    mx_signals_state_t pending;
-    mx_status_t r;
-    uint32_t sz;
-
+static ssize_t _read(mx_handle_t h, void* data, size_t len, int nonblock) {
+    // TODO: let the generic read() to do this loop
     for (;;) {
-        sz = len;
-        r = mx_message_read(h, data, &sz, NULL, NULL, 0);
-        if (r == 0) {
-            return sz;
+        ssize_t r = mx_socket_read(h, 0, data, len, &len);
+        if (r == NO_ERROR) {
+            return (ssize_t) len;
+        } else if (r == ERR_PEER_CLOSED) {
+            return 0;
         }
-        if (r == ERR_BAD_STATE) {
-            r = mx_handle_wait_one(h, MX_SIGNAL_READABLE | MX_SIGNAL_PEER_CLOSED,
-                                         MX_TIME_INFINITE, &pending);
-            if (r < 0)
+        if (r == ERR_SHOULD_WAIT && !nonblock) {
+            mx_signals_t pending;
+            r = mx_object_wait_one(h, MX_SOCKET_READABLE | MX_SOCKET_PEER_CLOSED,
+                                   MX_TIME_INFINITE, &pending);
+            if (r < 0) {
                 return r;
-            if (pending.satisfied & MX_SIGNAL_READABLE)
+            }
+            if (pending & MX_SOCKET_READABLE) {
                 continue;
-            if (pending.satisfied & MX_SIGNAL_PEER_CLOSED)
-                return ERR_CHANNEL_CLOSED;
+            }
+            if (pending & MX_SOCKET_PEER_CLOSED) {
+                return 0;
+            }
+            // impossible
             return ERR_INTERNAL;
         }
         return r;
     }
 }
 
-static ssize_t mx_pipe_write(mxio_t* io, const void* _data, size_t len) {
-    mx_pipe_t* p = (mx_pipe_t*)io;
-    const uint8_t* data = _data;
-    mx_status_t r = 0;
-    ssize_t count = 0;
-
-    while (len > 0) {
-        size_t xfer = (len > MXIO_CHUNK_SIZE) ? MXIO_CHUNK_SIZE : len;
-        r = mx_message_write(p->h, data, xfer, NULL, 0, 0);
-        if (r < 0)
-            break;
-        len -= xfer;
-        count += xfer;
-        data += xfer;
+static ssize_t _write(mx_handle_t h, const void* data, size_t len, int nonblock) {
+    // TODO: let the generic write() to do this loop
+    for (;;) {
+        ssize_t r;
+        if ((r = mx_socket_write(h, 0, data, len, &len)) == NO_ERROR) {
+            return (ssize_t)len;
+        }
+        if (r == ERR_SHOULD_WAIT && !nonblock) {
+            mx_signals_t pending;
+            r = mx_object_wait_one(h, MX_SOCKET_WRITABLE | MX_SOCKET_PEER_CLOSED,
+                                   MX_TIME_INFINITE, &pending);
+            if (r < 0) {
+                return r;
+            }
+            if (pending & MX_SOCKET_WRITABLE) {
+                continue;
+            }
+            if (pending & MX_SOCKET_PEER_CLOSED) {
+                return ERR_PEER_CLOSED;
+            }
+            // impossible
+            return ERR_INTERNAL;
+        }
+        return r;
     }
-
-    // prioritize partial write results over errors
-    return count ? count : r;
 }
 
-static ssize_t mx_pipe_read(mxio_t* io, void* _data, size_t len) {
+
+static ssize_t mx_pipe_write(mxio_t* io, const void* data, size_t len) {
     mx_pipe_t* p = (mx_pipe_t*)io;
-    uint8_t* data = _data;
-    mx_status_t r = 0;
-    ssize_t count = 0;
+    return _write(p->h, data, len, io->flags & MXIO_FLAG_NONBLOCK);
+}
 
-    while (len > 0) {
-        if (p->avail == 0) {
-            if (len >= MXIO_CHUNK_SIZE) {
-                // largest message will fit, read directly
-                r = mxu_blocking_read(p->h, data, MXIO_CHUNK_SIZE);
-                if (r <= 0)
-                    break;
-                data += r;
-                len -= r;
-                count += r;
-                continue;
-            } else {
-                r = mxu_blocking_read(p->h, p->data, MXIO_CHUNK_SIZE);
-                if (r <= 0)
-                    break;
-                p->avail = r;
-                p->next = p->data;
-            }
+static ssize_t mx_pipe_read(mxio_t* io, void* data, size_t len) {
+    mx_pipe_t* p = (mx_pipe_t*)io;
+    return _read(p->h, data, len, io->flags & MXIO_FLAG_NONBLOCK);
+}
+
+static mx_status_t mx_pipe_misc(mxio_t* io, uint32_t op, int64_t off, uint32_t maxreply, void* data, size_t len) {
+    switch (op) {
+    default:
+        return ERR_NOT_SUPPORTED;
+
+    case MXRIO_STAT: {
+        vnattr_t attr = {};
+        if (maxreply < sizeof(attr)) {
+            return ERR_INVALID_ARGS;
         }
-        size_t xfer = (p->avail > len) ? len : p->avail;
-        memcpy(data, p->next, xfer);
-        p->next += xfer;
-        p->avail -= xfer;
-        data += xfer;
-        len -= xfer;
-        count += xfer;
+        attr.mode = V_TYPE_PIPE | V_IRUSR | V_IWUSR;
+        vnattr_t* attr_out = data;
+        *attr_out = attr;
+        return sizeof(attr);
     }
-
-    // prioritize partial read results over errors
-    return count ? count : r;
+    }
 }
 
 static mx_status_t mx_pipe_close(mxio_t* io) {
@@ -130,71 +124,120 @@ static void mx_pipe_release(mxio_t* io) {
     free(io);
 }
 
-static mx_status_t mx_pipe_wait(mxio_t* io, uint32_t _events, uint32_t* _pending, mx_time_t timeout) {
+static void mx_pipe_wait_begin(mxio_t* io, uint32_t events, mx_handle_t* handle, mx_signals_t* _signals) {
     mx_pipe_t* p = (void*)io;
-    uint32_t events = 0;
-    mx_status_t r;
-    mx_signals_state_t pending;
+    *handle = p->h;
+    mx_signals_t signals = 0;
+    if (events & EPOLLIN) {
+        signals |= MX_SOCKET_READABLE | MX_SOCKET_PEER_CLOSED;
+    }
+    if (events & EPOLLOUT) {
+        signals |= MX_SOCKET_WRITABLE;
+    }
+    if (events & EPOLLRDHUP) {
+        signals |= MX_SOCKET_PEER_CLOSED;
+    }
+    *_signals = signals;
+}
 
-    if (_events & MXIO_EVT_READABLE) {
-        events |= MX_SIGNAL_READABLE;
+static void mx_pipe_wait_end(mxio_t* io, mx_signals_t signals, uint32_t* _events) {
+    uint32_t events = 0;
+    if (signals & (MX_SOCKET_READABLE | MX_SOCKET_PEER_CLOSED)) {
+        events |= EPOLLIN;
     }
-    if (_events & MXIO_EVT_WRITABLE) {
-        events |= MX_SIGNAL_WRITABLE;
+    if (signals & MX_SOCKET_WRITABLE) {
+        events |= EPOLLOUT;
     }
-    if ((r = mx_handle_wait_one(p->h, events, timeout, &pending)) < 0) {
-        return r;
+    if (signals & MX_SOCKET_PEER_CLOSED) {
+        events |= EPOLLRDHUP;
     }
-    if (_pending) {
-        uint32_t out = 0;
-        if (pending.satisfied & MX_SIGNAL_READABLE) {
-            out |= MXIO_EVT_READABLE;
+    *_events = events;
+}
+
+static mx_status_t mx_pipe_clone(mxio_t* io, mx_handle_t* handles, uint32_t* types) {
+    mx_pipe_t* p = (void*)io;
+    mx_status_t status = mx_handle_duplicate(p->h, MX_RIGHT_SAME_RIGHTS, &handles[0]);
+    if (status < 0) {
+        return status;
+    }
+    types[0] = PA_MXIO_PIPE;
+    return 1;
+}
+
+static mx_status_t mx_pipe_unwrap(mxio_t* io, mx_handle_t* handles, uint32_t* types) {
+    mx_pipe_t* p = (void*)io;
+    handles[0] = p->h;
+    types[0] = PA_MXIO_PIPE;
+    free(p);
+    return 1;
+}
+
+static ssize_t mx_pipe_posix_ioctl(mxio_t* io, int req, va_list va) {
+    mx_pipe_t* p = (void*)io;
+    switch (req) {
+    case FIONREAD: {
+        mx_status_t r;
+        size_t avail;
+        if ((r = mx_socket_read(p->h, 0, NULL, 0, &avail)) < 0) {
+            return r;
         }
-        if (pending.satisfied & MX_SIGNAL_WRITABLE) {
-            out |= MXIO_EVT_WRITABLE;
+        if (avail > INT_MAX) {
+            avail = INT_MAX;
         }
-        *_pending = out;
+        int* actual = va_arg(va, int*);
+        *actual = avail;
+        return NO_ERROR;
     }
-    return NO_ERROR;
+    default:
+        return ERR_NOT_SUPPORTED;
+    }
 }
 
 static mxio_ops_t mx_pipe_ops = {
     .read = mx_pipe_read,
     .write = mx_pipe_write,
+    .recvmsg = mxio_default_recvmsg,
+    .sendmsg = mxio_default_sendmsg,
     .seek = mxio_default_seek,
-    .misc = mxio_default_misc,
+    .misc = mx_pipe_misc,
     .close = mx_pipe_close,
     .open = mxio_default_open,
-    .clone = mxio_default_clone,
-    .wait = mx_pipe_wait,
+    .clone = mx_pipe_clone,
     .ioctl = mxio_default_ioctl,
+    .wait_begin = mx_pipe_wait_begin,
+    .wait_end = mx_pipe_wait_end,
+    .unwrap = mx_pipe_unwrap,
+    .posix_ioctl = mx_pipe_posix_ioctl,
+    .get_vmo = mxio_default_get_vmo,
 };
 
 mxio_t* mxio_pipe_create(mx_handle_t h) {
     mx_pipe_t* p = calloc(1, sizeof(*p));
-    if (p == NULL)
+    if (p == NULL) {
+        mx_handle_close(h);
         return NULL;
+    }
     p->io.ops = &mx_pipe_ops;
     p->io.magic = MXIO_MAGIC;
-    p->io.refcount = 1;
+    p->io.flags |= MXIO_FLAG_PIPE;
+    atomic_init(&p->io.refcount, 1);
     p->h = h;
     return &p->io;
 }
 
 int mxio_pipe_pair(mxio_t** _a, mxio_t** _b) {
-    mx_handle_t h[2];
+    mx_handle_t h0, h1;
     mxio_t *a, *b;
-    mx_status_t r = mx_message_pipe_create(h, 0);
-    if (r < 0)
+    mx_status_t r;
+    if ((r = mx_socket_create(0, &h0, &h1)) < 0) {
         return r;
-    if ((a = mxio_pipe_create(h[0])) == NULL) {
-        mx_handle_close(h[0]);
-        mx_handle_close(h[1]);
+    }
+    if ((a = mxio_pipe_create(h0)) == NULL) {
+        mx_handle_close(h1);
         return ERR_NO_MEMORY;
     }
-    if ((b = mxio_pipe_create(h[1])) == NULL) {
+    if ((b = mxio_pipe_create(h1)) == NULL) {
         mx_pipe_close(a);
-        mx_handle_close(h[1]);
         return ERR_NO_MEMORY;
     }
     *_a = a;
@@ -204,23 +247,23 @@ int mxio_pipe_pair(mxio_t** _a, mxio_t** _b) {
 
 mx_status_t mxio_pipe_pair_raw(mx_handle_t* handles, uint32_t* types) {
     mx_status_t r;
-    if ((r = mx_message_pipe_create(handles, 0)) < 0) {
+    if ((r = mx_socket_create(0, handles, handles + 1)) < 0) {
         return r;
     }
-    types[0] = MX_HND_TYPE_MXIO_PIPE;
-    types[1] = MX_HND_TYPE_MXIO_PIPE;
+    types[0] = PA_MXIO_PIPE;
+    types[1] = PA_MXIO_PIPE;
     return 2;
 }
 
 mx_status_t mxio_pipe_half(mx_handle_t* handle, uint32_t* type) {
-    mx_handle_t h[2];
+    mx_handle_t h0, h1;
     mx_status_t r;
     mxio_t* io;
     int fd;
-    if ((r = mx_message_pipe_create(h, 0)) < 0) {
+    if ((r = mx_socket_create(0, &h0, &h1)) < 0) {
         return r;
     }
-    if ((io = mxio_pipe_create(h[0])) == NULL) {
+    if ((io = mxio_pipe_create(h0)) == NULL) {
         r = ERR_NO_MEMORY;
         goto fail;
     }
@@ -229,12 +272,11 @@ mx_status_t mxio_pipe_half(mx_handle_t* handle, uint32_t* type) {
         r = ERR_NO_RESOURCES;
         goto fail;
     }
-    *handle = h[1];
-    *type = MX_HND_TYPE_MXIO_PIPE;
+    *handle = h1;
+    *type = PA_MXIO_PIPE;
     return fd;
 
 fail:
-    mx_handle_close(h[0]);
-    mx_handle_close(h[1]);
+    mx_handle_close(h1);
     return r;
 }

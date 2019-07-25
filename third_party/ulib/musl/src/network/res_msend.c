@@ -1,6 +1,5 @@
 #include "lookup.h"
 #include "stdio_impl.h"
-#include "syscall.h"
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
@@ -13,10 +12,6 @@
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
-
-static void cleanup(void* p) {
-    __syscall(SYS_close, (intptr_t)p);
-}
 
 static unsigned long mtime(void) {
     struct timespec ts;
@@ -32,18 +27,15 @@ int __res_msend_rc(int nqueries, const unsigned char* const* queries, const int*
     union {
         struct sockaddr_in sin;
         struct sockaddr_in6 sin6;
-    } sa = {0}, ns[MAXNS] = {{0}};
+    } sa = {}, ns[MAXNS] = {};
     socklen_t sl = sizeof sa.sin;
     int nns = 0;
     int family = AF_INET;
     int rlen;
     int next;
     int i, j;
-    int cs;
     struct pollfd pfd;
     unsigned long t0, t1, t2;
-
-    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cs);
 
     timeout = 1000 * conf->timeout;
     attempts = conf->attempts;
@@ -78,9 +70,6 @@ int __res_msend_rc(int nqueries, const unsigned char* const* queries, const int*
     /* Past this point, there are no errors. Each individual query will
      * yield either no reply (indicated by zero length) or an answer
      * packet which is up to the caller to interpret. */
-
-    pthread_cleanup_push(cleanup, (void*)(intptr_t)fd);
-    pthread_setcancelstate(cs, 0);
 
     /* Convert any IPv4 addresses in a mixed environment to v4-mapped */
     if (family == AF_INET6) {
@@ -171,7 +160,6 @@ int __res_msend_rc(int nqueries, const unsigned char* const* queries, const int*
         }
     }
 out:
-    pthread_cleanup_pop(1);
 
     return 0;
 }

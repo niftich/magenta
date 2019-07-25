@@ -1,4 +1,3 @@
-#include "libc.h"
 #include <wctype.h>
 
 /* Consider all legal codepoints as printable except for:
@@ -17,9 +16,3 @@ int iswprint(wint_t wc) {
         return 0;
     return 1;
 }
-
-int __iswprint_l(wint_t c, locale_t l) {
-    return iswprint(c);
-}
-
-weak_alias(__iswprint_l, iswprint_l);

@@ -7,7 +7,7 @@
 
 #pragma once
 
-#include <compiler.h>
+#include <magenta/compiler.h>
 #include <arch/x86/mmu.h>
 #include <kernel/spinlock.h>
 
@@ -29,8 +29,13 @@ struct arch_aspace {
     vaddr_t base;
     size_t size;
 
-    /* if not NULL, pointer to the port IO permissions for this address space */
-    void *io_bitmap_ptr;
+    /* cpus that are currently executing in this aspace
+     * actually an mp_cpu_mask_t, but header dependencies. */
+    volatile int active_cpus;
+
+    /* Pointer to a bitmap::RleBitmap representing the range of ports
+     * enabled in this aspace. */
+    void *io_bitmap;
     spin_lock_t io_bitmap_lock;
 };
 

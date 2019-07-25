@@ -44,9 +44,12 @@ void mp_init(void)
 
 void mp_reschedule(mp_cpu_mask_t target, uint flags)
 {
+    if (target == 0)
+        return;
+
     uint local_cpu = arch_curr_cpu_num();
 
-    LTRACEF("local %d, target 0x%x\n", local_cpu, target);
+    LTRACEF("local %u, target 0x%x\n", local_cpu, target);
 
     if (target == MP_CPU_ALL) {
         target = mp.active_cpus;
@@ -61,7 +64,7 @@ void mp_reschedule(mp_cpu_mask_t target, uint flags)
     }
     target &= ~(1U << local_cpu);
 
-    LTRACEF("local %d, post mask target now 0x%x\n", local_cpu, target);
+    LTRACEF("local %u, post mask target now 0x%x\n", local_cpu, target);
 
     arch_mp_send_ipi(target, MP_IPI_RESCHEDULE);
 }
@@ -126,7 +129,7 @@ void mp_sync_exec(mp_cpu_mask_t target, mp_sync_task_t task, void *context)
         .outstanding_cpus = target,
     };
 
-    struct mp_ipi_task sync_tasks[SMP_MAX_CPUS] = { 0 };
+    struct mp_ipi_task sync_tasks[SMP_MAX_CPUS] = {};
     for (uint i = 0; i < num_cpus; ++i) {
         sync_tasks[i].func = mp_sync_task;
         sync_tasks[i].context = &sync_context;
@@ -234,7 +237,7 @@ status_t mp_hotplug_cpu(uint cpu_id) {
     mutex_acquire(&mp.hotplug_lock);
 
     if (mp_is_cpu_online(cpu_id)) {
-        status = ERR_ALREADY_STARTED;
+        status = ERR_BAD_STATE;
         goto cleanup_mutex;
     }
 
@@ -279,8 +282,7 @@ status_t mp_unplug_cpu(uint cpu_id) {
             NULL,
             &unplug_done,
             HIGHEST_PRIORITY,
-            NULL,
-            4096,
+            NULL, NULL, 4096,
             mp_unplug_trampoline);
     if (t == NULL) {
         status = ERR_NO_MEMORY;
@@ -351,6 +353,8 @@ enum handler_return mp_mbx_generic_irq(void)
 {
     DEBUG_ASSERT(arch_ints_disabled());
     uint local_cpu = arch_curr_cpu_num();
+
+    THREAD_STATS_INC(generic_ipis);
 
     while (1) {
         struct mp_ipi_task *task;

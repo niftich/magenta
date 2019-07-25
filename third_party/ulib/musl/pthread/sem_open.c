@@ -2,7 +2,6 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
-#include <pthread.h>
 #include <semaphore.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -10,10 +9,9 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <threads.h>
 #include <time.h>
 #include <unistd.h>
-
-#include <runtime/mutex.h>
 
 char* __shm_mapname(const char*, char*);
 
@@ -22,7 +20,7 @@ static struct {
     sem_t* sem;
     int refcnt;
 } * semtab;
-static mxr_mutex_t lock;
+static mtx_t lock;
 
 #define FLAGS (O_RDWR | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
 
@@ -30,7 +28,7 @@ sem_t* sem_open(const char* name, int flags, ...) {
     va_list ap;
     mode_t mode;
     unsigned value;
-    int fd, i, e, slot, first = 1, cnt, cs;
+    int fd, i, e, slot, first = 1, cnt;
     sem_t newsem;
     void* map;
     char tmp[64];
@@ -41,10 +39,10 @@ sem_t* sem_open(const char* name, int flags, ...) {
     if (!(name = __shm_mapname(name, buf)))
         return SEM_FAILED;
 
-    mxr_mutex_lock(&lock);
+    mtx_lock(&lock);
     /* Allocate table if we don't have one yet */
     if (!semtab && !(semtab = calloc(sizeof *semtab, SEM_NSEMS_MAX))) {
-        mxr_mutex_unlock(&lock);
+        mtx_unlock(&lock);
         return SEM_FAILED;
     }
 
@@ -60,16 +58,14 @@ sem_t* sem_open(const char* name, int flags, ...) {
     /* Avoid possibility of overflow later */
     if (cnt == INT_MAX || slot < 0) {
         errno = EMFILE;
-        mxr_mutex_unlock(&lock);
+        mtx_unlock(&lock);
         return SEM_FAILED;
     }
     /* Dummy pointer to make a reservation */
     semtab[slot].sem = (sem_t*)-1;
-    mxr_mutex_unlock(&lock);
+    mtx_unlock(&lock);
 
     flags &= (O_CREAT | O_EXCL);
-
-    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cs);
 
     /* Early failure check for exclusive open; otherwise the case
      * where the semaphore already exists is expensive. */
@@ -143,7 +139,7 @@ sem_t* sem_open(const char* name, int flags, ...) {
     /* See if the newly mapped semaphore is already mapped. If
      * so, unmap the new mapping and use the existing one. Otherwise,
      * add it to the table of mapped semaphores. */
-    mxr_mutex_lock(&lock);
+    mtx_lock(&lock);
     for (i = 0; i < SEM_NSEMS_MAX && semtab[i].ino != st.st_ino; i++)
         ;
     if (i < SEM_NSEMS_MAX) {
@@ -155,28 +151,26 @@ sem_t* sem_open(const char* name, int flags, ...) {
     semtab[slot].refcnt++;
     semtab[slot].sem = map;
     semtab[slot].ino = st.st_ino;
-    mxr_mutex_unlock(&lock);
-    pthread_setcancelstate(cs, 0);
+    mtx_unlock(&lock);
     return map;
 
 fail:
-    pthread_setcancelstate(cs, 0);
-    mxr_mutex_lock(&lock);
+    mtx_lock(&lock);
     semtab[slot].sem = 0;
-    mxr_mutex_unlock(&lock);
+    mtx_unlock(&lock);
     return SEM_FAILED;
 }
 
 int sem_close(sem_t* sem) {
     int i;
-    mxr_mutex_lock(&lock);
+    mtx_lock(&lock);
     for (i = 0; i < SEM_NSEMS_MAX && semtab[i].sem != sem; i++)
         ;
     if (!--semtab[i].refcnt) {
         semtab[i].sem = 0;
         semtab[i].ino = 0;
     }
-    mxr_mutex_unlock(&lock);
+    mtx_unlock(&lock);
     munmap(sem, sizeof *sem);
     return 0;
 }

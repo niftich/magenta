@@ -1,21 +1,16 @@
-// Copyright 2016 The Fuchsia Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
 
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include <magenta/syscalls.h>
+
+// defined in cpp_specific.cpp.
+int cpp_out_of_mem(void);
 
 typedef struct {
     const char* name;
@@ -40,8 +35,16 @@ int ro_write(volatile unsigned int* addr) {
 }
 
 int nx_run(volatile unsigned int* addr) {
-    // test that we cannot execute NX memory
-    static uint8_t codebuf[16];
+    // Test that we cannot execute NX memory.  Use stack memory for this
+    // because using a static means the compiler might generate a direct
+    // branch to the symbol rather than computing the function pointer
+    // address in a register as the code looks like it would do, and
+    // declaring a static writable variable that the compiler can see
+    // nobody writes leaves the compiler free to morph it into a static
+    // const variable, which gets put into a mergeable rodata section, and
+    // the Gold linker for aarch64 cannot handle a branch into a mergeable
+    // section.
+    uint8_t codebuf[16] = {};
     void (*func)(void) = (void*)codebuf;
     func();
     return 0;
@@ -62,17 +65,48 @@ int stack_overflow(volatile unsigned int* i_array) {
     return 0;
 }
 
+int stack_buf_overrun(volatile unsigned int* arg) {
+    volatile unsigned int array[6];
+    if (!arg) {
+        return stack_buf_overrun(array);
+    } else {
+        memset((void*)arg, 0, sizeof(array[0]) * 7);
+    }
+    return 0;
+}
+
 int undefined(volatile unsigned int* unused) {
 #if defined(__x86_64__)
     __asm__ volatile("ud2");
 #elif defined(__aarch64__)
     __asm__ volatile("brk #0"); // not undefined, but close enough
-#elif defined(__arm__)
-    __asm__ volatile("udf");
 #else
 #error "need to define undefined for this architecture"
 #endif
     return 0;
+}
+
+int oom(volatile unsigned int* unused) {
+    return cpp_out_of_mem();
+}
+
+#include <unistd.h>
+
+// volatile to ensure compiler doesn't optimize the allocs away
+volatile char* mem_alloc;
+
+int mem(volatile unsigned int* arg) {
+    int count = 0;
+    for (;;) {
+        mem_alloc = malloc(1024*1024);
+        memset((void*)mem_alloc, 0xa5, 1024*1024);
+        count++;
+        if ((count % 128) == 0) {
+            mx_nanosleep(mx_deadline_after(MX_MSEC(250)));
+            write(1, ".", 1);
+        }
+    }
+
 }
 
 command_t commands[] = {
@@ -80,8 +114,11 @@ command_t commands[] = {
     {"read0", blind_read, "read address 0x0"},
     {"writero", ro_write, "write to read only code segment"},
     {"stackov", stack_overflow, "overflow the stack (recursive)"},
+    {"stackbuf", stack_buf_overrun, "overrun a buffer on the stack"},
     {"und", undefined, "undefined instruction"},
     {"nx_run", nx_run, "run in no-execute memory"},
+    {"oom", oom, "out of memory c++ death"},
+    {"mem", mem, "out of memory"},
     {NULL, NULL, NULL}};
 
 int main(int argc, char** argv) {

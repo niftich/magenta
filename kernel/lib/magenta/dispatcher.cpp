@@ -5,13 +5,17 @@
 // https://opensource.org/licenses/MIT
 
 #include <magenta/dispatcher.h>
+#include <magenta/state_tracker.h>
 
 #include <arch/ops.h>
+#include <lib/ktrace.h>
+#include <mxtl/atomic.h>
 
-static mx_koid_t global_koid = 255ULL;
+// The first 1K koids are reserved.
+static mxtl::atomic<mx_koid_t> global_koid(1024ULL);
 
 mx_koid_t Dispatcher::GenerateKernelObjectId() {
-    return atomic_add_u64(&global_koid, 1ULL);
+    return global_koid.fetch_add(1ULL);
 }
 
 Dispatcher::Dispatcher()
@@ -19,13 +23,34 @@ Dispatcher::Dispatcher()
       handle_count_(0u) {
 }
 
-void Dispatcher::add_handle() {
-    atomic_add_relaxed(&handle_count_, 1);
+Dispatcher::~Dispatcher() {
+#if WITH_LIB_KTRACE
+    ktrace(TAG_OBJECT_DELETE, (uint32_t)koid_, 0, 0, 0);
+#endif
 }
 
-void Dispatcher::remove_handle() {
-    if (atomic_add_release(&handle_count_, -1) == 1) {
-        atomic_fence_acquire();
-        on_zero_handles();
-    }
+status_t Dispatcher::add_observer(StateObserver* observer) {
+    auto state_tracker = get_state_tracker();
+    if (!state_tracker)
+        return ERR_NOT_SUPPORTED;
+    state_tracker->AddObserver(observer, nullptr);
+    return NO_ERROR;
 }
+
+status_t Dispatcher::user_signal(uint32_t clear_mask, uint32_t set_mask, bool peer) {
+    if (peer)
+        return ERR_NOT_SUPPORTED;
+
+    auto state_tracker = get_state_tracker();
+    if (!state_tracker)
+        return ERR_NOT_SUPPORTED;
+
+    // Generic objects can set all USER_SIGNALs. Particular object
+    // types (events and eventpairs) may be able to set more.
+    if ((set_mask & ~MX_USER_SIGNAL_ALL) || (clear_mask & ~MX_USER_SIGNAL_ALL))
+        return ERR_INVALID_ARGS;
+
+    state_tracker->UpdateState(clear_mask, set_mask);
+    return NO_ERROR;
+}
+

@@ -1,27 +1,22 @@
-#include "pthread_impl.h"
 #include <semaphore.h>
 
-static void cleanup(void* p) {
-    a_dec(p);
-}
+#include <stdatomic.h>
+
+#include "atomic.h"
+#include "pthread_impl.h"
 
 int sem_timedwait(sem_t* restrict sem, const struct timespec* restrict at) {
-    pthread_testcancel();
-
     if (!sem_trywait(sem))
         return 0;
 
     int spins = 100;
-    while (spins-- && sem->__val[0] <= 0 && !sem->__val[1])
+    while (spins-- && atomic_load(&sem->_s_value) <= 0 && !atomic_load(&sem->_s_waiters))
         a_spin();
 
     while (sem_trywait(sem)) {
-        int r;
-        a_inc(sem->__val + 1);
-        a_cas(sem->__val, 0, -1);
-        pthread_cleanup_push(cleanup, (void*)(sem->__val + 1));
-        r = __timedwait_cp(sem->__val, -1, CLOCK_REALTIME, at);
-        pthread_cleanup_pop(1);
+        atomic_fetch_add(&sem->_s_waiters, 1);
+        a_cas_shim(&sem->_s_value, 0, -1);
+        int r = __timedwait(&sem->_s_value, -1, CLOCK_REALTIME, at);
         if (r) {
             errno = r;
             return -1;

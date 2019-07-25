@@ -8,7 +8,7 @@
 
 #pragma once
 
-#include <compiler.h>
+#include <magenta/compiler.h>
 
 #ifndef ASSEMBLY
 
@@ -35,40 +35,49 @@ static inline bool arch_ints_disabled(void)
     x86_flags_t state;
 
     __asm__ volatile(
-#if ARCH_X86_32
-        "pushfl;"
-        "popl %%eax"
-#elif ARCH_X86_64
         "pushfq;"
         "popq %%rax"
-#endif
         : "=a" (state)
         :: "memory");
 
     return !(state & (1<<9));
 }
 
-static inline uint32_t arch_cycle_count(void)
+static inline uint64_t arch_cycle_count(void)
 {
-    return (rdtsc() & 0xffffffff);
+    return rdtsc();
 }
 
 static inline void arch_spinloop_pause(void)
 {
-    __asm__ volatile("pause");
+    __asm__ volatile("pause" ::: "memory");
 }
 
 static inline void arch_spinloop_signal(void)
 {
 }
 
-#define mb()        __asm__ volatile ("mfence")
-#define wmb()       __asm__ volatile ("sfence")
-#define rmb()       __asm__ volatile ("lfence")
+#define mb()        __asm__ volatile ("mfence" ::: "memory")
+#define wmb()       __asm__ volatile ("sfence" ::: "memory")
+#define rmb()       __asm__ volatile ("lfence" ::: "memory")
 
 #define smp_mb()    mb()
 #define smp_wmb()   wmb()
 #define smp_rmb()   rmb()
+
+static inline uint32_t arch_dcache_line_size(void) {
+    // TODO(mcgrathr): not needed for anything yet
+    // cpuid can separately report line sizes for L[123]
+    return 0;
+}
+
+// Log architecture-specific data for process creation.
+// This can only be called after the process has been created and before
+// it is running: |aspace| is assumed to live across the call.
+// Alas we can't use mx_koid_t here as the arch layer is at a lower level
+// than magenta.
+struct arch_aspace;
+void arch_trace_process_create(uint64_t pid, const struct arch_aspace* aspace);
 
 __END_CDECLS
 

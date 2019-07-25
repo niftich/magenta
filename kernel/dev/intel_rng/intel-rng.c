@@ -6,16 +6,32 @@
 #include <arch/x86/feature.h>
 #include <dev/hw_rng.h>
 
-static bool rdseed64(uint64_t *out) {
-    bool success = false;
-    __asm__ volatile ("xor %%al, %%al\r\n"
-                      "rdseed %0\r\n"
-                      "adc $0, %%al\r\n"
-                      : "=r"(*out), "=a"(success)
-                      :
-                      : "cc");
-    return success;
-}
+// TODO(mcgrathr): As of GCC 6.3.0, these other files included by
+// <x86intrin.h> are incompatible with -mno-sse.
+// When https://gcc.gnu.org/bugzilla/show_bug.cgi?id=80298 is fixed,
+// these #define hacks can be removed.
+#ifndef __clang__
+#define _AVX512VLINTRIN_H_INCLUDED
+#define _AVX512BWINTRIN_H_INCLUDED
+#define _AVX512DQINTRIN_H_INCLUDED
+#define _AVX512VLBWINTRIN_H_INCLUDED
+#define _AVX512VLDQINTRIN_H_INCLUDED
+#define _AVX512VBMIINTRIN_H_INCLUDED
+#define _AVX512VBMIVLINTRIN_H_INCLUDED
+#define _MM3DNOW_H_INCLUDED
+#define _FMA4INTRIN_H_INCLUDED
+#define _XOPMMINTRIN_H_INCLUDED
+#endif
+#include <x86intrin.h>
+
+enum entropy_instr {
+    ENTROPY_INSTR_RDSEED,
+    ENTROPY_INSTR_RDRAND,
+};
+static ssize_t get_entropy_from_instruction(void* buf, size_t len, bool block,
+                                            enum entropy_instr instr);
+static ssize_t get_entropy_from_rdseed(void* buf, size_t len, bool block);
+static ssize_t get_entropy_from_rdrand(void* buf, size_t len, bool block);
 
 /* @brief Get entropy from the CPU using RDSEED.
  *
@@ -33,20 +49,37 @@ static ssize_t get_entropy_from_cpu(void* buf, size_t len, bool block) {
      * tests against this code */
 
     if (len >= SSIZE_MAX) {
-        STATIC_ASSERT(ERR_INVALID_ARGS < 0);
+        static_assert(ERR_INVALID_ARGS < 0, "");
         return ERR_INVALID_ARGS;
     }
 
-    if (!x86_feature_test(X86_FEATURE_RDSEED)) {
-        /* We don't have an entropy source */
-        STATIC_ASSERT(ERR_NOT_SUPPORTED < 0);
-        return ERR_NOT_SUPPORTED;
+    if (x86_feature_test(X86_FEATURE_RDSEED)) {
+        return get_entropy_from_rdseed(buf, len, block);
+    } else if (x86_feature_test(X86_FEATURE_RDRAND)) {
+        return get_entropy_from_rdrand(buf, len, block);
     }
 
+    /* We don't have an entropy source */
+    static_assert(ERR_NOT_SUPPORTED < 0, "");
+    return ERR_NOT_SUPPORTED;
+}
+
+__attribute__((target("rdrnd,rdseed")))
+static bool instruction_step(enum entropy_instr instr,
+                             unsigned long long int* val) {
+    switch (instr) {
+        case ENTROPY_INSTR_RDRAND: return _rdrand64_step(val);
+        case ENTROPY_INSTR_RDSEED: return _rdseed64_step(val);
+        default: panic("Invalid entropy instruction %u\n", instr);
+    }
+}
+
+static ssize_t get_entropy_from_instruction(void* buf, size_t len, bool block,
+                                            enum entropy_instr instr) {
     size_t written = 0;
     while (written < len) {
-        uint64_t val = 0;
-        if (!rdseed64(&val)) {
+        unsigned long long int val = 0;
+        if (!instruction_step(instr, &val)) {
             if (!block) {
                 break;
             }
@@ -56,8 +89,24 @@ static ssize_t get_entropy_from_cpu(void* buf, size_t len, bool block) {
         memcpy(buf + written, &val, to_copy);
         written += to_copy;
     }
-    DEBUG_ASSERT(written == len);
+    if (block) {
+        DEBUG_ASSERT(written == len);
+    }
     return (ssize_t)written;
+}
+
+static ssize_t get_entropy_from_rdseed(void* buf, size_t len, bool block) {
+    return get_entropy_from_instruction(buf, len, block, ENTROPY_INSTR_RDSEED);
+}
+
+static ssize_t get_entropy_from_rdrand(void* buf, size_t len, bool block) {
+    // TODO(security): This method is not compliant with Intel's "Digital Random
+    // Number Generator (DRNG) Software Implementation Guide".  We are using
+    // rdrand in a way that is explicitly against their recommendations.  This
+    // needs to be corrected, but this fallback is a compromise to allow our
+    // development platforms that don't support RDSEED to get some degree of
+    // hardware-based randomization.
+    return get_entropy_from_instruction(buf, len, block, ENTROPY_INSTR_RDRAND);
 }
 
 size_t hw_rng_get_entropy(void* buf, size_t len, bool block)

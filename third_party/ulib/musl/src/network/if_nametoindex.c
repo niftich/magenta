@@ -1,9 +1,9 @@
 #define _GNU_SOURCE
-#include "syscall.h"
 #include <net/if.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <unistd.h>
 
 unsigned if_nametoindex(const char* name) {
     struct ifreq ifr;
@@ -13,6 +13,6 @@ unsigned if_nametoindex(const char* name) {
         return 0;
     strncpy(ifr.ifr_name, name, sizeof ifr.ifr_name);
     r = ioctl(fd, SIOCGIFINDEX, &ifr);
-    __syscall(SYS_close, fd);
+    close(fd);
     return r < 0 ? 0 : ifr.ifr_ifindex;
 }

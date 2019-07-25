@@ -6,7 +6,8 @@
 
 #pragma once
 
-#include <compiler.h>
+#include <assert.h>
+#include <magenta/compiler.h>
 
 __BEGIN_CDECLS
 
@@ -22,11 +23,11 @@ struct idt {
 };
 
 #ifdef ARCH_X86_64
-STATIC_ASSERT(sizeof(struct idt_entry) == 16);
-STATIC_ASSERT(sizeof(struct idt) == 16 * 256);
+static_assert(sizeof(struct idt_entry) == 16, "");
+static_assert(sizeof(struct idt) == 16 * 256, "");
 #else
-STATIC_ASSERT(sizeof(struct idt_entry) == 8);
-STATIC_ASSERT(sizeof(struct idt) == 8* 256);
+static_assert(sizeof(struct idt_entry) == 8, "");
+static_assert(sizeof(struct idt) == 8* 256, "");
 #endif
 
 struct idtr {
@@ -95,6 +96,11 @@ void idt_set_ist_index(struct idt *idt, uint8_t vec, uint8_t ist_idx);
 void idt_setup(struct idt *idt);
 
 /*
+ * @brief Setup the read-only remapping of the IDT.
+ */
+void idt_setup_readonly(void);
+
+/*
  * @brief Switch to thie given IDT
  *
  * @param idt Pointer to the IDT
@@ -103,5 +109,10 @@ static void idt_load(struct idt *idt) {
     struct idtr idtr = { .limit = sizeof(*idt) - 1, .address = (uintptr_t)idt };
     x86_lidt((uintptr_t)&idtr);
 }
+
+/*
+ * @brief Get the read-only IDT.
+ */
+struct idt * idt_get_readonly(void);
 
 __END_CDECLS

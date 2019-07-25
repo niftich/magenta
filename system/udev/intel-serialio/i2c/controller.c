@@ -1,35 +1,35 @@
-// Copyright 2016 The Fuchsia Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
 
 #include <assert.h>
 #include <ddk/device.h>
 #include <ddk/driver.h>
-#include <ddk/protocol/i2c.h>
 #include <ddk/protocol/pci.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <hw/pci.h>
 #include <intel-serialio/reg.h>
 #include <intel-serialio/serialio.h>
+#include <magenta/device/i2c.h>
+#include <magenta/listnode.h>
 #include <magenta/syscalls.h>
 #include <magenta/types.h>
-#include <runtime/mutex.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <system/listnode.h>
+#include <threads.h>
+#include <unistd.h>
 
 #include "controller.h"
 #include "slave.h"
+
+#define DEVIDLE_CONTROL 0x24c
+#define DEVIDLE_CONTROL_CMD_IN_PROGRESS 0
+#define DEVIDLE_CONTROL_DEVIDLE 2
+#define DEVIDLE_CONTROL_RESTORE_REQUIRED 3
+
+#define ACER_I2C_TOUCH INTEL_SUNRISE_POINT_SERIALIO_I2C1_DID
 
 // Implement the functionality of the i2c bus device.
 
@@ -53,7 +53,7 @@ static mx_status_t intel_serialio_i2c_find_slave(
 }
 
 static mx_status_t intel_serialio_i2c_add_slave(
-    mx_device_t* dev, uint8_t width, uint16_t address) {
+    intel_serialio_i2c_device_t* device, uint8_t width, uint16_t address) {
     mx_status_t status;
 
     if ((width != I2C_7BIT_ADDRESS && width != I2C_10BIT_ADDRESS) ||
@@ -61,48 +61,89 @@ static mx_status_t intel_serialio_i2c_add_slave(
         return ERR_INVALID_ARGS;
     }
 
-    intel_serialio_i2c_device_t* device = get_intel_serialio_i2c_device(dev);
-
     intel_serialio_i2c_slave_device_t* slave;
 
-    mxr_mutex_lock(&device->mutex);
+    mtx_lock(&device->mutex);
 
     // Make sure a slave with the given address doesn't already exist.
     status = intel_serialio_i2c_find_slave(&slave, device, address);
     if (status == NO_ERROR) {
         status = ERR_ALREADY_EXISTS;
-        goto fail2;
-    } else if (status != ERR_NOT_FOUND) {
-        goto fail2;
+    }
+    if (status != ERR_NOT_FOUND) {
+        mtx_unlock(&device->mutex);
+        return status;
     }
 
-    slave = malloc(sizeof(*slave));
+    slave = calloc(1, sizeof(*slave));
     if (!slave) {
         status = ERR_NO_MEMORY;
+        mtx_unlock(&device->mutex);
+        return status;
+    }
+    slave->chip_address_width = width;
+    slave->chip_address = address;
+    slave->controller = device;
+
+    list_add_head(&device->slave_list, &slave->slave_list_node);
+    mtx_unlock(&device->mutex);
+
+    // Temporarily add binding support for the i2c slave. The real way to do
+    // this will involve ACPI/devicetree enumeration, but for now we publish PCI
+    // VID/DID and i2c ADDR as binding properties.
+
+    // Retrieve pci_config (again)
+    pci_protocol_t* pci;
+    status = device_op_get_protocol(device->pcidev, MX_PROTOCOL_PCI, (void**)&pci);
+    if (status != NO_ERROR) {
+        goto fail2;
+    }
+
+    const pci_config_t* pci_config;
+    mx_handle_t config_handle;
+    status = pci->get_config(device->pcidev, &pci_config, &config_handle);
+    if (status != NO_ERROR) {
+        goto fail2;
+    }
+
+    int count = 0;
+    slave->props[count++] = (mx_device_prop_t){BIND_PCI_VID, 0, pci_config->vendor_id};
+    slave->props[count++] = (mx_device_prop_t){BIND_PCI_DID, 0, pci_config->device_id};
+    slave->props[count++] = (mx_device_prop_t){BIND_I2C_ADDR, 0, address};
+
+    char name[sizeof(address) * 2 + 2] = {
+            [sizeof(name) - 1] = '\0',
+    };
+    snprintf(name, sizeof(name) - 1, "%04x", address);
+
+   device_add_args_t args = {
+        .version = DEVICE_ADD_ARGS_VERSION,
+        .name = name,
+        .ctx = slave,
+        .ops = &intel_serialio_i2c_slave_device_proto,
+        .props = slave->props,
+        .prop_count = count,
+    };
+
+    status = device_add(device->mxdev, &args, &slave->mxdev);
+    if (status != NO_ERROR) {
         goto fail1;
     }
 
-    status = intel_serialio_i2c_slave_device_init(dev, slave, width, address);
-    if (status < 0)
-        goto fail1;
-
-    list_add_head(&device->slave_list, &slave->slave_list_node);
-
-    status = device_add(&slave->device, dev);
-    if (status < 0)
-        goto fail1;
-
-    mxr_mutex_unlock(&device->mutex);
     return NO_ERROR;
+
 fail1:
-    free(slave);
+    mx_handle_close(config_handle);
 fail2:
-    mxr_mutex_unlock(&device->mutex);
+    mtx_lock(&device->mutex);
+    list_delete(&slave->slave_list_node);
+    mtx_unlock(&device->mutex);
+    free(slave);
     return status;
 }
 
 static mx_status_t intel_serialio_i2c_remove_slave(
-    mx_device_t* dev, uint8_t width, uint16_t address) {
+    intel_serialio_i2c_device_t* device, uint8_t width, uint16_t address) {
     mx_status_t status;
 
     if ((width != I2C_7BIT_ADDRESS && width != I2C_10BIT_ADDRESS) ||
@@ -110,11 +151,9 @@ static mx_status_t intel_serialio_i2c_remove_slave(
         return ERR_INVALID_ARGS;
     }
 
-    intel_serialio_i2c_device_t* device = get_intel_serialio_i2c_device(dev);
-
     intel_serialio_i2c_slave_device_t* slave;
 
-    mxr_mutex_lock(&device->mutex);
+    mtx_lock(&device->mutex);
 
     // Find the slave we're trying to remove.
     status = intel_serialio_i2c_find_slave(&slave, device, address);
@@ -126,7 +165,7 @@ static mx_status_t intel_serialio_i2c_remove_slave(
         goto remove_slave_finish;
     }
 
-    status = device_remove(&slave->device);
+    status = device_remove(slave->mxdev);
     if (status < 0)
         goto remove_slave_finish;
 
@@ -134,8 +173,8 @@ static mx_status_t intel_serialio_i2c_remove_slave(
     free(slave);
 
 remove_slave_finish:
-    mxr_mutex_unlock(&device->mutex);
-    return NO_ERROR;
+    mtx_unlock(&device->mutex);
+    return status;
 }
 
 static uint32_t intel_serialio_compute_scl_hcnt(
@@ -206,16 +245,14 @@ static mx_status_t intel_serialio_configure_bus_timing(
     return NO_ERROR;
 }
 
-static mx_status_t intel_serialio_i2c_set_bus_frequency(mx_device_t* dev,
+static mx_status_t intel_serialio_i2c_set_bus_frequency(intel_serialio_i2c_device_t* device,
                                                         uint32_t frequency) {
-    intel_serialio_i2c_device_t* device = get_intel_serialio_i2c_device(dev);
-
     if (frequency != I2C_MAX_FAST_SPEED_HZ &&
         frequency != I2C_MAX_STANDARD_SPEED_HZ) {
         return ERR_INVALID_ARGS;
     }
 
-    mxr_mutex_lock(&device->mutex);
+    mtx_lock(&device->mutex);
     device->bus_freq = frequency;
 
     unsigned int speed = CTL_SPEED_STANDARD;
@@ -223,54 +260,53 @@ static mx_status_t intel_serialio_i2c_set_bus_frequency(mx_device_t* dev,
         speed = CTL_SPEED_FAST;
     }
     RMWREG32(&device->regs->ctl, CTL_SPEED, 2, speed);
-    mxr_mutex_unlock(&device->mutex);
+    mtx_unlock(&device->mutex);
 
     return NO_ERROR;
 }
 
-static ssize_t intel_serialio_i2c_ioctl(
-    mx_device_t* dev, uint32_t op, const void* in_buf, size_t in_len,
-    void* out_buf, size_t out_len) {
-    int ret;
+static mx_status_t intel_serialio_i2c_ioctl(
+    void* ctx, uint32_t op, const void* in_buf, size_t in_len,
+    void* out_buf, size_t out_len, size_t* out_actual) {
+    intel_serialio_i2c_device_t* device = ctx;
     switch (op) {
-    case I2C_BUS_ADD_SLAVE: {
+    case IOCTL_I2C_BUS_ADD_SLAVE: {
         const i2c_ioctl_add_slave_args_t* args = in_buf;
         if (in_len < sizeof(*args))
             return ERR_INVALID_ARGS;
 
-        ret = intel_serialio_i2c_add_slave(dev, args->chip_address_width,
-                                           args->chip_address);
-        break;
+        return intel_serialio_i2c_add_slave(device, args->chip_address_width,
+                                            args->chip_address);
     }
-    case I2C_BUS_REMOVE_SLAVE: {
+    case IOCTL_I2C_BUS_REMOVE_SLAVE: {
         const i2c_ioctl_remove_slave_args_t* args = in_buf;
         if (in_len < sizeof(*args))
             return ERR_INVALID_ARGS;
 
-        ret = intel_serialio_i2c_remove_slave(dev, args->chip_address_width,
+        return intel_serialio_i2c_remove_slave(device, args->chip_address_width,
                                               args->chip_address);
-        break;
     }
-    case I2C_BUS_SET_FREQUENCY: {
+    case IOCTL_I2C_BUS_SET_FREQUENCY: {
         const i2c_ioctl_set_bus_frequency_args_t* args = in_buf;
-        if (in_len < sizeof(*args))
+        if (in_len < sizeof(*args)) {
             return ERR_INVALID_ARGS;
-
-        ret = intel_serialio_i2c_set_bus_frequency(dev, args->frequency);
-        break;
+        }
+        intel_serialio_i2c_set_bus_frequency(device, args->frequency);
     }
     default:
         return ERR_INVALID_ARGS;
     }
+}
 
-    if (ret == NO_ERROR)
-        return in_len;
-    else
-        return ret;
+static void intel_serialio_i2c_release(void* ctx) {
+    intel_serialio_i2c_device_t* cont = ctx;
+    free(cont);
 }
 
 static mx_protocol_device_t intel_serialio_i2c_device_proto = {
-    .ioctl = &intel_serialio_i2c_ioctl,
+    .version = DEVICE_OPS_VERSION,
+    .ioctl = intel_serialio_i2c_ioctl,
+    .release = intel_serialio_i2c_release,
 };
 
 // The controller lock should already be held when entering this function.
@@ -278,9 +314,30 @@ mx_status_t intel_serialio_i2c_reset_controller(
     intel_serialio_i2c_device_t* device) {
     mx_status_t status = NO_ERROR;
 
+    // The register will only return valid values if the ACPI _PS0 has been
+    // evaluated.
+    if (*REG32((void*)device->regs + DEVIDLE_CONTROL) != 0xffffffff) {
+        // Wake up device if it is in DevIdle state
+        RMWREG32((void*)device->regs + DEVIDLE_CONTROL, DEVIDLE_CONTROL_DEVIDLE, 1, 0);
+
+        // Wait for wakeup to finish processing
+        int retry = 10;
+        while (retry-- &&
+               (*REG32((void*)device->regs + DEVIDLE_CONTROL) & (1 << DEVIDLE_CONTROL_CMD_IN_PROGRESS))) {
+            usleep(10);
+        }
+        if (!retry) {
+            printf("i2c-controller: timed out waiting for device idle\n");
+            return ERR_TIMED_OUT;
+        }
+    }
+
     // Reset the device.
     RMWREG32(device->soft_reset, 0, 2, 0x0);
     RMWREG32(device->soft_reset, 0, 2, 0x3);
+
+    // Clear the "Restore Required" flag
+    RMWREG32((void*)device->regs + DEVIDLE_CONTROL, DEVIDLE_CONTROL_RESTORE_REQUIRED, 1, 0);
 
     // Disable the controller.
     RMWREG32(&device->regs->i2c_en, I2C_EN_ENABLE, 1, 0);
@@ -362,34 +419,34 @@ static mx_status_t intel_serialio_i2c_device_specific_init(
     return ERR_NOT_SUPPORTED;
 }
 
-mx_status_t intel_serialio_bind_i2c(mx_driver_t* drv, mx_device_t* dev) {
+mx_status_t intel_serialio_bind_i2c(mx_device_t* dev) {
     pci_protocol_t* pci;
-    if (device_get_protocol(dev, MX_PROTOCOL_PCI, (void**)&pci))
+    if (device_op_get_protocol(dev, MX_PROTOCOL_PCI, (void**)&pci))
         return ERR_NOT_SUPPORTED;
 
     mx_status_t status = pci->claim_device(dev);
     if (status < 0)
         return status;
 
-    intel_serialio_i2c_device_t* device = malloc(sizeof(*device));
+    intel_serialio_i2c_device_t* device = calloc(1, sizeof(*device));
     if (!device)
         return ERR_NO_MEMORY;
 
     list_initialize(&device->slave_list);
-    memset(&device->mutex, 0, sizeof(device->mutex));
+    mtx_init(&device->mutex, mtx_plain);
+    device->pcidev = dev;
 
     const pci_config_t* pci_config;
-    mx_handle_t config_handle = pci->get_config(dev, &pci_config);
-    if (config_handle < 0) {
-        status = config_handle;
+    mx_handle_t config_handle;
+    status = pci->get_config(dev, &pci_config, &config_handle);
+    if (status != NO_ERROR) {
         goto fail;
     }
 
-    device->regs_handle = pci->map_mmio(
+    status = pci->map_mmio(
         dev, 0, MX_CACHE_POLICY_UNCACHED_DEVICE,
-        (void**)&device->regs, &device->regs_size);
-    if (device->regs_handle < 0) {
-        status = device->regs_handle;
+        (void**)&device->regs, &device->regs_size, &device->regs_handle);
+    if (status != NO_ERROR) {
         goto fail;
     }
 
@@ -400,12 +457,23 @@ mx_status_t intel_serialio_bind_i2c(mx_driver_t* drv, mx_device_t* dev) {
     if (status < 0)
         goto fail;
 
-    char name[MX_DEVICE_NAME_MAX];
-    snprintf(name, sizeof(name), "i2c-bus-%04x", pci_config->device_id);
-    status = device_init(&device->device, drv, name,
-                         &intel_serialio_i2c_device_proto);
-    if (status < 0)
-        goto fail;
+    // This is a temporary workaround until we have full ACPI device
+    // enumeration. If this is the I2C1 bus, we run _PS0 so the controller is
+    // active.
+    if (pci_config->vendor_id == INTEL_VID &&
+        pci_config->device_id == ACER_I2C_TOUCH) {
+        int dmctlfd = open("/dev/misc/dmctl", O_RDWR);
+        if (dmctlfd < 0) {
+            printf("could not open dmctl: %d\n", errno);
+        } else {
+            const char* i2c1 = "acpi-ps0:\\_SB.PCI0.I2C1";
+            ssize_t wr = write(dmctlfd, i2c1, strlen(i2c1));
+            if (wr < 0) {
+                printf("could not run ps0 for %s: %zd\n", i2c1, wr);
+            }
+            close(dmctlfd);
+        }
+    }
 
     // Configure the I2C controller. We don't need to hold the lock because
     // nobody else can see this controller yet.
@@ -413,15 +481,34 @@ mx_status_t intel_serialio_bind_i2c(mx_driver_t* drv, mx_device_t* dev) {
     if (status < 0)
         goto fail;
 
-    status = device_add(&device->device, dev);
-    if (status < 0)
+    char name[MX_DEVICE_NAME_MAX];
+    snprintf(name, sizeof(name), "i2c-bus-%04x", pci_config->device_id);
+
+   device_add_args_t args = {
+        .version = DEVICE_ADD_ARGS_VERSION,
+        .name = name,
+        .ctx = device,
+        .ops = &intel_serialio_i2c_device_proto,
+    };
+
+    status = device_add(dev, &args, &device->mxdev);
+    if (status < 0) {
         goto fail;
+    }
 
     xprintf(
         "initialized intel serialio i2c driver, "
-        "reg=%#x regsize=%#x\n",
+        "reg=%p regsize=%ld\n",
         device->regs, device->regs_size);
 
+    // Temporarily setup the controller for the Acer12 touch panel. This will
+    // eventually be done by enumerating the device via ACPI, but for now we
+    // hardcode it.
+    if (pci_config->vendor_id == INTEL_VID &&
+        pci_config->device_id == ACER_I2C_TOUCH) {
+        intel_serialio_i2c_set_bus_frequency(device, 400000);
+        intel_serialio_i2c_add_slave(device, I2C_7BIT_ADDRESS, 0x0010);
+    }
     mx_handle_close(config_handle);
     return NO_ERROR;
 

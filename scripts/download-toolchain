@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Copyright 2016 The Fuchsia Authors
 #
@@ -16,14 +16,17 @@
 
 set -e
 
-readonly GS_BUCKET="https://fuchsia-build.storage.googleapis.com/magenta"
+readonly FUCHSIA_GS_BUCKET="https://fuchsia-build.storage.googleapis.com/fuchsia"
+readonly MAGENTA_GS_BUCKET="https://fuchsia-build.storage.googleapis.com/magenta"
 readonly OS="$(uname)"
+readonly HOSTOS=$(uname | tr '[:upper:]' '[:lower:]')
 readonly HOSTARCH="$(uname -m)"
+readonly GCC_VERSION="6.3.0"
 
 # We assume the following directory structure:
 # ./magenta/scripts
 # ./magenta/prebuilt
-readonly SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+readonly SCRIPT_DIR="$(cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd)"
 readonly MAGENTA_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 readonly PREBUILTS_DIR="$(cd "${MAGENTA_ROOT}/prebuilt" && pwd)"
 
@@ -33,7 +36,8 @@ readonly INSTALL_DIR="$(cd "${PREBUILTS_DIR}/downloads" && pwd)"
 
 # Download the tools if they don't already exist, or if their versions are out of date.
 TOOLCHAIN_MAKEVARS=()
-function downloadToolchain() {
+PREBUILT_NAMES=()
+function downloadGCCToolchain() {
   local target="${1}"
 
   # These are files and paths we expect to already exist.
@@ -45,7 +49,7 @@ function downloadToolchain() {
     exit 1
   fi
   local required_version="$(cat "${version_file}" )"
-  local prebuilt_url="${GS_BUCKET}/${common_path}/${required_version}"
+  local prebuilt_url="${MAGENTA_GS_BUCKET}/${common_path}/${required_version}"
 
   # These are files and paths we control in this script.
   local tool_name="${target}-${OS}-${HOSTARCH}"
@@ -58,38 +62,96 @@ function downloadToolchain() {
   if [[ ! -f "${stamp_path}" || "${required_version}" != "$(cat ${stamp_path})" ]]; then
     rm -f -- "${tool_path}"
     echo "Downloading ${prebuilt_url}"
-    curl -continue-at=- --location --output "${tool_path}" "${prebuilt_url}"
+    curl --progress-bar -continue-at=- --location --output "${tool_path}" "${prebuilt_url}"
     echo "Unpacking ${tool_path}"
     bzip2 -dc "${tool_path}" | tar -x
     echo "${required_version}" > "${stamp_path}"
   fi
 
-  local toolchain_dir="${target}-5.3.0-${OS}-${HOSTARCH}"
   # Record the locations of the various toolchains.
+  local toolchain_dir="${target}-${GCC_VERSION}-${OS}-${HOSTARCH}"
+  local relative_install_dir="\$(LKMAKEROOT)${INSTALL_DIR#${MAGENTA_ROOT}}"
   case "${target}" in
-    "arm-eabi")
-      TOOLCHAIN_MAKEVARS+=("ARCH_arm_TOOLCHAIN_PREFIX = ${INSTALL_DIR}/${toolchain_dir}/bin/${target}-")
-      ;;
     "aarch64-elf")
-      TOOLCHAIN_MAKEVARS+=("ARCH_arm64_TOOLCHAIN_PREFIX = ${INSTALL_DIR}/${toolchain_dir}/bin/${target}-")
+      TOOLCHAIN_MAKEVARS+=("ARCH_arm64_TOOLCHAIN_PREFIX = ${relative_install_dir}/${toolchain_dir}/bin/${target}-")
       ;;
     "x86_64-elf")
-      TOOLCHAIN_MAKEVARS+=("ARCH_x86_64_TOOLCHAIN_PREFIX = ${INSTALL_DIR}/${toolchain_dir}/bin/${target}-")
+      TOOLCHAIN_MAKEVARS+=("ARCH_x86_64_TOOLCHAIN_PREFIX = ${relative_install_dir}/${toolchain_dir}/bin/${target}-")
       ;;
   esac
+
+  # Leave some breadcrumbs in the makefile so `make ...` can check if the toolchain is up-to-date.
+  PREBUILT_NAMES+=" ${tool_name}"  # FYI: That's load-bearing leading whitespace.
+  TOOLCHAIN_MAKEVARS+=("PREBUILT_${tool_name}_TOOLCHAIN_STAMP = \$(LKMAKEROOT)${stamp_path#${MAGENTA_ROOT}}")
+  TOOLCHAIN_MAKEVARS+=("PREBUILT_${tool_name}_TOOLCHAIN_SHAFILE = \$(LKMAKEROOT)${version_file#${MAGENTA_ROOT}}")
+}
+
+function downloadClangToolchain() {
+  case "${OS}" in
+    "Darwin") local host_platform="mac" ;;
+    "Linux") local host_platform="linux64" ;;
+    "*") echo "Unknown operating system." 1>&2 && exit 1 ;;
+  esac
+
+  # These are files and paths we expect to already exist.
+  local common_path="toolchain/clang/${host_platform}"
+  local version_file="${PREBUILTS_DIR}/versions/${common_path}/toolchain.sha1"
+  if [[ ! -f "${version_file}" ]]; then
+    echo "File ${version_file} does not exist."
+    echo "Your operating system is probably not supported, aborting."
+    exit 1
+  fi
+  local required_version="$(cat "${version_file}" )"
+  local prebuilt_url="${FUCHSIA_GS_BUCKET}/toolchain/${host_platform}/${required_version}"
+
+  # These are files and paths we control in this script.
+  local tool_name="clang+llvm-${HOSTARCH}-${HOSTOS}"
+  local stamp_path="${INSTALL_DIR}/${tool_name}.stamp"
+  local tool_path="${INSTALL_DIR}/${tool_name}.tar.bz2"
+
+  # The stamp file contains the SHA of the last version we downloaded.  If it doesn't
+  # match the SHA found in the version file, download and unpack the new one.
+  cd ${INSTALL_DIR}
+  if [[ ! -f "${stamp_path}" || "${required_version}" != "$(cat ${stamp_path})" ]]; then
+    rm -f -- "${tool_path}"
+    echo "Downloading ${prebuilt_url}"
+    curl --progress-bar -continue-at=- --location --output "${tool_path}" "${prebuilt_url}"
+    rm -rf -- "${tool_name}"
+    echo "Unpacking ${tool_path}"
+    bzip2 -dc "${tool_path}" | tar -x
+    echo "${required_version}" > "${stamp_path}"
+  fi
+
+  # Record the locations of the various toolchains.
+  local toolchain_dir="clang+llvm-${HOSTARCH}-${HOSTOS}"
+  local relative_install_dir="\$(LKMAKEROOT)${INSTALL_DIR#${MAGENTA_ROOT}}"
+  TOOLCHAIN_MAKEVARS+=("CLANG_TOOLCHAIN_PREFIX = ${relative_install_dir}/${toolchain_dir}/bin/")
+
+  # Leave some breadcrumbs in the makefile so `make ...` can check if the toolchain is up-to-date.
+  PREBUILT_NAMES+=" ${tool_name}"  # FYI: That's load-bearing leading whitespace.
+  TOOLCHAIN_MAKEVARS+=("PREBUILT_${tool_name}_TOOLCHAIN_STAMP = \$(LKMAKEROOT)${stamp_path#${MAGENTA_ROOT}}")
+  TOOLCHAIN_MAKEVARS+=("PREBUILT_${tool_name}_TOOLCHAIN_SHAFILE = \$(LKMAKEROOT)${version_file#${MAGENTA_ROOT}}")
 }
 
 # We want the toolchains for all target types.
-readonly TARGETS=("arm-eabi" "x86_64-elf" "aarch64-elf")
+readonly TARGETS=("x86_64-elf" "aarch64-elf")
 for target in "${TARGETS[@]}"; do
-  downloadToolchain "${target}"
+  downloadGCCToolchain "${target}"
 done
 
-# Update prebuilt/config.mk to point at the toolchains we just installed.
+# Clang supports all the targets.
+downloadClangToolchain
+
+# Clear old config lines from prebuilt/config.mk.
 readonly ENV_MK="${PREBUILTS_DIR}/config.mk"
 if [[ -f "${ENV_MK}" ]]; then
   sed -i.bak '/ARCH_.*_TOOLCHAIN_PREFIX/d' "${ENV_MK}"
+  sed -i.bak '/CLANG_TOOLCHAIN_PREFIX/d' "${ENV_MK}"
+  sed -i.bak '/PREBUILT_.*/d' "${ENV_MK}"
 fi
+
+# Update prebuilt/config.mk to point at the toolchains we just installed.
+TOOLCHAIN_MAKEVARS+=("PREBUILT_TOOLCHAINS :=${PREBUILT_NAMES[@]}")
 for line in "${TOOLCHAIN_MAKEVARS[@]}"; do
   echo $line >> "${ENV_MK}"
 done

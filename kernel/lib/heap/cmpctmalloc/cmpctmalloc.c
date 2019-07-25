@@ -8,15 +8,17 @@
 #include <debug.h>
 #include <trace.h>
 #include <assert.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <err.h>
 #include <kernel/thread.h>
 #include <kernel/mutex.h>
 #include <kernel/spinlock.h>
 #include <lib/cmpctmalloc.h>
 #include <lib/heap.h>
-#include <lib/page_alloc.h>
+#include <platform.h>
 
 // Malloc implementation tuned for space.
 //
@@ -24,7 +26,7 @@
 // kept in linked lists with 8 different sizes per binary order of magnitude
 // and the header size is two words with eager coalescing on free.
 
-#if defined(DEBUG) || LK_DEBUGLEVEL > 1
+#if defined(DEBUG) || LK_DEBUGLEVEL > 2
 #define CMPCT_DEBUG
 #endif
 
@@ -34,13 +36,11 @@
 #define FREE_FILL 0x77
 #define PADDING_FILL 0x55
 
-#if WITH_KERNEL_VM && !defined(HEAP_GROW_SIZE)
+#if !defined(HEAP_GROW_SIZE)
 #define HEAP_GROW_SIZE (1 * 1024 * 1024) /* Grow aggressively */
-#elif !defined(HEAP_GROW_SIZE)
-#define HEAP_GROW_SIZE (4 * 1024) /* Grow less aggressively */
 #endif
 
-STATIC_ASSERT(IS_PAGE_ALIGNED(HEAP_GROW_SIZE));
+static_assert(IS_PAGE_ALIGNED(HEAP_GROW_SIZE), "");
 
 // Individual allocations above 4Mbytes are just fetched directly from the
 // block allocator.
@@ -49,7 +49,7 @@ STATIC_ASSERT(IS_PAGE_ALIGNED(HEAP_GROW_SIZE));
 // When we grow the heap we have to have somewhere in the freelist to put the
 // resulting freelist entry, so the freelist has to have a certain number of
 // buckets.
-STATIC_ASSERT(HEAP_GROW_SIZE <= (1u << HEAP_ALLOC_VIRTUAL_BITS));
+static_assert(HEAP_GROW_SIZE <= (1u << HEAP_ALLOC_VIRTUAL_BITS), "");
 
 // Buckets for allocations.  The smallest 15 buckets are 8, 16, 24, etc. up to
 // 120 bytes.  After that we round up to the nearest size that can be written
@@ -87,24 +87,27 @@ static struct heap theheap;
 
 static ssize_t heap_grow(size_t len, free_t **bucket);
 
-static void lock(void)
+static void lock(void) TA_ACQ(theheap.lock)
 {
     mutex_acquire(&theheap.lock);
 }
 
-static void unlock(void)
+static void unlock(void) TA_REL(theheap.lock)
 {
     mutex_release(&theheap.lock);
 }
 
 static void dump_free(header_t *header)
 {
-    dprintf(INFO, "\t\tbase %p, end 0x%lx, len 0x%zx\n", header, (vaddr_t)header + header->size, header->size);
+    dprintf(INFO, "\t\tbase %p, end %#" PRIxPTR ", len %#zx (%zu)\n",
+            header, (vaddr_t)header + header->size, header->size, header->size);
 }
 
-void cmpct_dump(void)
+void cmpct_dump(bool panic_time) TA_NO_THREAD_SAFETY_ANALYSIS
 {
-    lock();
+    if (!panic_time)
+        lock();
+
     dprintf(INFO, "Heap dump (using cmpctmalloc):\n");
     dprintf(INFO, "\tsize %lu, remaining %lu\n",
             (unsigned long)theheap.size,
@@ -123,7 +126,9 @@ void cmpct_dump(void)
             dump_free(&free_area->header);
         }
     }
-    unlock();
+
+    if (!panic_time)
+        unlock();
 }
 
 // Operates in sizes that don't include the allocation header.
@@ -260,7 +265,7 @@ static bool is_end_of_os_allocation(char *address)
 static void free_to_os(header_t *header, size_t size)
 {
     DEBUG_ASSERT(IS_PAGE_ALIGNED(size));
-    page_free(header, size >> PAGE_SIZE_SHIFT);
+    heap_page_free(header, size >> PAGE_SIZE_SHIFT);
     theheap.size -= size;
 }
 
@@ -563,7 +568,7 @@ void cmpct_test(void)
     cmpct_test_get_back_newly_freed();
     cmpct_test_return_to_os();
     cmpct_test_trim();
-    cmpct_dump();
+    cmpct_dump(false);
     void *ptr[16];
 
     ptr[0] = cmpct_alloc(8);
@@ -581,9 +586,9 @@ void cmpct_test(void)
     cmpct_free(ptr[4]);
     cmpct_free(ptr[2]);
 
-    cmpct_dump();
+    cmpct_dump(false);
     cmpct_trim();
-    cmpct_dump();
+    cmpct_dump(false);
 
     int i;
     for (i=0; i < 16; i++)
@@ -606,7 +611,7 @@ void cmpct_test(void)
 //      printf("ptr[0x%x] = %p, align 0x%x\n", index, ptr[index], align);
 
         DEBUG_ASSERT(((addr_t)ptr[index] % align) == 0);
-//      cmpct_dump();
+//      cmpct_dump(false);
     }
 
     for (i=0; i < 16; i++) {
@@ -614,7 +619,23 @@ void cmpct_test(void)
             cmpct_free(ptr[i]);
     }
 
-    cmpct_dump();
+    cmpct_dump(false);
+}
+
+static void check_free_fill(void *ptr, size_t size)
+{
+    // The first 16 bytes of the region won't have free fill due to overlap
+    // with the allocator bookkeeping.
+    const size_t start = sizeof(free_t) - sizeof(header_t);
+    for (size_t i = start; i < size; ++i) {
+        uint8_t byte = ((uint8_t*)ptr)[i];
+        if (byte != FREE_FILL) {
+            platform_panic_start();
+            printf("Heap free fill check fail.  Allocated region:\n");
+            hexdump8(ptr, size);
+            panic("allocating %lu bytes, fill was %02x, offset %lu\n", size, byte, i);
+        }
+    }
 }
 
 static void *large_alloc(size_t size)
@@ -639,6 +660,7 @@ static void *large_alloc(size_t size)
     theheap.remaining -= free_area->header.size;
     unlock();
 #ifdef CMPCT_DEBUG
+    check_free_fill(result, requested_size);
     memset(result, ALLOC_FILL, requested_size);
     memset((char *)result + requested_size, PADDING_FILL, free_area->header.size - requested_size);
 #endif
@@ -678,7 +700,7 @@ void cmpct_trim(void)
                 create_allocation_header(free_area, new_free_size, 0, free_area);
                 // Also puts it in the correct bucket.
                 create_free_area(free_area, untag(free_area->header.left), new_free_size, NULL);
-                page_free(new_os_allocation_end, freed_up >> PAGE_SIZE_SHIFT);
+                heap_page_free(new_os_allocation_end, freed_up >> PAGE_SIZE_SHIFT);
                 theheap.size -= freed_up;
             } else if (is_start_of_os_allocation(untag(free_area->header.left))) {
                 char *old_os_allocation_start =
@@ -709,7 +731,7 @@ void cmpct_trim(void)
                     create_free_area(new_free, new_os_allocation_start, new_free_size, NULL);
                     FixLeftPointer(right, (header_t *)new_free);
                 }
-                page_free(old_os_allocation_start, freed_up >> PAGE_SIZE_SHIFT);
+                heap_page_free(old_os_allocation_start, freed_up >> PAGE_SIZE_SHIFT);
                 theheap.size -= freed_up;
             }
         }
@@ -764,6 +786,7 @@ void *cmpct_alloc(size_t size)
     void *result =
         create_allocation_header(head, 0, head->header.size, head->header.left);
 #ifdef CMPCT_DEBUG
+    check_free_fill(result, size);
     memset(result, ALLOC_FILL, size);
     memset(((char *)result) + size, PADDING_FILL, rounded_up - size - sizeof(header_t));
 #endif
@@ -871,11 +894,16 @@ static ssize_t heap_grow(size_t size, free_t **bucket)
     // sentinels) so we need to grow the gross heap size by this much more.
     size += 2 * sizeof(header_t);
     size = ROUNDUP(size, PAGE_SIZE);
-    void *ptr = page_alloc(size >> PAGE_SIZE_SHIFT);
+
+    void *ptr = heap_page_alloc(size >> PAGE_SIZE_SHIFT);
+    if (ptr == NULL)
+        return ERR_NO_MEMORY;
+
     theheap.size += size;
-    if (ptr == NULL) return -1;
+
     LTRACEF("growing heap by 0x%zx bytes, new ptr %p\n", size, ptr);
     add_to_heap(ptr, size, bucket);
+
     return size;
 }
 

@@ -5,12 +5,13 @@
 // license that can be found in the LICENSE file or at
 // https://opensource.org/licenses/MIT
 
+#include <app.h>
+#include <inttypes.h>
+#include <kernel/thread.h>
+#include <malloc.h>
+#include <platform.h>
 #include <stdio.h>
 #include <string.h>
-#include <malloc.h>
-#include <app.h>
-#include <platform.h>
-#include <kernel/thread.h>
 
 static uint8_t *src;
 static uint8_t *dst;
@@ -146,21 +147,21 @@ static void bench_memcpy(void)
     size_t srcalign, dstalign;
 
     printf("memcpy speed test\n");
-    thread_sleep(200); // let the debug string clear the serial port
+    thread_sleep_relative(LK_MSEC(200)); // let the debug string clear the serial port
 
     for (srcalign = 0; srcalign < 64; ) {
         for (dstalign = 0; dstalign < 64; ) {
 
-            null = bench_memcpy_routine(&null_memcpy, srcalign, dstalign);
-            c = bench_memcpy_routine(&c_memmove, srcalign, dstalign);
-            libc = bench_memcpy_routine(&memcpy, srcalign, dstalign);
-            mine = bench_memcpy_routine(&mymemcpy, srcalign, dstalign);
+            null = bench_memcpy_routine(&null_memcpy, srcalign, dstalign) / (1000 * 1000);
+            c = bench_memcpy_routine(&c_memmove, srcalign, dstalign) / (1000 * 1000);
+            libc = bench_memcpy_routine(&memcpy, srcalign, dstalign) / (1000 * 1000);
+            mine = bench_memcpy_routine(&mymemcpy, srcalign, dstalign) / (1000 * 1000);
 
             printf("srcalign %zu, dstalign %zu: ", srcalign, dstalign);
-            printf("   null memcpy %u msecs\n", null);
-            printf("c memcpy %u msecs, %llu bytes/sec; ", c, (uint64_t)BUFFER_SIZE * ITERATIONS * 1000ULL / c);
-            printf("libc memcpy %u msecs, %llu bytes/sec; ", libc, (uint64_t)BUFFER_SIZE * ITERATIONS * 1000ULL / libc);
-            printf("my memcpy %u msecs, %llu bytes/sec; ", mine, (uint64_t)BUFFER_SIZE * ITERATIONS * 1000ULL / mine);
+            printf("   null memcpy %" PRIu64 " msecs\n", null);
+            printf("c memcpy %" PRIu64 " msecs, %llu bytes/sec; ", c, (uint64_t)BUFFER_SIZE * ITERATIONS * 1000ULL / c);
+            printf("libc memcpy %" PRIu64 " msecs, %llu bytes/sec; ", libc, (uint64_t)BUFFER_SIZE * ITERATIONS * 1000ULL / libc);
+            printf("my memcpy %" PRIu64 " msecs, %llu bytes/sec; ", mine, (uint64_t)BUFFER_SIZE * ITERATIONS * 1000ULL / mine);
             printf("\n");
 
             if (dstalign < 8)
@@ -239,18 +240,18 @@ static void bench_memset(void)
     size_t dstalign;
 
     printf("memset speed test\n");
-    thread_sleep(200); // let the debug string clear the serial port
+    thread_sleep_relative(LK_MSEC(200)); // let the debug string clear the serial port
 
     for (dstalign = 0; dstalign < 64; dstalign++) {
 
-        c = bench_memset_routine(&c_memset, dstalign, BUFFER_SIZE);
-        libc = bench_memset_routine(&memset, dstalign, BUFFER_SIZE);
-        mine = bench_memset_routine(&mymemset, dstalign, BUFFER_SIZE);
+        c = bench_memset_routine(&c_memset, dstalign, BUFFER_SIZE) / (1000 * 1000);
+        libc = bench_memset_routine(&memset, dstalign, BUFFER_SIZE) / (1000 * 1000);
+        mine = bench_memset_routine(&mymemset, dstalign, BUFFER_SIZE) / (1000 * 1000);
 
         printf("dstalign %zu: ", dstalign);
-        printf("c memset %u msecs, %llu bytes/sec; ", c, (uint64_t)BUFFER_SIZE * ITERATIONS * 1000ULL / c);
-        printf("libc memset %u msecs, %llu bytes/sec; ", libc, (uint64_t)BUFFER_SIZE * ITERATIONS * 1000ULL / libc);
-        printf("my memset %u msecs, %llu bytes/sec; ", mine, (uint64_t)BUFFER_SIZE * ITERATIONS * 1000ULL / mine);
+        printf("c memset %" PRIu64 " msecs, %llu bytes/sec; ", c, (uint64_t)BUFFER_SIZE * ITERATIONS * 1000ULL / c);
+        printf("libc memset %" PRIu64 " msecs, %llu bytes/sec; ", libc, (uint64_t)BUFFER_SIZE * ITERATIONS * 1000ULL / libc);
+        printf("my memset %" PRIu64 " msecs, %llu bytes/sec; ", mine, (uint64_t)BUFFER_SIZE * ITERATIONS * 1000ULL / mine);
         printf("\n");
     }
 }
@@ -264,7 +265,7 @@ static void validate_memset(void)
     printf("testing memset for correctness\n");
 
     for (dstalign = 0; dstalign < 64; dstalign++) {
-        printf("align %zd\n", dstalign);
+        printf("align %zu\n", dstalign);
         for (size = 0; size < maxsize; size++) {
             for (c = -1; c < 257; c++) {
 
@@ -276,7 +277,8 @@ static void validate_memset(void)
 
                 int comp = memcmp(dst, dst2, maxsize * 2);
                 if (comp != 0) {
-                    printf("error! align %zu, c 0x%hhx, size %zu\n", dstalign, c, size);
+                    printf("error! align %zu, c 0x%hhx, size %zu\n",
+                           dstalign, (unsigned char)c, size);
                 }
             }
         }
@@ -286,7 +288,7 @@ static void validate_memset(void)
 #if defined(WITH_LIB_CONSOLE)
 #include <lib/console.h>
 
-static int string_tests(int argc, const cmd_args *argv)
+static int string_tests(int argc, const cmd_args *argv, uint32_t flags)
 {
     src = memalign(64, BUFFER_SIZE + 256);
     dst = memalign(64, BUFFER_SIZE + 256);
@@ -342,4 +344,3 @@ STATIC_COMMAND_END(stringtests);
 
 APP_START(stringtests)
 APP_END
-

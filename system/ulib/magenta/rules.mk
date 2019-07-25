@@ -1,16 +1,6 @@
-# Copyright 2016 The Fuchsia Authors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright 2016 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
 
 LOCAL_DIR := $(GET_LOCAL_DIR)
 
@@ -21,32 +11,47 @@ MODULE_TYPE := userlib
 # This library should not depend on libc.
 MODULE_COMPILEFLAGS := -ffreestanding
 
-# Both kernel and userspace code needs magenta headers.
-GLOBAL_INCLUDES += $(LOCAL_DIR)/include
+MODULE_HEADER_DEPS := kernel/lib/vdso
 
-ifeq ($(ARCH),arm)
-MODULE_SRCS += $(LOCAL_DIR)/syscalls-arm32.S
-else ifeq ($(ARCH),arm64)
-MODULE_SRCS += $(LOCAL_DIR)/syscalls-arm64.S
+MODULE_SRCS := \
+    $(LOCAL_DIR)/data.cpp \
+    $(LOCAL_DIR)/mx_cache_flush.cpp \
+    $(LOCAL_DIR)/mx_deadline_after.cpp \
+    $(LOCAL_DIR)/mx_status_get_string.cpp \
+    $(LOCAL_DIR)/mx_system_get_num_cpus.cpp \
+    $(LOCAL_DIR)/mx_system_get_physmem.cpp \
+    $(LOCAL_DIR)/mx_system_get_version.cpp \
+    $(LOCAL_DIR)/mx_ticks_get.cpp \
+    $(LOCAL_DIR)/mx_ticks_per_second.cpp \
+    $(LOCAL_DIR)/syscall-wrappers.cpp \
+
+ifeq ($(ARCH),arm64)
+MODULE_SRCS += \
+    $(LOCAL_DIR)/mx_futex_wake_handle_close_thread_exit-arm64.S \
+    $(LOCAL_DIR)/mx_vmar_unmap_handle_close_thread_exit-arm64.S \
+    $(LOCAL_DIR)/syscalls-arm64.S
 else ifeq ($(ARCH),x86)
-    ifeq ($(SUBARCH),x86-64)
-    MODULE_SRCS += $(LOCAL_DIR)/syscalls-x86-64.S
-    else
-    MODULE_SRCS += $(LOCAL_DIR)/syscalls-x86.S
-    endif
+MODULE_SRCS += \
+    $(LOCAL_DIR)/mx_futex_wake_handle_close_thread_exit-x86-64.S \
+    $(LOCAL_DIR)/mx_vmar_unmap_handle_close_thread_exit-x86-64.S \
+    $(LOCAL_DIR)/syscalls-x86-64.S
 endif
 
-MODULE_EXPORT := magenta
+# This gets an ABI stub installed in sysroots, but the DSO never gets
+# installed on disk because it's delivered magically by the kernel.
+MODULE_EXPORT := so
 MODULE_SO_NAME := magenta
-
-# TODO(mcgrathr): When the vDSO is fully in proper use, then there
-# will be no need for libmagenta.so in the runtime filesystem at all.
-#MODULE_SO_INSTALL_NAME := -
+MODULE_SO_INSTALL_NAME := -
 
 # All the code this DSO is pure read-only/reentrant code that
 # does not need any writable data (except its caller's stack).
 # Make it use a simplified, hardened memory layout.
-MODULE_LDFLAGS := -T $(BUILDDIR)/rodso.ld
-MODULE_EXTRA_OBJS := $(BUILDDIR)/rodso-stamp
+MODULE_LDFLAGS := -T scripts/rodso.ld
+
+# Explicit dependency to make sure the file gets generated first.
+# MODULE_SRCDEPS is overkill for this since only one file uses it.
+$(BUILDDIR)/$(LOCAL_DIR)/$(LOCAL_DIR)/mx_system_get_version.cpp.o: \
+    $(BUILDDIR)/config-buildid.h
+MODULE_COMPILEFLAGS += -I$(BUILDDIR)
 
 include make/module.mk

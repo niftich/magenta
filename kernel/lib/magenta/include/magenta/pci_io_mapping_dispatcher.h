@@ -5,29 +5,30 @@
 // https://opensource.org/licenses/MIT
 
 #pragma once
+#if WITH_DEV_PCIE
 
-#include <dev/pcie_constants.h>
+#include <dev/pci_common.h>
 #include <magenta/io_mapping_dispatcher.h>
 #include <sys/types.h>
 
 class PciDeviceDispatcher;
 class PciIoMappingDispatcher final : public IoMappingDispatcher {
 public:
-    static status_t Create(const utils::RefPtr<PciDeviceDispatcher::PciDeviceWrapper>& device,
+    static status_t Create(const mxtl::RefPtr<PciDeviceDispatcher::PciDeviceWrapper>& device,
                            const char* dbg_tag,
                            paddr_t paddr,
                            size_t size,
                            uint vmm_flags,
                            uint arch_mmu_flags,
-                           utils::RefPtr<Dispatcher>* out_dispatcher,
+                           mxtl::RefPtr<Dispatcher>* out_dispatcher,
                            mx_rights_t* out_rights);
 
     static status_t CreateBarMapping(
-            const utils::RefPtr<PciDeviceDispatcher::PciDeviceWrapper>& device,
+            const mxtl::RefPtr<PciDeviceDispatcher::PciDeviceWrapper>& device,
             uint bar_num,
             uint vmm_flags,
             uint cache_policy,
-            utils::RefPtr<Dispatcher>* out_dispatcher,
+            mxtl::RefPtr<Dispatcher>* out_dispatcher,
             mx_rights_t* out_rights);
 
     ~PciIoMappingDispatcher() final;
@@ -36,9 +37,11 @@ public:
     void Close() override;
 
 private:
-    PciIoMappingDispatcher(const utils::RefPtr<PciDeviceDispatcher::PciDeviceWrapper>& device)
+    PciIoMappingDispatcher(const mxtl::RefPtr<PciDeviceDispatcher::PciDeviceWrapper>& device)
         : device_(device) { }
 
-    utils::RefPtr<PciDeviceDispatcher::PciDeviceWrapper> device_;
+    mxtl::RefPtr<PciDeviceDispatcher::PciDeviceWrapper> device_;
     uint bar_num_ = PCIE_MAX_BAR_REGS;
 };
+
+#endif  // if WITH_DEV_PCIE

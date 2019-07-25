@@ -6,18 +6,12 @@
 
 #pragma once
 
-#include <compiler.h>
+#include <magenta/compiler.h>
 #include <sys/types.h>
 #include <magenta/types.h>
+#include <magenta/syscalls/exception.h>
 
 __BEGIN_CDECLS
-
-// low level to high level exception handler, called at interrupt or exception context
-enum {
-    EXC_FATAL_PAGE_FAULT,
-    EXC_UNDEFINED_INSTRUCTION,
-    EXC_GENERAL,
-};
 
 typedef struct arch_exception_context arch_exception_context_t;
 
@@ -26,6 +20,12 @@ status_t magenta_exception_handler(uint exception_type,
                                    mx_vaddr_t ip);
 
 // arch code must implement this to dump the architecturally specific state they passed to magenta_exception_handler
-void arch_dump_exception_context(arch_exception_context_t *);
+void arch_dump_exception_context(const arch_exception_context_t *);
+
+// request the arch code fill in the mx_exception_context report with arch specific information
+void arch_fill_in_exception_context(const arch_exception_context_t *, mx_exception_report_t *);
+
+// request the arch code fill in the mx_exception_context report with arch specific information
+void arch_fill_in_suspension_context(mx_exception_report_t *);
 
 __END_CDECLS

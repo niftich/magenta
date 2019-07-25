@@ -1,16 +1,6 @@
-// Copyright 2016 The Fuchsia Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
 
 #pragma once
 
@@ -62,13 +52,26 @@
 #include <stdio.h>
 #include <string.h>
 
-#include <system/compiler.h>
+#include <magenta/compiler.h>
 
 #define PRINT_BUFFER_SIZE (512)
 
 __BEGIN_CDECLS
 
 extern int utest_verbosity_level;
+
+typedef enum test_type {
+    TEST_SMALL       = 0x00000001,
+    TEST_MEDIUM      = 0x00000002,
+    TEST_LARGE       = 0x00000004,
+    TEST_PERFORMANCE = 0x00000008,
+    TEST_ALL         = 0xFFFFFFFF,
+} test_type_t;
+
+#define TEST_ENV_NAME "RUNTESTS_TEST_CLASS"
+#define TEST_DEFAULT (TEST_SMALL | TEST_MEDIUM)
+
+extern test_type_t utest_test_type;
 
 /*
  * Type for unit test result Output
@@ -79,7 +82,8 @@ typedef void (*test_output_func)(const char* line, int len, void* arg);
  * Printf dedicated to the unittest library
  * the default output is the printf
  */
-void unittest_printf_critical(const char* format, ...);
+void unittest_printf_critical(const char* format, ...)
+    __attribute__((format (printf, 1, 2)));
 
 /*
  * Printf dedicated to the unittest library which output
@@ -123,11 +127,9 @@ int unittest_set_verbosity_level(int new_level);
         unittest_printf_critical("\nCASE %-50s [STARTED] \n", #case_name);
 
 #define DEFINE_REGISTER_TEST_CASE(case_name)                            \
-    static void _register_##case_name(void) {                           \
+    __attribute__((constructor)) static void _register_##case_name(void) { \
         unittest_register_test_case(&_##case_name##_element);           \
-    }                                                                   \
-    void (*_register_##case_name##_ptr)(void) __SECTION(".ctors") =     \
-        _register_##case_name;
+    }
 
 #define END_TEST_CASE(case_name)                                        \
     if (all_success) {                                                  \
@@ -145,15 +147,39 @@ int unittest_set_verbosity_level(int new_level);
     };                                                                  \
     DEFINE_REGISTER_TEST_CASE(case_name);
 
-#define RUN_TEST(test)                                          \
-    unittest_printf_critical("    %-51s [RUNNING]", #test);     \
-    struct test_info test_info_##test;                          \
-    current_test_info = &test_info_##test;                      \
-    if (!test()) {                                              \
-        all_success = false;                                    \
-    } else {                                                    \
-        unittest_printf_critical(" [PASSED] \n");               \
-    }
+#define RUN_NAMED_TEST_TYPE(name, test, test_type)                     \
+    unittest_run_named_test(name, test, test_type, &current_test_info, \
+                            &all_success);
+
+#define TEST_CASE_ELEMENT(case_name) &_##case_name##_element
+
+/*
+ * Test classes:
+ *
+ * Small: Isolated tests for functions and classes. These must be totally
+ * synchronous and single-threaded. These tests should be parallelizable;
+ * there shouldn't be any shared resources between them.
+ *
+ * Medium: Single-process integration tests. Ideally these are also synchronous
+ * and single-threaded but they might run through a large chunk of code in each
+ * test case, or they might use disk, making them a bit slower.
+ *
+ * Large: Multi-process (or particularly incomprehensible single-process)
+ * integration tests. These tests are often too flaky to run in a CQ, and we
+ * should try to limit how many we have.
+ *
+ * Performance: Tests which are expected to pass, but which are measured
+ * using other metrics (thresholds, statistical techniques) to identify
+ * regressions.
+*/
+#define RUN_TEST_SMALL(test) RUN_NAMED_TEST_TYPE(#test, test, TEST_SMALL)
+#define RUN_TEST_MEDIUM(test) RUN_NAMED_TEST_TYPE(#test, test, TEST_MEDIUM)
+#define RUN_TEST_LARGE(test) RUN_NAMED_TEST_TYPE(#test, test, TEST_LARGE)
+#define RUN_TEST_PERFORMANCE(test) RUN_NAMED_TEST_TYPE(#test, test, TEST_PERFORMANCE)
+
+// "RUN_TEST" implies the test is small
+#define RUN_TEST(test) RUN_NAMED_TEST_TYPE(#test, test, TEST_SMALL)
+#define RUN_NAMED_TEST(name, test) RUN_NAMED_TEST_TYPE(name, test, TEST_SMALL)
 
 /*
  * BEGIN_TEST and END_TEST go in a function that is called by RUN_TEST
@@ -162,8 +188,34 @@ int unittest_set_verbosity_level(int new_level);
 #define BEGIN_TEST current_test_info->all_ok = true
 #define END_TEST return current_test_info->all_ok
 
+/*
+ * BEGIN_HELPER and END_HELPER let helper threads and files use
+ * the ASSERT_*,EXPECT_* macros, which require an in-scope, non-NULL
+ * |test_info* current_test_info|.
+ *
+ * This header file defines a static |current_test_info|, which is unlocked and
+ * should only be touched by the main thread; also, it is not visible to
+ * functions in other compilation units.
+ *
+ * Example usage:
+ *
+ *   bool my_helper_in_another_file_or_thread() {
+ *       BEGIN_HELPER;
+ *       // Use ASSERT_* or EXPECT_*
+ *       END_HELPER;  // Returns false if any EXPECT calls failed.
+ *   }
+ */
+// Intentionally shadows the global current_test_info to avoid accidentally
+// leaking dangling stack pointers.
+#define BEGIN_HELPER \
+    struct test_info _test_info; \
+    struct test_info* current_test_info = &_test_info; \
+    current_test_info->all_ok = true
+#define END_HELPER \
+    return current_test_info->all_ok
+
 #ifdef __cplusplus
-#define AUTO_TYPE_VAR(type) auto&
+#define AUTO_TYPE_VAR(type) auto
 #else
 #define AUTO_TYPE_VAR(type) __typeof__(type)
 #endif
@@ -179,8 +231,9 @@ int unittest_set_verbosity_level(int new_level);
             UNITTEST_TRACEF(                                          \
                 "%s:\n"                                               \
                 "        Comparison failed: %s %s %s is false\n"      \
-                "        Specifically, %ld %s %ld is false\n",        \
-                msg, lhs_str, #op, rhs_str, _lhs_val, #op, _rhs_val); \
+                "        Specifically, %lld %s %lld is false\n",      \
+                msg, lhs_str, #op, rhs_str, (long long int)_lhs_val,  \
+                #op, (long long int)_rhs_val);                        \
             current_test_info->all_ok = false;                        \
             ret;                                                      \
         }                                                             \
@@ -200,6 +253,20 @@ int unittest_set_verbosity_level(int new_level);
         ret;                                               \
     }
 
+#define UT_NULL(actual, msg, ret)                               \
+    if (actual != NULL) {                                       \
+        UNITTEST_TRACEF("%s: %s is non-null!\n", msg, #actual); \
+        current_test_info->all_ok = false;                      \
+        ret;                                                    \
+    }
+
+#define UT_NONNULL(actual, msg, ret)                        \
+    if (actual == NULL) {                                   \
+        UNITTEST_TRACEF("%s: %s is null!\n", msg, #actual); \
+        current_test_info->all_ok = false;                  \
+        ret;                                                \
+    }
+
 #define UT_BYTES_EQ(expected, actual, length, msg, ret)                   \
     if (!unittest_expect_bytes_eq((expected), (actual), (length), msg)) { \
         current_test_info->all_ok = false;                                \
@@ -209,12 +276,29 @@ int unittest_set_verbosity_level(int new_level);
 #define UT_BYTES_NE(bytes1, bytes2, length, msg, ret) \
     if (!memcmp(bytes1, bytes2, length)) {            \
         UNITTEST_TRACEF(                              \
-            "%s and %s are the same; "                \
+            "%s: %s and %s are the same; "            \
             "expected different\n",                   \
-            #bytes1, #bytes2);                        \
+            msg, #bytes1, #bytes2);                   \
         hexdump8(bytes1, length);                     \
         current_test_info->all_ok = false;            \
         ret;                                          \
+    }
+
+#define UT_STR_EQ(expected, actual, length, msg, ret)                   \
+    if (!unittest_expect_str_eq((expected), (actual), (length), msg)) { \
+        current_test_info->all_ok = false;                              \
+        ret;                                                            \
+    }
+
+#define UT_STR_NE(str1, str2, length, msg, ret) \
+    if (!strncmp(str1, str2, length)) {         \
+        UNITTEST_TRACEF(                        \
+            "%s: %s and %s are the same; "      \
+            "expected different:\n"             \
+            "        '%s'\n",                   \
+            msg, #str1, #str2, str1);           \
+        current_test_info->all_ok = false;      \
+        ret;                                    \
     }
 
 /* For comparing uint64_t, like hw_id_t. */
@@ -243,8 +327,12 @@ int unittest_set_verbosity_level(int new_level);
 
 #define EXPECT_TRUE(actual, msg) UT_TRUE(actual, msg, DONOT_RET)
 #define EXPECT_FALSE(actual, msg) UT_FALSE(actual, msg, DONOT_RET)
+#define EXPECT_NULL(actual, msg) UT_NULL(actual, msg, DONOT_RET)
+#define EXPECT_NONNULL(actual, msg) UT_NONNULL(actual, msg, DONOT_RET)
 #define EXPECT_BYTES_EQ(expected, actual, length, msg) UT_BYTES_EQ(expected, actual, length, msg, DONOT_RET)
 #define EXPECT_BYTES_NE(bytes1, bytes2, length, msg) UT_BYTES_NE(bytes1, bytes2, length, msg, DONOT_RET)
+#define EXPECT_STR_EQ(expected, actual, length, msg) UT_STR_EQ(expected, actual, length, msg, DONOT_RET)
+#define EXPECT_STR_NE(str1, str2, length, msg) UT_STR_NE(str1, str2, length, msg, DONOT_RET)
 
 /* For comparing uint64_t, like hw_id_t. */
 #define EXPECT_EQ_LL(expected, actual, msg) UT_EQ_LL(expected, actual, msg, DONOT_RET)
@@ -270,8 +358,12 @@ int unittest_set_verbosity_level(int new_level);
 
 #define ASSERT_TRUE(actual, msg) UT_TRUE(actual, msg, RET_FALSE)
 #define ASSERT_FALSE(actual, msg) UT_FALSE(actual, msg, RET_FALSE)
+#define ASSERT_NULL(actual, msg) UT_NULL(actual, msg, RET_FALSE)
+#define ASSERT_NONNULL(actual, msg) UT_NONNULL(actual, msg, RET_FALSE)
 #define ASSERT_BYTES_EQ(expected, actual, length, msg) UT_BYTES_EQ(expected, actual, length, msg, RET_FALSE)
 #define ASSERT_BYTES_NE(bytes1, bytes2, length, msg) UT_BYTES_NE(bytes1, bytes2, length, msg, RET_FALSE)
+#define ASSERT_STR_EQ(expected, actual, length, msg) UT_STR_EQ(expecetd, actual, length, msg, RET_FALSE)
+#define ASSERT_STR_NE(str1, str2, length, msg) UT_STR_NE(str1, str2, length, msg, RET_FALSE)
 
 /* For comparing uint64_t, like hw_id_t. */
 #define ASSERT_EQ_LL(expected, actual, msg) UT_EQ_LL(expected, actual, msg, RET_FALSE)
@@ -309,10 +401,23 @@ void unittest_register_test_case(struct test_case_element* elem);
 bool unittest_run_all_tests(int argc, char** argv);
 
 /*
+ * Runs a single test case.
+ */
+bool unittest_run_one_test(struct test_case_element* elem, test_type_t type);
+
+/*
  * Returns false if expected does not equal actual and prints msg and a hexdump8
  * of the input buffers.
  */
 bool unittest_expect_bytes_eq(const uint8_t* expected, const uint8_t* actual, size_t len,
                               const char* msg);
+
+bool unittest_expect_str_eq(const char* expected, const char* actual, size_t len, const char* msg);
+
+/* Used to implement RUN_TEST() and other variants. */
+void unittest_run_named_test(const char* name, bool (*test)(void),
+                             test_type_t test_type,
+                             struct test_info** current_test_info,
+                             bool* all_success);
 
 __END_CDECLS

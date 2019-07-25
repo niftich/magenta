@@ -12,32 +12,39 @@ MODULE := $(LOCAL_DIR)
 CPU := generic
 
 MODULE_DEPS += \
-    lib/cbuf \
+    kernel/lib/cbuf \
 
 MODULE_SRCS += \
-    $(LOCAL_DIR)/acpi.c \
-    $(LOCAL_DIR)/acpi_debug.c \
-    $(LOCAL_DIR)/acpi_ec.c \
-    $(LOCAL_DIR)/console.c \
-    $(LOCAL_DIR)/debug.c \
-    $(LOCAL_DIR)/hpet.c \
-    $(LOCAL_DIR)/interrupts.c \
-    $(LOCAL_DIR)/keyboard.c \
-    $(LOCAL_DIR)/memory.c \
-    $(LOCAL_DIR)/pci.c \
-    $(LOCAL_DIR)/pic.c \
-    $(LOCAL_DIR)/platform.c \
-    $(LOCAL_DIR)/power.c \
-    $(LOCAL_DIR)/timer.c \
+    $(LOCAL_DIR)/acpi.cpp \
+    $(LOCAL_DIR)/console.cpp \
+    $(LOCAL_DIR)/debug.cpp \
+    $(LOCAL_DIR)/hpet.cpp \
+    $(LOCAL_DIR)/interrupts.cpp \
+    $(LOCAL_DIR)/keyboard.cpp \
+    $(LOCAL_DIR)/memory.cpp \
+    $(LOCAL_DIR)/pcie_quirks.cpp \
+    $(LOCAL_DIR)/pic.cpp \
+    $(LOCAL_DIR)/platform.cpp \
+    $(LOCAL_DIR)/platform_pcie.cpp \
+    $(LOCAL_DIR)/power.cpp \
+    $(LOCAL_DIR)/timer.cpp \
+    $(LOCAL_DIR)/watchdog.cpp \
 
 MODULE_DEPS += \
-    lib/acpica \
-    lib/gfxconsole \
-    lib/pow2_range_allocator \
-    dev/interrupt \
-    dev/pcie \
+    third_party/lib/acpica \
+    kernel/lib/gfxconsole \
+    kernel/lib/fixed_point \
+    kernel/lib/memory_limit \
+    kernel/lib/pow2_range_allocator \
+    kernel/lib/version \
+    kernel/dev/interrupt \
+    kernel/dev/pcie \
 
-LK_HEAP_IMPLEMENTATION ?= cmpctmalloc
+KERNEL_DEFINES += \
+    PLATFORM_SUPPORTS_PANIC_SHELL=1
+
+WITH_SMP ?= 1
+SMP_MAX_CPUS ?= 8
 
 include make/module.mk
 

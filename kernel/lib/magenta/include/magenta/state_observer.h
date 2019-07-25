@@ -8,55 +8,74 @@
 
 #include <magenta/types.h>
 
-#include <utils/intrusive_double_list.h>
+#include <mxtl/canary.h>
+#include <mxtl/intrusive_double_list.h>
 
 class Handle;
 
 // Observer base class for state maintained by StateTracker.
 class StateObserver {
 public:
-    StateObserver() {}
+    // Optional initial counts. Each object might have a different idea of them
+    // and currently we assume at most two. The state observers will iterate on
+    // the entries and might fire if |signal| matches one of their trigger signals
+    // so each entry should be assocaited with a unique signal or with 0 if not
+    // applicable.
+    struct CountInfo {
+        struct {
+            uint64_t count;
+            mx_signals_t signal;
+        } entry[2];
+    };
 
-    // Called when this object is added to a StateTracker, to give it the initial state. Returns
-    // true if a thread was awoken.
+    explicit StateObserver() : remove_(false) { }
+
+    // Called when this object is added to a StateTracker, to give it the initial state.
+    // Note that |cinfo| might be null. Returns true if a thread was awoken.
     // WARNING: This is called under StateTracker's mutex.
-    virtual bool OnInitialize(mx_signals_state_t initial_state) = 0;
+    virtual bool OnInitialize(mx_signals_t initial_state, const CountInfo* cinfo) = 0;
 
     // Called whenever the state changes, to give it the new state. Returns true if a thread was
     // awoken.
-    // WARNING: This is called under StateTracker's mutex.
-    virtual bool OnStateChange(mx_signals_state_t new_state) = 0;
+    // WARNING: This is called under StateTracker's mutex
+    virtual bool OnStateChange(mx_signals_t new_state) = 0;
 
     // Called when |handle| (which refers to a handle to the object that owns the StateTracker) is
     // being destroyed/"closed"/transferred. (The object itself, and thus the StateTracker too, may
-    // also be destroyed shortly afterwards.) Returns true if a thread was awoken. If the callee
-    // wants to be removed from the calling StateTracker, it should set |*should_remove| to true
-    // (by default, |*should_remove| is false), in which case RemoveObserver() should not be called
-    // for the callee observer.
-    // In addition to |should_remove|, the callee can set |*call_did_cancel| to true if it
-    // wants to be notified after it has been removed from the state tracker list. See
-    // OnDidCancel() below.
+    // also be destroyed shortly afterwards.) Returns true if a thread was awoken.
     // WARNING: This is called under StateTracker's mutex.
-    virtual bool OnCancel(Handle* handle, bool* should_remove, bool* call_did_cancel) = 0;
+    virtual bool OnCancel(Handle* handle) = 0;
 
-    // Called when the StateTracker has removed all internal references to this observer. This
-    // happens after OnCancel() is called if |call_did_cancel| is set to true. This not called
-    // under the StateTracker's mutex.
-    virtual void OnDidCancel() = 0;
+    // Called when the client wants to cancel an outstanding object_wait_aysnc(..key..). In this
+    // case the object might not be destroyed. Returns true if a thread was awoken.
+    // WARNING: This is called under StateTracker's mutex.
+    virtual bool OnCancelByKey(Handle* handle, const void* port, uint64_t key) { return false; }
+
+    // Called after this observer has been removed from the state tracker list. In this callback
+    // is safe to delete the observer.
+    virtual void OnRemoved() {}
+
+    // Return true to have the observer removed from the state_observer after calling either
+    // OnInitialize() OnStateChange() or OnCancel().
+    bool remove() const { return remove_; }
 
 protected:
     ~StateObserver() {}
+    // Warning: |remove_| should only be mutated during the OnXXX callbacks.
+    bool remove_ = false;
 
 private:
+    mxtl::Canary<mxtl::magic("SOBS")> canary_;
+
     friend struct StateObserverListTraits;
-    utils::DoublyLinkedListNodeState<StateObserver*> state_observer_list_node_state_;
+    mxtl::DoublyLinkedListNodeState<StateObserver*> state_observer_list_node_state_;
 };
 
 // For use by StateTracker to maintain a list of StateObservers. (We don't use the default traits so
 // that implementations of StateObserver can themselves use the default traits if they need to be on
 // a different list.)
 struct StateObserverListTraits {
-    inline static utils::DoublyLinkedListNodeState<StateObserver*>& node_state(
+    inline static mxtl::DoublyLinkedListNodeState<StateObserver*>& node_state(
             StateObserver& obj) {
         return obj.state_observer_list_node_state_;
     }

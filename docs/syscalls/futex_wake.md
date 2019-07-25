@@ -9,7 +9,7 @@ futex_wake - Wake some number of threads waiting on a futex.
 ```
 #include <magenta/syscalls.h>
 
-mx_status_t mx_futex_wake(int* value_ptr, uint32_t wake_count);
+mx_status_t mx_futex_wake(const mx_futex_t* value_ptr, uint32_t wake_count);
 ```
 
 ## DESCRIPTION
@@ -17,16 +17,17 @@ mx_status_t mx_futex_wake(int* value_ptr, uint32_t wake_count);
 Waking a futex causes `wake_count` threads waiting on the `value_ptr`
 futex to be woken up.
 
+Waking up zero threads is not an error condition.
+
 ## RETURN VALUE
 
-**futex_wake**() returns **NO_ERROR**.
+**futex_wake**() returns **NO_ERROR** on success.
 
 ## ERRORS
 
-**futex_wake**() always succeeds. Waking up zero threads is not an
-error condition.
+**ERR_INVALID_ARGS**  *value_ptr* is not aligned.
 
 ## SEE ALSO
 
-[futex_wait](futex_wait.md)
-[futex_requeue](futex_requeue.md)
+[futex_requeue](futex_requeue.md),
+[futex_wait](futex_wait.md).

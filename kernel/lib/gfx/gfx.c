@@ -381,7 +381,7 @@ void gfx_line(gfx_surface *surface, uint x1, uint y1, uint x2, uint y2, uint col
     }
 }
 
-uint32_t alpha32_add_ignore_destalpha(uint32_t dest, uint32_t src)
+static uint32_t alpha32_add_ignore_destalpha(uint32_t dest, uint32_t src)
 {
     uint32_t cdest[3];
     uint32_t csrc[3];
@@ -521,7 +521,7 @@ void gfx_surface_blend(struct gfx_surface *target, struct gfx_surface *source, u
             src += source_stride_diff;
         }
     } else {
-        panic("gfx_surface_blend: unimplemented colorspace combination (source %d target %d)\n", source->format, target->format);
+        panic("gfx_surface_blend: unimplemented colorspace combination (source %u target %u)\n", source->format, target->format);
     }
 }
 
@@ -693,7 +693,7 @@ int gfx_init_surface_from_display(gfx_surface *surface, struct display_info *inf
             format = GFX_FORMAT_MONO;
             break;
         default:
-            DEBUG_ASSERT_MSG(0, "invalid graphics format %u", info->format);
+            DEBUG_ASSERT_MSG(0, "invalid graphics format %d", info->format);
             return ERR_INVALID_ARGS;
     }
 
@@ -749,7 +749,7 @@ void gfx_draw_pattern(void)
 /**
  * @brief  Fill default display with white
  */
-void gfx_draw_pattern_white(void)
+static void gfx_draw_pattern_white(void)
 {
     struct display_info info;
     if (display_get_info(&info) < 0)
@@ -774,7 +774,7 @@ void gfx_draw_pattern_white(void)
 #if LK_DEBUGLEVEL > 1
 #include <lib/console.h>
 
-static int cmd_gfx(int argc, const cmd_args *argv);
+static int cmd_gfx(int argc, const cmd_args *argv, uint32_t flags);
 
 STATIC_COMMAND_START
 STATIC_COMMAND("gfx", "gfx commands", &cmd_gfx)
@@ -808,7 +808,7 @@ static int gfx_draw_rgb_bars(gfx_surface *surface)
     return 0;
 }
 
-static int cmd_gfx(int argc, const cmd_args *argv)
+static int cmd_gfx(int argc, const cmd_args *argv, uint32_t flags)
 {
     if (argc < 2) {
         printf("not enough arguments:\n");
@@ -832,7 +832,7 @@ static int cmd_gfx(int argc, const cmd_args *argv)
         printf("display:\n");
         printf("\tframebuffer %p\n", info.framebuffer);
         printf("\twidth %u height %u stride %u\n", info.width, info.height, info.stride);
-        printf("\tformat %u\n", info.format);
+        printf("\tformat %d\n", info.format);
         printf("\tflags 0x%x\n", info.flags);
     } else if (!strcmp(argv[1].str, "rgb_bars")) {
         gfx_draw_rgb_bars(surface);

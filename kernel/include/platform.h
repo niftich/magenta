@@ -9,7 +9,7 @@
 #define __PLATFORM_H
 
 #include <sys/types.h>
-#include <compiler.h>
+#include <magenta/compiler.h>
 
 __BEGIN_CDECLS;
 
@@ -33,8 +33,11 @@ typedef enum {
     HALT_REASON_SW_UPDATE,      // SW triggered reboot in order to begin firmware update
 } platform_halt_reason;
 
+/* current time in nanoseconds */
 lk_time_t current_time(void);
-lk_bigtime_t current_time_hires(void);
+
+/* high-precision timer ticks per second */
+uint64_t ticks_per_second(void);
 
 /* super early platform initialization, before almost everything */
 void platform_early_init(void);
@@ -48,6 +51,14 @@ void platform_init_mmu_mappings(void);
 /* if the platform has knowledge of what caused the latest reboot, it can report
  * it to applications with this function.  */
 platform_halt_reason platform_get_reboot_reason(void);
+
+
+/* platform_panic_start informs the system that a panic message is about
+ * to be printed and that platformn_halt will be called shortly.  The
+ * platform should stop other CPUs if possible and do whatever is necessary
+ * to safely ensure that the panic message will be visible to the user.
+ */
+void platform_panic_start(void);
 
 /* platform_halt is a method which is called from various places in the LK
  * system, and may be implemented by platforms and called by applications.  This
@@ -66,6 +77,9 @@ platform_halt_reason platform_get_reboot_reason(void);
 void platform_halt(platform_halt_action suggested_action,
                    platform_halt_reason reason) __NO_RETURN;
 
+/* optionally stop the current cpu in a way the platform finds appropriate */
+void platform_halt_cpu(void);
+
 /* called during chain loading to make sure drivers and platform is put into a stopped state */
 void platform_quiesce(void);
 
@@ -73,6 +87,17 @@ void platform_quiesce(void);
  * Sets size to ramdisk size or zero if none.
  */
 void *platform_get_ramdisk(size_t *size);
+
+/* Stash the crashlog somewhere platform-specific that allows
+ * for recovery after reboot.  This will only be called out
+ * of the panic() handling path on the way to reboot, and is
+ * not necessarily safe to be called from any other state.
+ *
+ * Calling with a NULL log returns the maximum supported size.
+ * It is safe to query the size at any time after boot.  If the
+ * return is 0, no crashlog recovery is supported.
+ */
+size_t platform_stow_crashlog(void* log, size_t len);
 
 __END_CDECLS;
 

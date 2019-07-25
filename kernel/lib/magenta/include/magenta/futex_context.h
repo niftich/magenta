@@ -7,6 +7,7 @@
 #pragma once
 
 #include <kernel/mutex.h>
+#include <lib/user_copy/user_ptr.h>
 #include <magenta/futex_node.h>
 #include <magenta/types.h>
 
@@ -29,13 +30,13 @@ public:
 
     // FutexWait first verifies that the integer pointed to by |value_ptr|
     // still equals |current_value|. If the test fails, FutexWait returns FAILED_PRECONDITION.
-    // Otherwise it will block the current thread for up to |timeout| nanoseconds,
+    // Otherwise it will block the current thread until the |deadline| passes,
     // or until the thread is woken by a FutexWake or FutexRequeue operation
     // on the same |value_ptr| futex.
-    status_t FutexWait(int* value_ptr, int current_value, mx_time_t timeout);
+    status_t FutexWait(user_ptr<int> value_ptr, int current_value, mx_time_t deadline);
 
     // FutexWake will wake up to |count| number of threads blocked on the |value_ptr| futex.
-    status_t FutexWake(int* value_ptr, uint32_t count);
+    status_t FutexWake(user_ptr<const int> value_ptr, uint32_t count);
 
     // FutexWait first verifies that the integer pointed to by |wake_ptr|
     // still equals |current_value|. If the test fails, FutexWait returns FAILED_PRECONDITION.
@@ -43,19 +44,21 @@ public:
     // If any other threads remain blocked on on the |wake_ptr| futex, up to |requeue_count|
     // of them will then be requeued to the tail of the list of threads
     // blocked on the |requeue_ptr| futex.
-    status_t FutexRequeue(int* wake_ptr, uint32_t wake_count, int current_value, int* requeue_ptr,
-                          uint32_t requeue_count);
+    status_t FutexRequeue(user_ptr<int> wake_ptr, uint32_t wake_count, int current_value,
+                          user_ptr<int> requeue_ptr, uint32_t requeue_count);
 
 private:
     FutexContext(const FutexContext&) = delete;
     FutexContext& operator=(const FutexContext&) = delete;
 
-    void QueueNodesLocked(FutexNode* head);
+    void QueueNodesLocked(FutexNode* head) TA_REQ(lock_);
+
+    bool UnqueueNodeLocked(FutexNode* node) TA_REQ(lock_);
 
     // protects futex_table_
-    mutex_t lock_;
+    Mutex lock_;
 
     // Hash table for futexes in this context.
     // Key is futex address, value is the FutexNode for the head of futex's blocked thread list.
-    FutexNode::HashTable futex_table_;
+    FutexNode::HashTable futex_table_ TA_GUARDED(lock_);
 };

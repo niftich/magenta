@@ -9,7 +9,7 @@ handle_duplicate - duplicate a handle
 ```
 #include <magenta/syscalls.h>
 
-mx_handle_t mx_handle_duplicate(mx_handle_t handle, mx_rights_t rights);
+mx_status_t mx_handle_duplicate(mx_handle_t handle, mx_rights_t rights, mx_handle_t* out);
 ```
 
 ## DESCRIPTION
@@ -23,16 +23,21 @@ to specify no rights by using 0.
 
 ## RETURN VALUE
 
-**handle_duplicate**() returns the duplicate handle on success (a
-positive value), or an error code (negative).
+**handle_duplicate**() returns NO_ERROR and the duplicate handle via *out* on success.
 
 ## ERRORS
 
 **ERR_BAD_HANDLE**  *handle* isn't a valid handle.
 
-**ERR_INVALID_ARGS**  The *rights* requested are not a subset of *handle* rights.
+**ERR_INVALID_ARGS**  The *rights* requested are not a subset of *handle* rights or
+*out* is an invalid pointer.
 
 **ERR_ACCESS_DENIED**  *handle* does not have **MX_RIGHT_DUPLICATE** and may not be duplicated.
 
 **ERR_NO_MEMORY**  (Temporary) out of memory situation.
 
+## SEE ALSO
+
+[handle_close](handle_close.md),
+[handle_replace](handle_replace.md),
+[rights](../rights.md).

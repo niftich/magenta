@@ -5,11 +5,12 @@
 // license that can be found in the LICENSE file or at
 // https://opensource.org/licenses/MIT
 
+#include "tests.h"
+
 #include <assert.h>
 #include <err.h>
 #include <stdio.h>
 #include <trace.h>
-#include <app/tests.h>
 #include <arch/ops.h>
 #include <kernel/event.h>
 #include <kernel/mp.h>
@@ -19,7 +20,7 @@
 
 #define TEST_RUNS 1000
 
-void inorder_count_task(void *raw_context) {
+static void inorder_count_task(void *raw_context) {
     ASSERT(arch_ints_disabled());
     int *inorder_counter = raw_context;
     uint cpu_num = arch_curr_cpu_num();
@@ -29,13 +30,13 @@ void inorder_count_task(void *raw_context) {
     LTRACEF("  CPU %u checked in\n", cpu_num);
 }
 
-void counter_task(void *raw_context) {
+static void counter_task(void *raw_context) {
     ASSERT(arch_ints_disabled());
     int *counter = raw_context;
     atomic_add(counter, 1);
 }
 
-int deadlock_test_thread(void *arg) {
+static int deadlock_test_thread(void *arg) {
     event_t *gate = arg;
     event_wait(gate);
 
@@ -46,7 +47,7 @@ int deadlock_test_thread(void *arg) {
     return 0;
 }
 
-void deadlock_test(void) {
+static void deadlock_test(void) {
     /* Test for a deadlock caused by multiple CPUs broadcasting concurrently */
 
     event_t gate = EVENT_INITIAL_VALUE(gate, false, 0);

@@ -1,16 +1,6 @@
-// Copyright 2016 The Fuchsia Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
 
 #include <unittest/unittest.h>
 
@@ -20,7 +10,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "hexdump.h"
+#include <pretty/hexdump.h>
 
 /**
  * \brief Default function to dump unit test results
@@ -30,7 +20,7 @@
  * \param[in] arg can be any kind of arguments needed to dump the values
  */
 static void default_printf(const char* line, int len, void* arg) {
-    printf("%s", line);
+    fputs(line, stdout);
     fflush(stdout);
 }
 
@@ -40,7 +30,13 @@ static test_output_func out_func = default_printf;
 static void* out_func_arg = NULL;
 
 // Controls the behavior of unittest_printf.
-int utest_verbosity_level = 1;
+// To override, specify v=N on the command line.
+int utest_verbosity_level = 0;
+
+// Controls the types of tests which are executed.
+// Multiple test types can be "OR-ed" together to
+// run a subset of all tests.
+test_type_t utest_test_type = TEST_DEFAULT;
 
 /**
  * \brief Function called to dump results
@@ -74,6 +70,15 @@ bool unittest_expect_bytes_eq(const uint8_t* expected, const uint8_t* actual, si
     return true;
 }
 
+bool unittest_expect_str_eq(const char* expected, const char* actual, size_t len,
+                            const char* msg) {
+    if (strncmp(expected, actual, len)) {
+        printf("%s. expected\n'%s'\nactual\n'%s'\n", msg, expected, actual);
+        return false;
+    }
+    return true;
+}
+
 void unittest_set_output_function(test_output_func fun, void* arg) {
     out_func = fun;
     out_func_arg = arg;
@@ -83,4 +88,23 @@ int unittest_set_verbosity_level(int new_level) {
     int out = utest_verbosity_level;
     utest_verbosity_level = new_level;
     return out;
+}
+
+void unittest_run_named_test(const char* name, bool (*test)(void),
+                             test_type_t test_type,
+                             struct test_info** current_test_info,
+                             bool* all_success) {
+    if (utest_test_type & test_type) {
+        unittest_printf_critical("    %-51s [RUNNING]", name);
+        struct test_info test_info;
+        *current_test_info = &test_info;
+        if (!test()) {
+            *all_success = false;
+        } else {
+            unittest_printf_critical(" [PASSED] \n");
+        }
+        current_test_info = NULL;
+    } else {
+        unittest_printf_critical("    %-51s [IGNORED]\n", name);
+    }
 }

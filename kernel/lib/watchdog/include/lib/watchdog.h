@@ -20,7 +20,7 @@ typedef struct watchdog {
     uint32_t                magic;
     const char             *name;
     bool                    enabled;
-    lk_time_t               timeout;
+    lk_time_t            timeout;
     timer_t                 expire_timer;
 } watchdog_t;
 

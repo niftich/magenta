@@ -12,10 +12,7 @@
 #include <sys/types.h> // for status_t
 #endif
 
-#include <global/fuchsia-types.h>
-
-// Kernel-private errors
-#define ERR_KERNEL_PRIVATE_BASE (-500)
+#include <magenta/errors.h>
 
 // TODO: This is used primarily by class drivers which are obsolete.
 // Re-examine when those are removed.

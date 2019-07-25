@@ -1,146 +1,114 @@
-// Copyright 2016 The Fuchsia Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
 
 #include <runtime/thread.h>
 
-#include <limits.h>
+#include <magenta/stack.h>
 #include <magenta/syscalls.h>
-#include <magenta/tlsroot.h>
 #include <runtime/mutex.h>
-#include <runtime/process.h>
-#include <runtime/tls.h>
 #include <stddef.h>
+#include <stdint.h>
 
 // An mxr_thread_t starts its life JOINABLE.
 // - If someone calls mxr_thread_join on it, it transitions to JOINED.
 // - If someone calls mxr_thread_detach on it, it transitions to DETACHED.
-// - If it returns before one of those calls is made, it transitions to DONE.
+// - When it exits, it transitions to DONE.
 // No other transitions occur.
 enum {
     JOINABLE,
-    JOINED,
     DETACHED,
+    JOINED,
     DONE,
 };
 
-struct mxr_thread {
-    mx_handle_t handle;
-    int return_value;
-    mxr_thread_entry_t entry;
-    void* arg;
-
-    int errno_value;
-
-    mxr_mutex_t state_lock;
-    int state;
-
-    mx_tls_root_t tls_root;
-};
-
-static mx_status_t allocate_thread_page(mxr_thread_t** thread_out) {
-    // TODO(kulakowski) Pull out this allocation function out
-    // somewhere once we have the ability to hint to the vm how and
-    // where to allocate threads, stacks, heap etc.
-
-    mx_size_t len = sizeof(mxr_thread_t);
-    // mx_tls_root_t already accounts for 1 tls slot.
-    len += (MXR_TLS_SLOT_MAX - 1) * sizeof(void*);
-    len += PAGE_SIZE - 1;
-    len &= ~(PAGE_SIZE - 1);
-
-    mx_handle_t vmo = mx_vm_object_create(len);
-    if (vmo < 0)
-        return (mx_status_t)vmo;
-
-    // TODO(kulakowski) Track process handle.
-    mx_handle_t self_handle = 0;
-    uintptr_t mapping = 0;
-    uint32_t flags = MX_VM_FLAG_PERM_READ | MX_VM_FLAG_PERM_WRITE;
-    mx_status_t status = mx_process_vm_map(self_handle, vmo, 0, len, &mapping, flags);
-    if (status != NO_ERROR) {
-        mx_handle_close(vmo);
-        return status;
-    }
-
-    mx_handle_close(vmo);
-    *thread_out = (mxr_thread_t*)mapping;
-    return NO_ERROR;
+mx_status_t mxr_thread_destroy(mxr_thread_t* thread) {
+    mx_handle_t handle = thread->handle;
+    thread->handle = MX_HANDLE_INVALID;
+    return handle == MX_HANDLE_INVALID ? NO_ERROR : _mx_handle_close(handle);
 }
 
-static mx_status_t deallocate_thread_page(mxr_thread_t* thread) {
-    // TODO(kulakowski) Track process handle.
-    mx_handle_t self_handle = 0;
-    uintptr_t mapping = (uintptr_t)thread;
-    return mx_process_vm_unmap(self_handle, mapping, 0u);
+// Put the thread into DONE state.  As soon as thread->state has changed to
+// to DONE, a caller of mxr_thread_join might complete and deallocate the
+// memory containing the thread descriptor.  Hence it's no longer safe to
+// touch *thread or read anything out of it.  Therefore we must extract the
+// thread handle beforehand.
+static int begin_exit(mxr_thread_t* thread, mx_handle_t* out_handle) {
+    *out_handle = thread->handle;
+    thread->handle = MX_HANDLE_INVALID;
+    return atomic_exchange_explicit(&thread->state, DONE, memory_order_release);
 }
 
-static mx_status_t thread_cleanup(mxr_thread_t* thread, int* return_value_out) {
-    mx_status_t status = mx_handle_close(thread->handle);
-    thread->handle = 0;
-    if (status != NO_ERROR)
-        return status;
-    int return_value = thread->return_value;
-    status = deallocate_thread_page(thread);
-    if (status != NO_ERROR)
-        return status;
-    if (return_value_out)
-        *return_value_out = return_value;
-    return NO_ERROR;
+static _Noreturn void exit_joinable(mx_handle_t handle) {
+    // A later mxr_thread_join call will complete immediately.
+    if (_mx_handle_close(handle) != NO_ERROR)
+        __builtin_trap();
+    // If there were no other handles to the thread, closing the handle
+    // killed us right there.  If there are other handles, exit now.
+    _mx_thread_exit();
 }
 
-static void init_tls(mxr_thread_t* thread) {
-    thread->tls_root.self = &thread->tls_root;
-    thread->tls_root.proc = mxr_process_get_info();
-    thread->tls_root.proc = NULL;
-    thread->tls_root.magic = MX_TLS_ROOT_MAGIC;
-    thread->tls_root.flags = 0;
-    thread->tls_root.maxslots = MXR_TLS_SLOT_MAX;
-    // Avoid calling memset so as not to depend on libc.
-    for (size_t i = 0; i < MXR_TLS_SLOT_MAX; ++i)
-        thread->tls_root.slots[i] = NULL;
-    mxr_tls_root_set(&thread->tls_root);
-    mxr_tls_set(MXR_TLS_SLOT_SELF, &thread->tls_root);
-    mxr_tls_set(MXR_TLS_SLOT_ERRNO, &thread->errno_value);
+static _Noreturn void exit_joined(mxr_thread_t* thread, mx_handle_t handle) {
+    // Wake the _mx_futex_wait in mxr_thread_join (below), and then die.
+    // This has to be done with the special three-in-one vDSO call because
+    // as soon as the mx_futex_wake completes, the joiner is free to unmap
+    // our stack out from under us.  Doing so is a benign race: if the
+    // address is unmapped and our futex_wake fails, it's OK; if the memory
+    // is reused for something else and our futex_wake tickles somebody
+    // completely unrelated, well, that's why futex_wait can always have
+    // spurious wakeups.
+    _mx_futex_wake_handle_close_thread_exit(&thread->state, 1, handle);
+    __builtin_trap();
 }
 
-static int thread_trampoline(void* ctx) {
+static _Noreturn void thread_trampoline(uintptr_t ctx) {
     mxr_thread_t* thread = (mxr_thread_t*)ctx;
 
-    init_tls(thread);
+    thread->entry(thread->arg);
 
-    thread->return_value = thread->entry(thread->arg);
-
-    mxr_mutex_lock(&thread->state_lock);
-    switch (thread->state) {
-    case JOINED:
-        mxr_mutex_unlock(&thread->state_lock);
-        break;
-    case JOINABLE:
-        thread->state = DONE;
-        mxr_mutex_unlock(&thread->state_lock);
-        break;
+    mx_handle_t handle;
+    int old_state = begin_exit(thread, &handle);
+    switch (old_state) {
     case DETACHED:
-        mxr_mutex_unlock(&thread->state_lock);
-        thread_cleanup(thread, NULL);
+        // Nobody cares.  Just die, alone and in the dark.
+        // Fall through.
+
+    case JOINABLE:
+        // Nobody's watching right now, but they might care later.
+        exit_joinable(handle);
         break;
-    case DONE:
-        // Not reached.
-        __builtin_trap();
+
+    case JOINED:
+        // Somebody loves us!  Or at least intends to inherit when we die.
+        exit_joined(thread, handle);
+        break;
     }
 
-    mx_thread_exit();
-    return 0;
+    __builtin_trap();
+}
+
+_Noreturn void mxr_thread_exit_unmap_if_detached(
+    mxr_thread_t* thread, mx_handle_t vmar, uintptr_t addr, size_t len) {
+
+    mx_handle_t handle;
+    int old_state = begin_exit(thread, &handle);
+    switch (old_state) {
+    case DETACHED:
+        // Don't bother touching the mxr_thread_t about to be unmapped.
+        _mx_vmar_unmap_handle_close_thread_exit(vmar, addr, len, handle);
+        // If that returned, the unmap operation was invalid.
+        break;
+
+    case JOINABLE:
+        exit_joinable(handle);
+        break;
+
+    case JOINED:
+        exit_joined(thread, handle);
+        break;
+    }
+
+    __builtin_trap();
 }
 
 // Local implementation so libruntime does not depend on libc.
@@ -151,106 +119,136 @@ static size_t local_strlen(const char* s) {
     return len;
 }
 
-mx_status_t mxr_thread_create(mxr_thread_entry_t entry, void* arg, const char* name, mxr_thread_t** thread_out) {
-    mxr_thread_t* thread = NULL;
-    mx_status_t status = allocate_thread_page(&thread);
-    if (status < 0)
-        return status;
+static void initialize_thread(mxr_thread_t* thread,
+                              mx_handle_t handle, bool detached) {
+    *thread = (mxr_thread_t){
+        .handle = handle,
+        .state = ATOMIC_VAR_INIT(detached ? DETACHED : JOINABLE),
+    };
+}
 
-    thread->entry = entry;
-    thread->arg = arg;
-    thread->state_lock = MXR_MUTEX_INIT;
-    thread->state = JOINABLE;
-
+mx_status_t mxr_thread_create(mx_handle_t process, const char* name,
+                              bool detached, mxr_thread_t* thread) {
+    initialize_thread(thread, MX_HANDLE_INVALID, detached);
     if (name == NULL)
         name = "";
     size_t name_length = local_strlen(name) + 1;
-    mx_handle_t handle = mx_thread_create(thread_trampoline, thread, name, name_length);
-    if (handle < 0) {
-        deallocate_thread_page(thread);
-        return (mx_status_t)handle;
-    }
-    thread->handle = handle;
-    *thread_out = thread;
-    return NO_ERROR;
+    return _mx_thread_create(process, name, name_length, 0, &thread->handle);
 }
 
-mx_status_t mxr_thread_join(mxr_thread_t* thread, int* return_value_out) {
-    mxr_mutex_lock(&thread->state_lock);
-    switch (thread->state) {
-    case JOINED:
-    case DETACHED:
-        mxr_mutex_unlock(&thread->state_lock);
-        return ERR_INVALID_ARGS;
-    case JOINABLE: {
-        thread->state = JOINED;
-        mxr_mutex_unlock(&thread->state_lock);
-        mx_status_t status = mx_handle_wait_one(thread->handle, MX_SIGNAL_SIGNALED,
-                                                      MX_TIME_INFINITE, NULL);
-        if (status != NO_ERROR)
-            return status;
-        break;
-    }
-    case DONE:
-        mxr_mutex_unlock(&thread->state_lock);
-        break;
-    }
+mx_status_t mxr_thread_start(mxr_thread_t* thread, uintptr_t stack_addr, size_t stack_size, mxr_thread_entry_t entry, void* arg) {
+    thread->entry = entry;
+    thread->arg = arg;
 
-    return thread_cleanup(thread, return_value_out);
-}
+    // compute the starting address of the stack
+    uintptr_t sp = compute_initial_stack_pointer(stack_addr, stack_size);
 
-mx_status_t mxr_thread_detach(mxr_thread_t* thread) {
-    mx_status_t status = NO_ERROR;
-    mxr_mutex_lock(&thread->state_lock);
-    switch (thread->state) {
-    case JOINABLE:
-        thread->state = DETACHED;
-        mxr_mutex_unlock(&thread->state_lock);
-        break;
-    case JOINED:
-    case DETACHED:
-        mxr_mutex_unlock(&thread->state_lock);
-        status = ERR_INVALID_ARGS;
-        break;
-    case DONE:
-        mxr_mutex_unlock(&thread->state_lock);
-        status = thread_cleanup(thread, NULL);
-        break;
-    }
+    // kick off the new thread
+    mx_status_t status = _mx_thread_start(thread->handle,
+                                          (uintptr_t)thread_trampoline, sp,
+                                          (uintptr_t)thread, 0);
 
+    if (status != NO_ERROR)
+        mxr_thread_destroy(thread);
     return status;
 }
 
-mx_handle_t mxr_thread_get_handle(mxr_thread_t* thread) {
-    mx_handle_t ret = 0;
-
-    if (!thread) {
-        // TODO: get current handle from TLS once we pass it into the thread
+mx_status_t mxr_thread_join(mxr_thread_t* thread) {
+    int old_state = JOINABLE;
+    if (atomic_compare_exchange_strong_explicit(
+            &thread->state, &old_state, JOINED,
+            memory_order_acq_rel, memory_order_acquire)) {
+        do {
+            switch (_mx_futex_wait(&thread->state, JOINED, MX_TIME_INFINITE)) {
+            case ERR_BAD_STATE:   // Never blocked because it had changed.
+            case NO_ERROR:        // Woke up because it might have changed.
+                old_state = atomic_load_explicit(&thread->state,
+                                                 memory_order_acquire);
+                break;
+            default:
+                __builtin_trap();
+            }
+        } while (old_state == JOINED);
+        if (old_state != DONE)
+            __builtin_trap();
     } else {
-        mxr_mutex_lock(&thread->state_lock);
-
-        if (thread->state != DONE)
-            ret = thread->handle;
-
-        mxr_mutex_unlock(&thread->state_lock);
+        switch (old_state) {
+        case JOINED:
+        case DETACHED:
+            return ERR_INVALID_ARGS;
+        case DONE:
+            break;
+        default:
+            __builtin_trap();
+        }
     }
 
-    return ret;
+    // The thread has already closed its own handle.
+    return NO_ERROR;
 }
 
-void __mxr_thread_main(void) {
-    mxr_tls_t self_slot = mxr_tls_allocate();
-    mxr_tls_t errno_slot = mxr_tls_allocate();
+mx_status_t mxr_thread_detach(mxr_thread_t* thread) {
+    int old_state = JOINABLE;
+    if (!atomic_compare_exchange_strong_explicit(
+            &thread->state, &old_state, DETACHED,
+            memory_order_acq_rel, memory_order_relaxed)) {
+        switch (old_state) {
+        case DETACHED:
+        case JOINED:
+            return ERR_INVALID_ARGS;
+        case DONE:
+            return ERR_BAD_STATE;
+        default:
+            __builtin_trap();
+        }
+    }
 
-    if (self_slot != MXR_TLS_SLOT_SELF ||
-        errno_slot != MXR_TLS_SLOT_ERRNO)
-        __builtin_trap();
+    return NO_ERROR;
+}
 
-    mxr_thread_t* thread = NULL;
-    allocate_thread_page(&thread);
-    init_tls(thread);
-    thread->state_lock = MXR_MUTEX_INIT;
-    thread->state = JOINABLE;
-    // TODO(kulakowski) Once the main thread is passed a handle, save it here.
+bool mxr_thread_detached(mxr_thread_t* thread) {
+    int state = atomic_load_explicit(&thread->state, memory_order_acquire);
+    return state == DETACHED;
+}
+
+mx_status_t mxr_thread_kill(mxr_thread_t* thread) {
+    mx_status_t status = _mx_task_kill(thread->handle);
+    if (status != NO_ERROR)
+        return status;
+
+    mx_handle_t handle = thread->handle;
     thread->handle = MX_HANDLE_INVALID;
+
+    int old_state = atomic_exchange_explicit(&thread->state, DONE,
+                                             memory_order_release);
+    switch (old_state) {
+    case DETACHED:
+    case JOINABLE:
+        return _mx_handle_close(handle);
+
+    case JOINED:
+        // We're now in a race with mxr_thread_join.  It might complete
+        // and free the memory before we could fetch the handle from it.
+        // So we use the copy we fetched before.  In case someone is
+        // blocked in mxr_thread_join, wake the futex.  Doing so is a
+        // benign race: if the address is unmapped and our futex_wake
+        // fails, it's OK; if the memory is reused for something else
+        // and our futex_wake tickles somebody completely unrelated,
+        // well, that's why futex_wait can always have spurious wakeups.
+        status = _mx_handle_close(handle);
+        if (status != NO_ERROR)
+            (void)_mx_futex_wake(&thread->state, 1);
+        return status;
+    }
+
+    __builtin_trap();
+}
+
+mx_handle_t mxr_thread_get_handle(mxr_thread_t* thread) {
+    return thread->handle;
+}
+
+mx_status_t mxr_thread_adopt(mx_handle_t handle, mxr_thread_t* thread) {
+    initialize_thread(thread, handle, false);
+    return handle == MX_HANDLE_INVALID ? ERR_BAD_HANDLE : NO_ERROR;
 }

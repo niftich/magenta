@@ -1,22 +1,12 @@
-// Copyright 2016 The Fuchsia Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
 
 #include <hid/hid.h>
 
 keychar_t qwerty_map[] = {
     // 0x00
-    {0}, {0}, {0}, {0},
+    {}, {}, {}, {},
     // 0x04
     {'a', 'A'}, {'b', 'B'}, {'c', 'C'}, {'d', 'D'},
     // 0x08
@@ -36,31 +26,31 @@ keychar_t qwerty_map[] = {
     // 0x24
     {'7', '&'}, {'8', '*'}, {'9', '('}, {'0', ')'},
     // 0x28
-    {0}, {0}, {0}, {0},
+    {}, {}, {}, {},
     // 0x2c
     {' ', ' '}, {'-', '_'}, {'=','+'}, {'[', '{'},
     // 0x30
-    {']', '}'}, {'\\', '|'}, {0}, {';', ':'},
+    {']', '}'}, {'\\', '|'}, {}, {';', ':'},
     // 0x34
     {'\'', '"'}, {'`', '~'}, {',', '<'}, {'.', '>'},
     // 0x38
-    {'/', '?'}, {0}, {0}, {0},
+    {'/', '?'}, {}, {}, {},
     // 0x3c
-    {0}, {0}, {0}, {0},
+    {}, {}, {}, {},
     // 0x40
-    {0}, {0}, {0}, {0},
+    {}, {}, {}, {},
     // 0x44
-    {0}, {0}, {0}, {0},
+    {}, {}, {}, {},
     // 0x48
-    {0}, {0}, {0}, {0},
+    {}, {}, {}, {},
     // 0x4c
-    {0}, {0}, {0}, {0},
+    {}, {}, {}, {},
     // 0x50
-    {0}, {0}, {0}, {0},
+    {}, {}, {}, {},
     // 0x54
     {'/', 0}, {'*', 0}, {'-', 0}, {'+', 0},
     // 0x58
-    {0}, {'1', 0}, {'2', 0},  {'3', 0},
+    {}, {'1', 0}, {'2', 0},  {'3', 0},
     // 0x5c
     {'4', 0}, {'5', 0}, {'6', 0}, {'7', 0},
     // 0x60
@@ -69,7 +59,7 @@ keychar_t qwerty_map[] = {
 
 keychar_t dvorak_map[] = {
     // 0x00
-    {0}, {0}, {0}, {0},
+    {}, {}, {}, {},
     // 0x04
     {'a', 'A'}, {'x', 'X'}, {'j', 'J'}, {'e', 'E'},
     // 0x08
@@ -89,31 +79,31 @@ keychar_t dvorak_map[] = {
     // 0x24
     {'7', '&'}, {'8', '*'}, {'9', '('}, {'0', ')'},
     // 0x28
-    {0}, {0}, {0}, {0},
+    {}, {}, {}, {},
     // 0x2c
     {' ', ' '}, {'[', '{'}, {']','}'}, {'/', '?'},
     // 0x30
-    {'=', '+'}, {'\\', '|'}, {0}, {'s', 'S'},
+    {'=', '+'}, {'\\', '|'}, {}, {'s', 'S'},
     // 0x34
     {'-', '_'}, {'`', '~'}, {'w', 'W'}, {'v', 'V'},
     // 0x38
-    {'z', 'Z'}, {0}, {0}, {0},
+    {'z', 'Z'}, {}, {}, {},
     // 0x3c
-    {0}, {0}, {0}, {0},
+    {}, {}, {}, {},
     // 0x40
-    {0}, {0}, {0}, {0},
+    {}, {}, {}, {},
     // 0x44
-    {0}, {0}, {0}, {0},
+    {}, {}, {}, {},
     // 0x48
-    {0}, {0}, {0}, {0},
+    {}, {}, {}, {},
     // 0x4c
-    {0}, {0}, {0}, {0},
+    {}, {}, {}, {},
     // 0x50
-    {0}, {0}, {0}, {0},
+    {}, {}, {}, {},
     // 0x54
     {'/', 0}, {'*', 0}, {'-', 0}, {'+', 0},
     // 0x58
-    {0}, {'1', 0}, {'2', 0},  {'3', 0},
+    {}, {'1', 0}, {'2', 0},  {'3', 0},
     // 0x5c
     {'4', 0}, {'5', 0}, {'6', 0}, {'7', 0},
     // 0x60

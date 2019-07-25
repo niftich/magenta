@@ -1,4 +1,3 @@
-#include "libc.h"
 #include <wctype.h>
 
 static const unsigned char table[] = {
@@ -12,9 +11,3 @@ int iswalpha(wint_t wc) {
         return 1;
     return 0;
 }
-
-int __iswalpha_l(wint_t c, locale_t l) {
-    return iswalpha(c);
-}
-
-weak_alias(__iswalpha_l, iswalpha_l);

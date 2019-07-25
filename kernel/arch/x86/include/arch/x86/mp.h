@@ -10,26 +10,24 @@
 /* describes the per cpu structure pointed to by gs: in the kernel */
 
 /* offsets into this structure, used by assembly */
-#if ARCH_X86_32
-#define PERCPU_DIRECT_OFFSET           0x0
-#define PERCPU_CURRENT_THREAD_OFFSET   0x4
-#define PERCPU_KERNEL_SP_OFFSET        0x8
-#define PERCPU_SAVED_USER_SP_OFFSET    0xc
-#define PERCPU_DEFAULT_TSS_OFFSET      0x20
-#elif ARCH_X86_64
 #define PERCPU_DIRECT_OFFSET           0x0
 #define PERCPU_CURRENT_THREAD_OFFSET   0x8
-#define PERCPU_KERNEL_SP_OFFSET        0x10
-#define PERCPU_SAVED_USER_SP_OFFSET    0x18
-#define PERCPU_DEFAULT_TSS_OFFSET      0x30
-#endif
+//      MX_TLS_STACK_GUARD_OFFSET      0x10
+//      MX_TLS_UNSAFE_SP_OFFSET        0x18
+#define PERCPU_KERNEL_SP_OFFSET        0x20
+#define PERCPU_SAVED_USER_SP_OFFSET    0x28
+#define PERCPU_IN_IRQ_OFFSET           0x30
+#define PERCPU_GPF_RETURN_OFFSET       0x38
+#define PERCPU_DEFAULT_TSS_OFFSET      0x50
 
 #ifndef ASSEMBLY
 
 #include <arch/spinlock.h>
 #include <arch/x86.h>
 #include <arch/x86/idt.h>
-#include <compiler.h>
+#include <assert.h>
+#include <magenta/compiler.h>
+#include <magenta/tls.h>
 #include <stdint.h>
 
 __BEGIN_CDECLS
@@ -43,6 +41,11 @@ struct x86_percpu {
     /* the current thread */
     struct thread *current_thread;
 
+    // The offsets of these two slots are published in
+    // system/public/magenta/tls.h and known to the compiler.
+    uintptr_t stack_guard;
+    uintptr_t kernel_unsafe_sp;
+
     /* our current kernel sp, to be loaded by syscall */
     // TODO: Remove this and replace with a fetch from
     // the current tss?
@@ -51,31 +54,40 @@ struct x86_percpu {
     /* temporarily saved during a syscall */
     uintptr_t saved_user_sp;
 
+    /* are we currently in an irq handler */
+    uint32_t in_irq;
+
     /* local APIC id */
     uint32_t apic_id;
 
+    /* If nonzero and we receive a GPF, change the return IP to this value. */
+    uintptr_t gpf_return_target;
+
     /* CPU number */
-    uint8_t cpu_num;
+    uint32_t cpu_num;
 
     /* This CPU's default TSS */
     tss_t __ALIGNED(16) default_tss;
 
-    /* The IDT for this CPU */
-    struct idt idt;
-#ifdef ARCH_X86_64
     /* Reserved space for interrupt stacks */
     uint8_t interrupt_stacks[NUM_ASSIGNED_IST_ENTRIES][PAGE_SIZE];
-#endif
 };
 
-STATIC_ASSERT(__offsetof(struct x86_percpu, direct) == PERCPU_DIRECT_OFFSET);
-STATIC_ASSERT(__offsetof(struct x86_percpu, current_thread) == PERCPU_CURRENT_THREAD_OFFSET);
-STATIC_ASSERT(__offsetof(struct x86_percpu, kernel_sp) == PERCPU_KERNEL_SP_OFFSET);
-STATIC_ASSERT(__offsetof(struct x86_percpu, saved_user_sp) == PERCPU_SAVED_USER_SP_OFFSET);
-STATIC_ASSERT(__offsetof(struct x86_percpu, default_tss) == PERCPU_DEFAULT_TSS_OFFSET);
+static_assert(__offsetof(struct x86_percpu, direct) == PERCPU_DIRECT_OFFSET, "");
+static_assert(__offsetof(struct x86_percpu, current_thread) == PERCPU_CURRENT_THREAD_OFFSET, "");
+static_assert(__offsetof(struct x86_percpu, stack_guard) == MX_TLS_STACK_GUARD_OFFSET, "");
+static_assert(__offsetof(struct x86_percpu, kernel_unsafe_sp) == MX_TLS_UNSAFE_SP_OFFSET, "");
+static_assert(__offsetof(struct x86_percpu, kernel_sp) == PERCPU_KERNEL_SP_OFFSET, "");
+static_assert(__offsetof(struct x86_percpu, saved_user_sp) == PERCPU_SAVED_USER_SP_OFFSET, "");
+static_assert(__offsetof(struct x86_percpu, in_irq) == PERCPU_IN_IRQ_OFFSET, "");
+static_assert(__offsetof(struct x86_percpu, gpf_return_target) == PERCPU_GPF_RETURN_OFFSET, "");
+static_assert(__offsetof(struct x86_percpu, default_tss) == PERCPU_DEFAULT_TSS_OFFSET, "");
 
-/* needs to be run very early in the boot process from start.S and as each cpu is brought up */
-void x86_init_percpu(uint8_t cpu_num);
+// This needs to be run very early in the boot process from start.S and as
+// each CPU is brought up.  It returns the global stack_guard value, for
+// secondary CPUs.  On the initial CPU, it returns zero because the
+// stack_guard value has not been initialized yet.
+uintptr_t x86_init_percpu(uint cpu_num, uintptr_t unsafe_sp);
 
 /* used to set the bootstrap processor's apic_id once the APIC is initialized */
 void x86_set_local_apic_id(uint32_t apic_id);
@@ -87,46 +99,7 @@ status_t x86_allocate_ap_structures(uint32_t *apic_ids, uint8_t cpu_count);
 
 static inline struct x86_percpu *x86_get_percpu(void)
 {
-#if ARCH_X86_64
-    return (struct x86_percpu *)x86_read_gs_offset(PERCPU_DIRECT_OFFSET);
-#else
-    /* x86-32 does not yet support SMP and thus does not need a gs: pointer to point
-     * at the percpu structure
-     */
-    STATIC_ASSERT(SMP_MAX_CPUS == 1);
-    extern struct x86_percpu bp_percpu;
-    return &bp_percpu;
-#endif
-}
-
-static inline struct thread *get_current_thread(void)
-{
-#if ARCH_X86_64
-    /* Read directly from gs, rather than via x86_get_percpu()->current_thread,
-     * so that this is atomic.  Otherwise, we could context switch between the
-     * read of percpu from gs and the read of the current_thread pointer, and
-     * discover the current thread on a different CPU */
-    return (struct thread *)x86_read_gs_offset(PERCPU_CURRENT_THREAD_OFFSET);
-#else
-    spin_lock_saved_state_t state;
-    arch_interrupt_save(&state, 0);
-    struct thread *t = x86_get_percpu()->current_thread;
-    arch_interrupt_restore(state, 0);
-    return t;
-#endif
-}
-
-static inline void set_current_thread(struct thread *t)
-{
-#if ARCH_X86_64
-    /* See above for why this is a direct gs write */
-    x86_write_gs_offset(PERCPU_CURRENT_THREAD_OFFSET, (uintptr_t)t);
-#else
-    spin_lock_saved_state_t state;
-    arch_interrupt_save(&state, 0);
-    x86_get_percpu()->current_thread = t;
-    arch_interrupt_restore(state, 0);
-#endif
+    return (struct x86_percpu *)x86_read_gs_offset64(PERCPU_DIRECT_OFFSET);
 }
 
 static inline uint arch_curr_cpu_num(void)
@@ -143,20 +116,24 @@ static uint arch_max_num_cpus(void)
 /* set on every context switch and before entering user space */
 static inline void x86_set_percpu_kernel_sp(uintptr_t sp)
 {
-#if ARCH_X86_64
-    x86_write_gs_offset(PERCPU_KERNEL_SP_OFFSET, sp);
-#else
-    spin_lock_saved_state_t state;
-    arch_interrupt_save(&state, 0);
-    x86_get_percpu()->kernel_sp = sp;
-    arch_interrupt_restore(state, 0);
-#endif
+    x86_write_gs_offset64(PERCPU_KERNEL_SP_OFFSET, sp);
+}
+
+static bool arch_in_int_handler(void)
+{
+    return (bool)x86_read_gs_offset32(PERCPU_IN_IRQ_OFFSET);
+}
+
+static void arch_set_in_int_handler(bool in_irq)
+{
+    x86_write_gs_offset32(PERCPU_IN_IRQ_OFFSET, in_irq);
 }
 
 enum handler_return x86_ipi_generic_handler(void);
 enum handler_return x86_ipi_reschedule_handler(void);
+void x86_ipi_halt_handler(void) __NO_RETURN;
+void x86_secondary_entry(volatile int *aps_still_booting, thread_t *thread);
 
 __END_CDECLS
 
-#endif
-
+#endif // !ASSEMBLY

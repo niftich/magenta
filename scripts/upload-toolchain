@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Copyright 2016 The Fuchsia Authors
 #
@@ -32,25 +32,20 @@ if [[ -z "${ARCH}" ]]; then
   exit 99
 fi
 
-# Sanity check the value of ARCH.  `doit` accepts multiple values for arch at a time,
-# so it's easy to accidentally do the same for this script.
+# Sanity check the value of ARCH.
 if [[ "${ARCH}" != "${ARCH// /}" ]]; then
   echo "ARCH appears to contain spaces; provide only one ARCH at a time"
   exit 99
 fi
 
-# Build the toolchain: `doit` will fetch source, apply patches and build gcc and friends.
-./doit -a "${ARCH}" -f -j2 -s
+# Build the toolchain: `do-build` will fetch source, apply patches and build gcc and friends.
+./do-build --target "${ARCH}-none" -j2 --strip
 
 # Figure out where the toolchains got generated.  They end up in a directory with the
 # structure $ARCH-$ABI-$VERSION-$OS-$HOSTARCH.
 readonly OS="$(uname)"
 readonly HOSTARCH="$(uname -m)"
-if [[ "${ARCH}" == "arm" ]]; then
-  readonly ABI="eabi"
-else
-  readonly ABI="elf"
-fi
+readonly ABI="elf"
 readonly TOOLCHAIN_DIR="$(ls -td ${ARCH}-${ABI}-*-${OS}-${HOSTARCH} | head -1)"
 
 # Fetch the current git SHA: we upload the prebuilts with a SHA that corresponds

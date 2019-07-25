@@ -1,16 +1,6 @@
-// Copyright 2016 The Fuchsia Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
 
 #include <stdint.h>
 #include <stdio.h>
@@ -39,6 +29,13 @@ const ip6_addr_t ip6_ll_all_routers = {
     .u8 = {0xFF, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2},
 };
 
+
+// If non-zero, this setting causes us to generate our
+// MAC-derived link-local IPv6 address in a way that
+// is different from the spec, so we our link-local traffic
+// is distinct from traffic from Fuchsia's netstack service.
+#define INET6_COEXIST_WITH_NETSTACK 1
+
 // Convert MAC Address to IPv6 Link Local Address
 // aa:bb:cc:dd:ee:ff => FF80::aabb:ccFF:FEdd:eeff
 // bit 2 (U/L) of the mac is inverted
@@ -49,10 +46,17 @@ void ll6addr_from_mac(ip6_addr_t* _ip, const mac_addr_t* _mac) {
     ip[0] = 0xFE;
     ip[1] = 0x80;
     memset(ip + 2, 0, 6);
+    // Flip the globally-unique bit from the MAC
+    // since the sense of this is backwards in
+    // IPv6 Interface Identifiers.
     ip[8] = mac[0] ^ 2;
     ip[9] = mac[1];
     ip[10] = mac[2];
+#if INET6_COEXIST_WITH_NETSTACK
+    ip[11] = 'M';
+#else
     ip[11] = 0xFF;
+#endif
     ip[12] = 0xFE;
     ip[13] = mac[3];
     ip[14] = mac[4];
@@ -209,13 +213,13 @@ static int ip6_setup(ip6_pkt_t* p, const ip6_addr_t* daddr, size_t length, uint8
 #define UDP6_MAX_PAYLOAD (ETH_MTU - ETH_HDR_LEN - IP6_HDR_LEN - UDP_HDR_LEN)
 
 int udp6_send(const void* data, size_t dlen, const ip6_addr_t* daddr, uint16_t dport, uint16_t sport) {
-    size_t length = dlen + UDP_HDR_LEN;
-    udp_pkt_t* p = eth_get_buffer(ETH_MTU + 2);
-
-    if (p == 0)
-        return -1;
     if (dlen > UDP6_MAX_PAYLOAD)
-        goto fail;
+        return -1;
+    size_t length = dlen + UDP_HDR_LEN;
+    udp_pkt_t* p;
+    eth_buffer_t* ethbuf;
+    if (eth_get_buffer(ETH_MTU + 2, (void**) &p, &ethbuf))
+        return -1;
     if (ip6_setup((void*)p, daddr, length, HDR_UDP))
         goto fail;
 
@@ -227,34 +231,34 @@ int udp6_send(const void* data, size_t dlen, const ip6_addr_t* daddr, uint16_t d
 
     memcpy(p->data, data, dlen);
     p->udp.checksum = ip6_checksum(&p->ip6, HDR_UDP, length);
-    return eth_send(p->eth + 2, ETH_HDR_LEN + IP6_HDR_LEN + length);
+    return eth_send(ethbuf, 2, ETH_HDR_LEN + IP6_HDR_LEN + length);
 
 fail:
-    eth_put_buffer(p);
+    eth_put_buffer(ethbuf);
     return -1;
 }
 
 #define ICMP6_MAX_PAYLOAD (ETH_MTU - ETH_HDR_LEN - IP6_HDR_LEN)
 
 static int icmp6_send(const void* data, size_t length, const ip6_addr_t* daddr) {
+    if (length > ICMP6_MAX_PAYLOAD)
+        return -1;
+    eth_buffer_t* ethbuf;
     ip6_pkt_t* p;
     icmp6_hdr_t* icmp;
 
-    p = eth_get_buffer(ETH_MTU + 2);
-    if (p == 0)
+    if (eth_get_buffer(ETH_MTU + 2, (void**) &p, &ethbuf))
         return -1;
-    if (length > ICMP6_MAX_PAYLOAD)
-        goto fail;
     if (ip6_setup(p, daddr, length, HDR_ICMP6))
         goto fail;
 
     icmp = (void*)p->data;
     memcpy(icmp, data, length);
     icmp->checksum = ip6_checksum(&p->ip6, HDR_ICMP6, length);
-    return eth_send(p->eth + 2, ETH_HDR_LEN + IP6_HDR_LEN + length);
+    return eth_send(ethbuf, 2, ETH_HDR_LEN + IP6_HDR_LEN + length);
 
 fail:
-    eth_put_buffer(p);
+    eth_put_buffer(ethbuf);
     return -1;
 }
 
@@ -311,8 +315,10 @@ void icmp6_recv(ip6_hdr_t* ip, void* _data, size_t len) {
             BAD("Bogus NDP Message");
         if (ndp->code != 0)
             BAD("Bogus NDP Code");
+#if !INET6_COEXIST_WITH_NETSTACK
         if (!ip6_addr_eq((ip6_addr_t*) ndp->target, &ll_ip6_addr))
             BAD("NDP Not For Me");
+#endif
 
         msg.hdr.type = ICMP6_NDP_N_ADVERTISE;
         msg.hdr.code = 0;
@@ -333,8 +339,6 @@ void icmp6_recv(ip6_hdr_t* ip, void* _data, size_t len) {
         icmp6_send(_data, len, (void*)&ip->src);
         return;
     }
-
-    BAD("ICMP6 Unhandled");
 }
 
 void eth_recv(void* _data, size_t len) {
@@ -384,7 +388,8 @@ void eth_recv(void* _data, size_t len) {
         _udp6_recv(ip, data, len);
         break;
     default:
-        BAD("Unhandled IP6");
+        // do nothing
+        break;
     }
 }
 

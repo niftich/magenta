@@ -1,26 +1,26 @@
-// Copyright 2016 The Fuchsia Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
 
 #pragma once
 
 #include <ddk/driver.h>
-#include <ddk/protocol/usb-device.h>
+#include <magenta/compiler.h>
+#include <magenta/hw/usb.h>
+#include <magenta/hw/usb-hub.h>
+
+__BEGIN_CDECLS;
 
 typedef struct usb_bus_protocol {
-    mx_device_t* (*attach_device)(mx_device_t* busdev, mx_device_t* hubdev, int hubaddress, int port,
-                                  usb_speed_t speed);
-    void (*detach_device)(mx_device_t* busdev, mx_device_t* dev);
-    void (*root_hub_port_changed)(mx_device_t* busdev, int port);
+    mx_status_t (*add_device)(mx_device_t* device, uint32_t device_id, uint32_t hub_id, usb_speed_t speed);
+    void (*remove_device)(mx_device_t* device, uint32_t device_id);
 
+    // Hub support
+    mx_status_t (*configure_hub)(mx_device_t* dev, mx_device_t* hub_device, usb_speed_t speed,
+                 usb_hub_descriptor_t* descriptor);
+    mx_status_t (*hub_device_added)(mx_device_t* device, mx_device_t* hub_device, int port, usb_speed_t speed);
+
+    mx_status_t (*hub_device_removed)(mx_device_t* device, mx_device_t* hub_device, int port);
 } usb_bus_protocol_t;
+
+__END_CDECLS;

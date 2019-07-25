@@ -6,18 +6,18 @@
 
 #pragma once
 
-#include <kernel/cond.h>
 #include <kernel/mutex.h>
+#include <kernel/thread.h>
 #include <kernel/wait.h>
 #include <list.h>
 #include <magenta/types.h>
-#include <utils/intrusive_hash_table.h>
+#include <mxtl/intrusive_hash_table.h>
 
 // Node for linked list of threads blocked on a futex
 // Intended to be embedded within a UserThread Instance
-class FutexNode : public utils::SinglyLinkedListable<FutexNode*> {
+class FutexNode : public mxtl::SinglyLinkedListable<FutexNode*> {
 public:
-    using HashTable = utils::HashTable<uintptr_t, FutexNode*>;
+    using HashTable = mxtl::HashTable<uintptr_t, FutexNode*>;
 
     FutexNode();
     ~FutexNode();
@@ -25,46 +25,39 @@ public:
     FutexNode(const FutexNode &) = delete;
     FutexNode& operator=(const FutexNode &) = delete;
 
+    bool IsInQueue() const;
+    void SetAsSingletonList();
+
     // adds a list of nodes to our tail
     void AppendList(FutexNode* head);
 
-    // remove up to |count| nodes from our head and return new head
-    // the removed nodes remain a valid list after this operation
-    FutexNode* RemoveFromHead(uint32_t count, uintptr_t old_hash_key,
-                              uintptr_t new_hash_key);
+    static FutexNode* RemoveNodeFromList(FutexNode* list_head, FutexNode* node);
 
-    // block the current thread, releasing the given mutex while the thread
-    // is blocked
-    status_t BlockThread(mutex_t* mutex, mx_time_t timeout);
+    static FutexNode* RemoveFromHead(FutexNode* list_head,
+                                     uint32_t count,
+                                     uintptr_t old_hash_key,
+                                     uintptr_t new_hash_key);
+
+    // This must be called with |mutex| held and returns without |mutex| held.
+    status_t BlockThread(Mutex* mutex, mx_time_t deadline) TA_REL(mutex);
 
     // wakes the list of threads starting with node |head|
     static void WakeThreads(FutexNode* head);
-
-    FutexNode* next() const {
-        return next_;
-    }
-
-    void set_next(FutexNode* node) {
-        next_ = node;
-    }
-
-    FutexNode* tail() const {
-        return tail_;
-    }
-
-    void set_tail(FutexNode* tail) {
-        tail_ = tail;
-    }
 
     void set_hash_key(uintptr_t key) {
         hash_key_ = key;
     }
 
-    // Trait implementation for utils::HashTable
+    // Trait implementation for mxtl::HashTable
     uintptr_t GetKey() const { return hash_key_; }
     static size_t GetHash(uintptr_t key) { return (key >> 3); }
 
 private:
+    static void RelinkAsAdjacent(FutexNode* node1, FutexNode* node2);
+    static void SpliceNodes(FutexNode* node1, FutexNode* node2);
+
+    void MarkAsNotInQueue();
+
     // hash_key_ contains the futex address.  This field has two roles:
     //  * It is used by FutexWait() to determine which queue to remove the
     //    thread from when a wait operation times out.
@@ -73,13 +66,14 @@ private:
     //    intrusive SinglyLinkedLists).
     uintptr_t hash_key_;
 
-    // condition variable used for blocking our containing thread on
-    cond_t condvar_;
+    // Used for waking the thread corresponding to the FutexNode.
+    wait_queue_t wait_queue_;
 
-    // for list of threads blocked on a futex
-    FutexNode* next_;
-
-    // tail node of the node list
-    // only valid if this node is the list head
-    FutexNode* tail_;
+    // queue_prev_ and queue_next_ are used for maintaining a circular
+    // doubly-linked list of threads that are waiting on one futex address.
+    //  * When the list contains only this node, queue_prev_ and
+    //    queue_next_ both point back to this node.
+    //  * When the thread is not waiting on a futex, queue_next_ is null.
+    FutexNode* queue_prev_ = nullptr;
+    FutexNode* queue_next_ = nullptr;
 };

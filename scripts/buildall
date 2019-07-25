@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Copyright 2016 The Fuchsia Authors
 # Copyright (c) 2008 Travis Geiselbrecht
@@ -9,23 +9,32 @@
 
 function HELP {
     echo "help:"
+    echo "-a arg              : Pass arg to make"
     echo "-f                  : Exit on first failure"
     echo "-m                  : Build magenta targets only"
     echo "-r                  : Also build release mode builds"
+    echo "-c                  : Also build with clang"
+    echo "-q                  : Build quietly"
     echo "-h for help"
     exit 1
 }
 
 FAIL_FAST=0
 DO_RELEASE=0
+DO_CLANG=0
 MAGENTA_ONLY=0
+MAKE_ARGS=
+QUIET=0
 
-while getopts fhmr FLAG; do
+while getopts a:fhmrcq FLAG; do
     case $FLAG in
+        a) MAKE_ARGS="${MAKE_ARGS} ${OPTARG}";;
         f) FAIL_FAST=1;;
         h) HELP;;
         r) DO_RELEASE=1;;
+        c) DO_CLANG=1;;
         m) MAGENTA_ONLY=1;;
+        q) QUIET=1;;
         \?)
             echo unrecognized option
             HELP
@@ -43,9 +52,11 @@ FAILED=""
 
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 STATUS=0
+export QUIET
 
 for p in $PROJECTS; do
-  nice $DIR/make-parallel $p
+  echo building $p
+  nice $DIR/make-parallel $p ${MAKE_ARGS}
   STATUS=$?
   if [ "$STATUS" -ne 0 ]; then
     FAILED="$FAILED $p"
@@ -54,13 +65,37 @@ for p in $PROJECTS; do
     fi
   fi
 
+  if [ "$DO_CLANG" -eq 1 ]; then
+    echo building $p with clang
+    nice $DIR/make-parallel $p ${MAKE_ARGS} USE_CLANG=true
+    STATUS=$?
+    if [ "$STATUS" -ne 0 ]; then
+      FAILED="$FAILED $p-clang"
+      if [ "$FAIL_FAST" -eq 1 ]; then
+        break
+      fi
+    fi
+  fi
+
   if [ "$DO_RELEASE" -eq 1 ]; then
-    nice $DIR/make-release $p
+    echo building $p with release
+    nice $DIR/make-release $p ${MAKE_ARGS}
     STATUS=$?
     if [ "$STATUS" -ne 0 ]; then
       FAILED="$FAILED $p-release"
       if [ "$FAIL_FAST" -eq 1 ]; then
         break
+      fi
+    fi
+    if [ "$DO_CLANG" -eq 1 ]; then
+      echo building $p with release and clang
+      nice $DIR/make-release $p ${MAKE_ARGS} USE_CLANG=true
+      STATUS=$?
+      if [ "$STATUS" -ne 0 ]; then
+        FAILED="$FAILED $p-clang-release"
+        if [ "$FAIL_FAST" -eq 1 ]; then
+          break
+        fi
       fi
     fi
   fi

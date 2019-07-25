@@ -1,4 +1,3 @@
-#include "syscall.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -39,13 +38,10 @@ char* tempnam(const char* dir, const char* pfx) {
 
     for (try = 0; try < MAXTRIES; try ++) {
         __randname(s + l - 6);
-#ifdef SYS_lstat
-        r = __syscall(SYS_lstat, s, &(struct stat){0});
-#else
-        r = __syscall(SYS_fstatat, AT_FDCWD, s, &(struct stat){0}, AT_SYMLINK_NOFOLLOW);
-#endif
-        if (r == -ENOENT)
+        r = lstat(s, &(struct stat){});
+        if (r == -1 && errno == ENOENT) {
             return strdup(s);
+        }
     }
     return 0;
 }

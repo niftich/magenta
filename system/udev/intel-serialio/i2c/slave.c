@@ -1,28 +1,17 @@
-// Copyright 2016 The Fuchsia Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
 
 #include <ddk/device.h>
 #include <ddk/driver.h>
-#include <ddk/protocol/i2c.h>
 #include <intel-serialio/reg.h>
 #include <magenta/types.h>
-#include <mxio/util.h>
-#include <system/listnode.h>
-#include <runtime/mutex.h>
+#include <magenta/device/i2c.h>
+#include <magenta/listnode.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <threads.h>
 
 #include "controller.h"
 #include "slave.h"
@@ -34,15 +23,15 @@ static const uint64_t timeout_ns = 2 * 1000 * 1000 * 1000;
 //the plumbing isn't all there for that apparently.
 #define DO_UNTIL(condition, action)                                           \
     ({                                                                        \
-        const uint64_t _wait_for_base_time = mx_current_time();         \
+        const uint64_t _wait_for_base_time = mx_time_get(MX_CLOCK_MONOTONIC); \
         uint64_t _wait_for_last_time = _wait_for_base_time;                   \
         int _wait_for_condition_value = !!(condition);                        \
         while (!_wait_for_condition_value) {                                  \
                _wait_for_condition_value = !!(condition);                     \
                if (_wait_for_last_time - _wait_for_base_time > timeout_ns)    \
                    break;                                                     \
-               _wait_for_last_time = mx_current_time();                 \
-               {action;}                                                       \
+               _wait_for_last_time = mx_time_get(MX_CLOCK_MONOTONIC);         \
+               {action;}                                                      \
         }                                                                     \
         _wait_for_condition_value;                                            \
     })
@@ -67,20 +56,18 @@ static int rx_fifo_empty(intel_serialio_i2c_device_t *controller) {
 }
 
 static mx_status_t intel_serialio_i2c_slave_transfer(
-    mx_device_t *dev, i2c_slave_segment_t *segments, int segment_count) {
+    intel_serialio_i2c_slave_device_t* slave, i2c_slave_segment_t *segments, int segment_count) {
     mx_status_t status = NO_ERROR;
 
-    intel_serialio_i2c_slave_device_t *slave =
-        get_intel_serialio_i2c_slave_device(dev);
-
-    if (!dev->parent) {
-        printf("Orphaned I2C slave.\n");
-        status = ERR_BAD_STATE;
-        goto transfer_finish_2;
+    for (int i = 0; i < segment_count; i++) {
+        if (segments[i].type != I2C_SEGMENT_TYPE_READ &&
+            segments[i].type != I2C_SEGMENT_TYPE_WRITE) {
+            status = ERR_INVALID_ARGS;
+            goto transfer_finish_2;
+        }
     }
 
-    intel_serialio_i2c_device_t* controller =
-        get_intel_serialio_i2c_device(dev->parent);
+    intel_serialio_i2c_device_t* controller = slave->controller;
 
     uint32_t ctl_addr_mode_bit;
     uint32_t tar_add_addr_mode_bit;
@@ -96,7 +83,7 @@ static mx_status_t intel_serialio_i2c_slave_transfer(
         goto transfer_finish_2;
     }
 
-    mxr_mutex_lock(&controller->mutex);
+    mtx_lock(&slave->controller->mutex);
 
     if (!WAIT_FOR(bus_is_idle(controller))) {
         status = ERR_TIMED_OUT;
@@ -112,9 +99,9 @@ static mx_status_t intel_serialio_i2c_slave_transfer(
     // Enable the controller.
     RMWREG32(&controller->regs->i2c_en, I2C_EN_ENABLE, 1, 1);
 
-    int last_read = 0;
+    int last_type = I2C_SEGMENT_TYPE_END;
     if (segment_count)
-        last_read = segments->read;
+        last_type = segments->type;
 
     while (segment_count--) {
         int len = segments->len;
@@ -123,22 +110,32 @@ static mx_status_t intel_serialio_i2c_slave_transfer(
         // If this segment is in the same direction as the last, inject a
         // restart at its start.
         uint32_t restart = 0;
-        if (last_read == segments->read)
+        if (last_type == segments->type)
             restart = 1;
         while (len--) {
             // Build the cmd register value.
             uint32_t cmd = (restart << DATA_CMD_RESTART);
             restart = 0;
-            if (!segments->read) {
-                while (!(*REG32(&controller->regs->i2c_sta) &
-                         (0x1 << I2C_STA_TFNF))) {
-                    ;
+            switch (segments->type) {
+            case I2C_SEGMENT_TYPE_WRITE:
+                if (!WAIT_FOR((*REG32(&controller->regs->i2c_sta) &
+                         (0x1 << I2C_STA_TFNF)))) {
+                    status = ERR_TIMED_OUT;
+                    goto transfer_finish_1;
                 }
                 cmd |= (*buf << DATA_CMD_DAT);
                 cmd |= (DATA_CMD_CMD_WRITE << DATA_CMD_CMD);
-            } else {
+                break;
+            case I2C_SEGMENT_TYPE_READ:
                 cmd |= (DATA_CMD_CMD_READ << DATA_CMD_CMD);
+                break;
+            default:
+                // shouldn't be reachable
+                printf("invalid i2c segment type: %d\n", segments->type);
+                status = ERR_INVALID_ARGS;
+                goto transfer_finish_1;
             }
+
             if (!len && !segment_count)
                 cmd |= (0x1 << DATA_CMD_STOP);
 
@@ -146,17 +143,17 @@ static mx_status_t intel_serialio_i2c_slave_transfer(
             *REG32(&controller->regs->data_cmd) = cmd;
 
             // If this is a read, extract the data.
-            if (segments->read) {
-                while (!(*REG32(&controller->regs->i2c_sta) &
-                         (0x1 << I2C_STA_RFNE))) {
-                    ;
+            if (segments->type == I2C_SEGMENT_TYPE_READ) {
+                if (!WAIT_FOR(!rx_fifo_empty(controller))) {
+                    status = ERR_TIMED_OUT;
+                    goto transfer_finish_1;
                 }
                 *buf = *REG32(&controller->regs->data_cmd);
             }
 
             buf++;
         }
-        last_read = segments->read;
+        last_type = segments->type;
         segments++;
     }
 
@@ -182,79 +179,89 @@ static mx_status_t intel_serialio_i2c_slave_transfer(
 transfer_finish_1:
     if (status < 0)
         intel_serialio_i2c_reset_controller(controller);
-    mxr_mutex_unlock(&controller->mutex);
+    mtx_unlock(&controller->mutex);
 transfer_finish_2:
     return status;
 }
 
 // Implement the char protocol for the slave devices.
 
-static ssize_t intel_serialio_i2c_slave_read(
-    mx_device_t* dev, void* buf, size_t count, mx_off_t off) {
+static mx_status_t intel_serialio_i2c_slave_read(
+    void* ctx, void* buf, size_t count, mx_off_t off, size_t* actual) {
+    intel_serialio_i2c_slave_device_t* slave = ctx;
     i2c_slave_segment_t segment = {
-        .read = 1,
+        .type = I2C_SEGMENT_TYPE_READ,
         .buf = buf,
         .len = count,
     };
-    return intel_serialio_i2c_slave_transfer(dev, &segment, 1);
+    mx_status_t status = intel_serialio_i2c_slave_transfer(slave, &segment, 1);
+    if (status == NO_ERROR) {
+        *actual = count;
+    }
+    return status;
 }
 
-static ssize_t intel_serialio_i2c_slave_write(
-    mx_device_t* dev, const void* buf, size_t count, mx_off_t off) {
+static mx_status_t intel_serialio_i2c_slave_write(
+    void* ctx, const void* buf, size_t count, mx_off_t off, size_t* actual) {
+    intel_serialio_i2c_slave_device_t* slave = ctx;
     i2c_slave_segment_t segment = {
-        .read = 0,
+        .type = I2C_SEGMENT_TYPE_WRITE,
         .buf = (void*)buf,
         .len = count,
     };
-    return intel_serialio_i2c_slave_transfer(dev, &segment, 1);
+    mx_status_t status = intel_serialio_i2c_slave_transfer(slave, &segment, 1);
+    if (status == NO_ERROR) {
+        *actual = count;
+    }
+    return status;
 }
 
-static ssize_t intel_serialio_i2c_slave_transfer_ioctl(
-    mx_device_t* dev, uint32_t op, const void* in_buf, size_t in_len,
-    void* out_buf, size_t out_len) {
+static mx_status_t intel_serialio_i2c_slave_transfer_ioctl(
+    intel_serialio_i2c_slave_device_t* slave, uint32_t op, const void* in_buf, size_t in_len,
+    void* out_buf, size_t out_len, size_t* out_actual) {
     mx_status_t status;
+    const size_t base_size = sizeof(i2c_slave_ioctl_segment_t);
 
-    size_t size = in_len;
     size_t read_len = 0;
     size_t write_len = 0;
     int segment_count = 0;
-    uintptr_t segment_addr = (uintptr_t)in_buf;
+    const i2c_slave_ioctl_segment_t* ioctl_segment = (const i2c_slave_ioctl_segment_t*)in_buf;
+    const void* end = (uint8_t*)in_buf + in_len;
     // Check that the inputs and output buffer are valid.
-    while (size) {
-        const i2c_slave_ioctl_segment_t* ioctl_segment =
-            (const i2c_slave_ioctl_segment_t*)segment_addr;
-        size_t base_size = offsetof(i2c_slave_ioctl_segment_t, buf);
-        int len = ioctl_segment->len;
-        if (size < base_size) {
+    while ((void*)ioctl_segment < end) {
+        if (ioctl_segment->type == I2C_SEGMENT_TYPE_END) {
+            // Advance past the segment, which should be the beginning of write
+            // data or the end (if there are no writes).
+            ioctl_segment++;
+            break;
+        }
+        if ((void*)((uint8_t*)ioctl_segment + base_size) > end) {
             status = ERR_INVALID_ARGS;
             goto slave_transfer_ioctl_finish_2;
         }
 
-        size_t consumed = 0;
-        if (ioctl_segment->read) {
+        int len = ioctl_segment->len;
+
+        switch (ioctl_segment->type) {
+        case I2C_SEGMENT_TYPE_READ:
             read_len += len;
-            consumed = base_size;
-        } else {
+            break;
+        case I2C_SEGMENT_TYPE_WRITE:
             write_len += len;
-            consumed = base_size + len;
+            break;
         }
-        if (consumed > size) {
-            status = ERR_INVALID_ARGS;
-            goto slave_transfer_ioctl_finish_2;
-        }
-        segment_addr += consumed;
-        size -= consumed;
+        ioctl_segment++;
         segment_count++;
+    }
+    if ((void*)((uint8_t*)ioctl_segment + write_len) != end) {
+        status = ERR_INVALID_ARGS;
+        goto slave_transfer_ioctl_finish_2;
     }
     if (out_len < read_len) {
         status = ERR_INVALID_ARGS;
         goto slave_transfer_ioctl_finish_2;
     }
-
-    if (in_len < write_len) {
-        status = ERR_INVALID_ARGS;
-        goto slave_transfer_ioctl_finish_2;
-    }
+    uint8_t* data = (uint8_t*)ioctl_segment;
 
     // Build a list of segments to transfer.
     i2c_slave_segment_t* segments =
@@ -264,38 +271,39 @@ static ssize_t intel_serialio_i2c_slave_transfer_ioctl(
         goto slave_transfer_ioctl_finish_2;
     }
     i2c_slave_segment_t* cur_segment = segments;
-    segment_addr = (uintptr_t)in_buf;
     uintptr_t out_addr = (uintptr_t)out_buf;
-    size = in_len;
-    while (size) {
-        const i2c_slave_ioctl_segment_t* ioctl_segment =
-            (const i2c_slave_ioctl_segment_t*)segment_addr;
-        const size_t base_size =
-            offsetof(i2c_slave_ioctl_segment_t, buf);
+    ioctl_segment = (const i2c_slave_ioctl_segment_t*)in_buf;
+    for (int i = 0; i < segment_count; i++) {
         int len = ioctl_segment->len;
 
-        size_t consumed = 0;
-        if (ioctl_segment->read) {
-            consumed = base_size;
-            cur_segment->read = 1;
+        switch (ioctl_segment->type) {
+        case I2C_SEGMENT_TYPE_READ:
+            cur_segment->type = I2C_SEGMENT_TYPE_READ;
             cur_segment->len = len;
             cur_segment->buf = (uint8_t*)out_addr;
             out_addr += len;
-        } else {
-            consumed = base_size + len;
-            cur_segment->read = 0;
+            break;
+        case I2C_SEGMENT_TYPE_WRITE:
+            cur_segment->type = I2C_SEGMENT_TYPE_WRITE;
             cur_segment->len = len;
-            cur_segment->buf = (uint8_t*)(segment_addr + base_size);
+            cur_segment->buf = data;
+            data += len;
+            break;
+        default:
+            // invalid segment type
+            status = ERR_INVALID_ARGS;
+            goto slave_transfer_ioctl_finish_1;
+            break;
         }
 
         cur_segment++;
-        segment_addr += consumed;
-        size -= consumed;
+        ioctl_segment++;
     }
 
-    status = intel_serialio_i2c_slave_transfer(dev, segments, segment_count);
-    if (status == NO_ERROR)
-        status = read_len;
+    status = intel_serialio_i2c_slave_transfer(slave, segments, segment_count);
+    if (status == NO_ERROR) {
+        *out_actual = read_len;
+    }
 
 slave_transfer_ioctl_finish_1:
     free(segments);
@@ -303,46 +311,31 @@ slave_transfer_ioctl_finish_2:
     return status;
 }
 
-static ssize_t intel_serialio_i2c_slave_ioctl(
-    mx_device_t* dev, uint32_t op, const void* in_buf, size_t in_len,
-    void* out_buf, size_t out_len) {
+static mx_status_t intel_serialio_i2c_slave_ioctl(
+    void* ctx, uint32_t op, const void* in_buf, size_t in_len,
+    void* out_buf, size_t out_len, size_t* out_actual) {
+    intel_serialio_i2c_slave_device_t* slave = ctx;
     switch (op) {
-    case I2C_SLAVE_TRANSFER:
+    case IOCTL_I2C_SLAVE_TRANSFER:
         return intel_serialio_i2c_slave_transfer_ioctl(
-            dev, op, in_buf, in_len, out_buf, out_len);
+            slave, op, in_buf, in_len, out_buf, out_len, out_actual);
         break;
     default:
         return ERR_INVALID_ARGS;
     }
 }
 
+static void intel_serialio_i2c_slave_release(void* ctx) {
+    intel_serialio_i2c_slave_device_t* slave = ctx;
+    free(slave);
+}
+
 // Implement the device protocol for the slave devices.
 
-static mx_protocol_device_t intel_serialio_i2c_slave_device_proto = {
-    .read = &intel_serialio_i2c_slave_read,
-    .write = &intel_serialio_i2c_slave_write,
-    .ioctl = &intel_serialio_i2c_slave_ioctl,
+mx_protocol_device_t intel_serialio_i2c_slave_device_proto = {
+    .version = DEVICE_OPS_VERSION,
+    .read = intel_serialio_i2c_slave_read,
+    .write = intel_serialio_i2c_slave_write,
+    .ioctl = intel_serialio_i2c_slave_ioctl,
+    .release = intel_serialio_i2c_slave_release,
 };
-
-// Initialize a slave device structure.
-
-mx_status_t intel_serialio_i2c_slave_device_init(
-    mx_device_t* cont, intel_serialio_i2c_slave_device_t* slave,
-    uint8_t width, uint16_t address) {
-    mx_status_t status = NO_ERROR;
-
-    char name[sizeof(address) * 2 + 2] = {
-            [sizeof(name) - 1] = '\0',
-    };
-    snprintf(name, sizeof(name) - 1, "%04x", address);
-
-    status = device_init(&slave->device, cont->driver, name,
-                         &intel_serialio_i2c_slave_device_proto);
-    if (status < 0)
-        return status;
-
-    slave->chip_address_width = width;
-    slave->chip_address = address;
-
-    return status;
-}

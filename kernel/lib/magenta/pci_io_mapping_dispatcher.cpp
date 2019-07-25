@@ -4,20 +4,23 @@
 // license that can be found in the LICENSE file or at
 // https://opensource.org/licenses/MIT
 
+#if WITH_DEV_PCIE
+
 #include <magenta/pci_device_dispatcher.h>
 #include <magenta/pci_io_mapping_dispatcher.h>
 
-#include <new.h>
+#include <mxalloc/new.h>
+
 #include <string.h>
 
 status_t PciIoMappingDispatcher::Create(
-        const utils::RefPtr<PciDeviceDispatcher::PciDeviceWrapper>& device,
+        const mxtl::RefPtr<PciDeviceDispatcher::PciDeviceWrapper>& device,
         const char* dbg_tag,
         paddr_t paddr,
         size_t size,
         uint vmm_flags,
         uint arch_mmu_flags,
-        utils::RefPtr<Dispatcher>* out_dispatcher,
+        mxtl::RefPtr<Dispatcher>* out_dispatcher,
         mx_rights_t* out_rights) {
     // Sanity check our args
     if (!device || !out_rights || !out_dispatcher)
@@ -31,12 +34,12 @@ status_t PciIoMappingDispatcher::Create(
 
     // Create a debug name for the mapping.
     char name[32];
-    const pcie_device_state_t& dev = *device->device();
+    const PcieDevice& dev = *device->device();
     snprintf(name, sizeof(name), "usr_pci_%s_%02x_%02x_%x",
-             dbg_tag, dev.bus_id, dev.dev_id, dev.func_id);
+             dbg_tag, dev.bus_id(), dev.dev_id(), dev.func_id());
 
     // Initialize the mapping
-    utils::RefPtr<Dispatcher> disp = utils::AdoptRef<Dispatcher>(pim_disp);
+    mxtl::RefPtr<Dispatcher> disp = mxtl::AdoptRef<Dispatcher>(pim_disp);
     status_t status = pim_disp->Init(name, paddr, size, vmm_flags, arch_mmu_flags);
     if (status != NO_ERROR) {
         pim_disp->Close();
@@ -44,26 +47,28 @@ status_t PciIoMappingDispatcher::Create(
     }
 
     // Success!  Stash the results.
-    *out_dispatcher = utils::move(disp);
+    *out_dispatcher = mxtl::move(disp);
     *out_rights     = IoMappingDispatcher::kDefaultRights;
     return NO_ERROR;
 }
 
 status_t PciIoMappingDispatcher::CreateBarMapping(
-        const utils::RefPtr<PciDeviceDispatcher::PciDeviceWrapper>& device,
+        const mxtl::RefPtr<PciDeviceDispatcher::PciDeviceWrapper>& device,
         uint bar_num,
         uint vmm_flags,
         uint cache_policy,
-        utils::RefPtr<Dispatcher>* out_dispatcher,
+        mxtl::RefPtr<Dispatcher>* out_dispatcher,
         mx_rights_t* out_rights) {
     // Sanity check our args
     if (!device || !out_rights || !out_dispatcher)
         return ERR_INVALID_ARGS;
 
+    if (!device->device())
+        return ERR_BAD_STATE;
+
     // Fetch our BAR info.
-    const pcie_bar_info_t* info = pcie_get_bar_info(device->device(), bar_num);
+    const pcie_bar_info_t* info = device->device()->GetBarInfo(bar_num);
     if (!info) return ERR_INVALID_ARGS;
-    DEBUG_ASSERT(bar_num < PCIE_MAX_BAR_REGS);
 
     // Fail if this is a PIO windows instead of an MMIO window.  For the time
     // being, PIO accesses need to go through the specialized PIO API.
@@ -99,8 +104,8 @@ status_t PciIoMappingDispatcher::CreateBarMapping(
                     static_cast<size_t>(aligned_size),
                     0 /* vmm flags */,
                     cache_policy |
-                    ARCH_MMU_FLAG_PERM_NO_EXECUTE |
-                    ARCH_MMU_FLAG_PERM_USER,
+                    ARCH_MMU_FLAG_PERM_READ | ARCH_MMU_FLAG_PERM_WRITE |
+                        ARCH_MMU_FLAG_PERM_USER,
                     out_dispatcher,
                     out_rights);
 
@@ -134,3 +139,5 @@ void PciIoMappingDispatcher::Close() {
 
     device_ = nullptr;
 }
+
+#endif  // if WITH_DEV_PCIE

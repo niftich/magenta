@@ -11,9 +11,7 @@
 #include <magenta/state_tracker.h>
 #include <magenta/wait_event.h>
 
-#include <utils/type_support.h>
-
-WaitStateObserver::WaitStateObserver() {}
+#include <mxtl/type_support.h>
 
 WaitStateObserver::~WaitStateObserver() {
     DEBUG_ASSERT(!dispatcher_);
@@ -21,52 +19,77 @@ WaitStateObserver::~WaitStateObserver() {
 
 mx_status_t WaitStateObserver::Begin(WaitEvent* event,
                                      Handle* handle,
-                                     mx_signals_t watched_signals,
-                                     uint64_t context) {
+                                     mx_signals_t watched_signals) {
+    canary_.Assert();
     DEBUG_ASSERT(!dispatcher_);
 
     event_ = event;
     handle_ = handle;
     watched_signals_ = watched_signals;
-    context_ = context;
     dispatcher_ = handle->dispatcher();
-    auto state_tracker = dispatcher_->get_state_tracker();
-    mx_status_t result = (state_tracker && state_tracker->is_waitable())
-            ? state_tracker->AddObserver(this) : ERR_NOT_SUPPORTED;
-    if (result != NO_ERROR)
+    wakeup_reasons_ = 0u;
+
+    auto status = dispatcher_->add_observer(this);
+    if (status != NO_ERROR) {
         dispatcher_.reset();
-    return result;
+        return status;
+    }
+    return NO_ERROR;
 }
 
-mx_signals_state_t WaitStateObserver::End() {
+mx_signals_t WaitStateObserver::End() {
+    canary_.Assert();
     DEBUG_ASSERT(dispatcher_);
 
-    mx_signals_state_t state = dispatcher_->get_state_tracker()->RemoveObserver(this);
+    auto tracker = dispatcher_->get_state_tracker();
+    DEBUG_ASSERT(tracker);
+    if (tracker)
+        tracker->RemoveObserver(this);
     dispatcher_.reset();
-    return state;
+
+    // Return the set of reasons that we may have been woken.  Basically, this
+    // is set of satisfied bits which were ever set while we were waiting on the list.
+    return wakeup_reasons_;
 }
 
-bool WaitStateObserver::OnInitialize(mx_signals_state_t initial_state) {
-    return MaybeSignal(initial_state);
-}
+bool WaitStateObserver::OnInitialize(mx_signals_t initial_state,
+                                     const StateObserver::CountInfo* cinfo) {
+    canary_.Assert();
 
-bool WaitStateObserver::OnStateChange(mx_signals_state_t new_state) {
-    return MaybeSignal(new_state);
-}
+    // Record the initial state of the state tracker as our wakeup reason.  If
+    // we are going to become immediately signaled, the reason is contained
+    // somewhere in this initial state.
+    wakeup_reasons_ = initial_state;
 
-bool WaitStateObserver::OnCancel(Handle* handle, bool* should_remove, bool* call_did_cancel) {
-    DEBUG_ASSERT(!*should_remove);  // We'll leave it at its default value, which should be false.
-    DEBUG_ASSERT(dispatcher_);
+    if (initial_state & watched_signals_)
+        return event_->Signal() > 0;
 
-    return (handle == handle_) ? event_->Signal(WaitEvent::Result::CANCELLED, context_) : false;
-}
-
-bool WaitStateObserver::MaybeSignal(mx_signals_state_t state) {
-    DEBUG_ASSERT(dispatcher_);
-
-    if (state.satisfied & watched_signals_)
-        return event_->Signal(WaitEvent::Result::SATISFIED, context_);
-    if (!(state.satisfiable & watched_signals_))
-        return event_->Signal(WaitEvent::Result::UNSATISFIABLE, context_);
     return false;
 }
+
+bool WaitStateObserver::OnStateChange(mx_signals_t new_state) {
+    canary_.Assert();
+
+    // If we are still on our StateTracker's list of observers, and the
+    // StateTracker's state has changed, accumulate the reasons that we may have
+    // woken up.  In particular any satisfied bits which have become set
+    // while we were on the list may have been reasons to wake up.
+    wakeup_reasons_ |= new_state;
+
+    if (new_state & watched_signals_)
+        return event_->Signal() > 0;
+
+    return false;
+}
+
+bool WaitStateObserver::OnCancel(Handle* handle) {
+    canary_.Assert();
+
+    if (handle == handle_) {
+        wakeup_reasons_ |= MX_SIGNAL_HANDLE_CLOSED;
+        return event_->Signal(ERR_CANCELED) > 0;
+    } else {
+        return false;
+    }
+}
+

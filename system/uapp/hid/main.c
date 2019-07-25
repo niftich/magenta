@@ -1,19 +1,7 @@
-// Copyright 2016 The Fuchsia Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
 
-#include <magenta/types.h>
-#include <mxio/io.h>
 #include <assert.h>
 #include <dirent.h>
 #include <errno.h>
@@ -22,19 +10,19 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <threads.h>
 #include <unistd.h>
 #include <limits.h>
 
-#include <system/listnode.h>
+#include <magenta/assert.h>
+#include <magenta/listnode.h>
+#include <magenta/threads.h>
+#include <magenta/types.h>
+#include <magenta/device/input.h>
 
-#include <runtime/mutex.h>
-#include <runtime/thread.h>
-
-#include <ddk/protocol/input.h>
+#include <mxio/watcher.h>
 
 #define DEV_INPUT "/dev/class/input"
-
-#define INPUT_LISTENER_FLAG_RUNNING 1
 
 static bool verbose = false;
 #define xprintf(fmt...) do { if (verbose) printf(fmt); } while (0)
@@ -42,29 +30,25 @@ static bool verbose = false;
 void usage(void) {
     printf("usage: hid [-v] <command> [<args>]\n\n");
     printf("  commands:\n");
-    printf("    read\n");
+    printf("    read [<devpath> [num reads]]\n");
     printf("    get <devpath> <in|out|feature> <id>\n");
     printf("    set <devpath> <in|out|feature> <id> [0xXX *]\n");
-    printf("  all values are parsed as hexadecimal integers\n");
 }
 
-typedef struct {
-    char dev_name[128];
-    mxr_thread_t* t;
-    int flags;
+typedef struct input_args {
     int fd;
-    struct list_node node;
-} input_listener_t;
+    char name[128];
+    unsigned long int num_reads;
+} input_args_t;
 
-static struct list_node input_listeners_list = LIST_INITIAL_VALUE(input_listeners_list);
-static mxr_thread_t* input_poll_thread;
+static thrd_t input_poll_thread;
 
-static mxr_mutex_t print_lock = MXR_MUTEX_INIT;
+static mtx_t print_lock = MTX_INIT;
 #define lprintf(fmt...) \
     do { \
-        mxr_mutex_lock(&print_lock); \
+        mtx_lock(&print_lock); \
         printf(fmt); \
-        mxr_mutex_unlock(&print_lock); \
+        mtx_unlock(&print_lock); \
     } while (0)
 
 
@@ -76,11 +60,73 @@ static void print_hex(uint8_t* buf, size_t len) {
     printf("\n");
 }
 
+static mx_status_t parse_uint_arg(const char* arg, uint32_t min, uint32_t max, uint32_t* out_val) {
+    if ((arg == NULL) || (out_val == NULL)) {
+        return ERR_INVALID_ARGS;
+    }
+
+    bool is_hex = (arg[0] == '0') && (arg[1] == 'x');
+    if (sscanf(arg, is_hex ? "%x" : "%u", out_val) != 1) {
+        return ERR_INVALID_ARGS;
+    }
+
+    if ((*out_val < min) || (*out_val > max)) {
+        return ERR_OUT_OF_RANGE;
+    }
+
+    return NO_ERROR;
+}
+
+static mx_status_t parse_input_report_type(const char* arg, input_report_type_t* out_type) {
+    if ((arg == NULL) || (out_type == NULL)) {
+        return ERR_INVALID_ARGS;
+    }
+
+    static const struct {
+        const char* name;
+        input_report_type_t type;
+    } LUT[] = {
+        { .name = "in",      .type = INPUT_REPORT_INPUT },
+        { .name = "out",     .type = INPUT_REPORT_OUTPUT },
+        { .name = "feature", .type = INPUT_REPORT_FEATURE },
+    };
+
+    for (size_t i = 0; i < countof(LUT); ++i) {
+        if (!strcasecmp(arg, LUT[i].name)) {
+            *out_type = LUT[i].type;
+            return NO_ERROR;
+        }
+    }
+
+    return ERR_INVALID_ARGS;
+}
+
+static mx_status_t parse_set_get_report_args(int argc,
+                                             const char** argv,
+                                             input_report_id_t* out_id,
+                                             input_report_type_t* out_type) {
+    if ((argc < 3) || (argv == NULL) || (out_id == NULL) || (out_type == NULL)) {
+        return ERR_INVALID_ARGS;
+    }
+
+    mx_status_t res;
+    uint32_t tmp;
+    res = parse_uint_arg(argv[2], 0, 255, &tmp);
+    if (res != NO_ERROR) {
+        return res;
+    }
+
+    *out_id = tmp;
+
+    return parse_input_report_type(argv[1], out_type);
+}
+
+
 static int get_hid_protocol(int fd, const char* name) {
     int proto;
-    int rc = mxio_ioctl(fd, INPUT_IOCTL_GET_PROTOCOL, NULL, 0, &proto, sizeof(proto));
+    ssize_t rc = ioctl_input_get_protocol(fd, &proto);
     if (rc < 0) {
-        lprintf("hid: could not get protocol from %s (status=%d)\n", name, rc);
+        lprintf("hid: could not get protocol from %s (status=%zd)\n", name, rc);
     } else {
         lprintf("hid: %s proto=%d\n", name, proto);
     }
@@ -88,11 +134,11 @@ static int get_hid_protocol(int fd, const char* name) {
 }
 
 static int get_report_desc_len(int fd, const char* name, size_t* report_desc_len) {
-    int rc = mxio_ioctl(fd, INPUT_IOCTL_GET_REPORT_DESC_SIZE, NULL, 0, report_desc_len, sizeof(*report_desc_len));
+    ssize_t rc = ioctl_input_get_report_desc_size(fd, report_desc_len);
     if (rc < 0) {
-        lprintf("hid: could not get report descriptor length from %s (status=%d)\n", name, rc);
+        lprintf("hid: could not get report descriptor length from %s (status=%zd)\n", name, rc);
     } else {
-        lprintf("hid: %s report descriptor len=%lu\n", name, *report_desc_len);
+        lprintf("hid: %s report descriptor len=%zu\n", name, *report_desc_len);
     }
     return rc;
 }
@@ -103,68 +149,88 @@ static int get_report_desc(int fd, const char* name, size_t report_desc_len) {
         lprintf("hid: out of memory\n");
         return ERR_NO_MEMORY;
     }
-    int rc = mxio_ioctl(fd, INPUT_IOCTL_GET_REPORT_DESC, NULL, 0, buf, report_desc_len);
+    ssize_t rc = ioctl_input_get_report_desc(fd, buf, report_desc_len);
     if (rc < 0) {
-        lprintf("hid: could not get report descriptor from %s (status=%d)\n", name, rc);
+        lprintf("hid: could not get report descriptor from %s (status=%zd)\n", name, rc);
         free(buf);
         return rc;
     }
-    mxr_mutex_lock(&print_lock);
+    mtx_lock(&print_lock);
     printf("hid: %s report descriptor:\n", name);
     print_hex(buf, report_desc_len);
-    mxr_mutex_unlock(&print_lock);
+    mtx_unlock(&print_lock);
     free(buf);
     return rc;
 }
 
 static int get_num_reports(int fd, const char* name, size_t* num_reports) {
-    int rc = mxio_ioctl(fd, INPUT_IOCTL_GET_NUM_REPORTS, NULL, 0, num_reports, sizeof(*num_reports));
+    ssize_t rc = ioctl_input_get_num_reports(fd, num_reports);
     if (rc < 0) {
-        lprintf("hid: could not get number of reports from %s (status=%d)\n", name, rc);
+        lprintf("hid: could not get number of reports from %s (status=%zd)\n", name, rc);
     } else {
-        lprintf("hid: %s num reports: %lu\n", name, *num_reports);
+        lprintf("hid: %s num reports: %zu\n", name, *num_reports);
     }
     return rc;
 }
 
 static int get_report_ids(int fd, const char* name, size_t num_reports) {
-    input_report_id_t* ids = malloc(num_reports * sizeof(input_report_id_t));
+    size_t out_len = num_reports * sizeof(input_report_id_t);
+    input_report_id_t* ids = malloc(out_len);
     if (!ids) return ERR_NO_MEMORY;
 
-    int rc = mxio_ioctl(fd, INPUT_IOCTL_GET_REPORT_IDS, NULL, 0, ids, num_reports * sizeof(input_report_id_t));
+    ssize_t rc = ioctl_input_get_report_ids(fd, ids, out_len);
     if (rc < 0) {
-        lprintf("hid: could not get report ids from %s (status=%d)\n", name, rc);
+        lprintf("hid: could not get report ids from %s (status=%zd)\n", name, rc);
         free(ids);
         return rc;
     }
-    mxr_mutex_lock(&print_lock);
-    printf("hid: %s report ids: [", name);
-    const char *s = "";
+    mtx_lock(&print_lock);
+    printf("hid: %s report ids...\n", name);
     for (size_t i = 0; i < num_reports; i++) {
-        input_get_report_size_t arg;
-        arg.id = ids[i];
-        arg.type = INPUT_REPORT_INPUT;  // TODO: get all types
-        input_report_size_t size;
-        rc = mxio_ioctl(fd, INPUT_IOCTL_GET_REPORT_SIZE, &arg, sizeof(arg), &size, sizeof(size));
-        if (rc < 0) {
-            printf("hid: could not get report id size from %s (status=%d)\n", name, rc);
-            continue;
+        static const struct {
+            input_report_type_t type;
+            const char* tag;
+        } TYPES[] = {
+            { .type = INPUT_REPORT_INPUT,   .tag = "Input" },
+            { .type = INPUT_REPORT_OUTPUT,  .tag = "Output" },
+            { .type = INPUT_REPORT_FEATURE, .tag = "Feature" },
+        };
+
+        bool found = false;
+        for (size_t j = 0; j < countof(TYPES); ++j) {
+            input_get_report_size_t arg = { .id = ids[i], .type = TYPES[j].type };
+            input_report_size_t size;
+            ssize_t size_rc;
+
+            size_rc = ioctl_input_get_report_size(fd, &arg, &size);
+            if (size_rc >= 0) {
+                printf("  ID 0x%02x : TYPE %7s : SIZE %u bytes\n",
+                        ids[i], TYPES[j].tag, size);
+                found = true;
+            }
         }
-        if (i > 0) s = " ";
-        printf("%s%d(%d bytes)", s, ids[i], size);
+
+        if (!found) {
+            printf("  hid: failed to find any report sizes for report id 0x%02x's (dev %s)\n",
+                    ids[i], name);
+        }
     }
-    printf("]\n");
-    mxr_mutex_unlock(&print_lock);
+
+    mtx_unlock(&print_lock);
     free(ids);
     return rc;
 }
 
-static int get_max_report_len(int fd, const char* name, size_t* max_report_len) {
-    int rc = mxio_ioctl(fd, INPUT_IOCTL_GET_MAX_REPORTSIZE, NULL, 0, max_report_len, sizeof(*max_report_len));
+static int get_max_report_len(int fd, const char* name, input_report_size_t* max_report_len) {
+    input_report_size_t tmp;
+    if (max_report_len == NULL) {
+        max_report_len = &tmp;
+    }
+    ssize_t rc = ioctl_input_get_max_reportsize(fd, max_report_len);
     if (rc < 0) {
-        lprintf("hid: could not get max report size from %s (status=%d)\n", name, rc);
+        lprintf("hid: could not get max report size from %s (status=%zd)\n", name, rc);
     } else {
-        lprintf("hid: %s maxreport=%zu\n", name, *max_report_len);
+        lprintf("hid: %s maxreport=%u\n", name, *max_report_len);
     }
     return rc;
 }
@@ -175,124 +241,142 @@ static int get_max_report_len(int fd, const char* name, size_t* max_report_len) 
         if (rc < 0) return rc; \
     } while (0)
 
-#define try_args(fn, fd, name, args...) \
-    do { \
-        int rc = fn(fd, name, args); \
-        if (rc < 0) return rc; \
-    } while (0)
-
-static int hid_input_thread(void* arg) {
-    input_listener_t* listener = arg;
-    assert(listener->flags & INPUT_LISTENER_FLAG_RUNNING);
-    assert(listener->fd >= 0);
-    lprintf("hid: input thread started for %s\n", listener->dev_name);
-    const char* name = listener->dev_name;
-    int fd = listener->fd;
+static int hid_status(int fd, const char* name, input_report_size_t* max_report_len) {
+    size_t report_desc_len;
+    size_t num_reports;
 
     try(get_hid_protocol(fd, name));
-
-    size_t report_desc_len;
     try(get_report_desc_len(fd, name, &report_desc_len));
-
     try(get_report_desc(fd, name, report_desc_len));
-
-    size_t num_reports;
     try(get_num_reports(fd, name, &num_reports));
-
     try(get_report_ids(fd, name, num_reports));
+    try(get_max_report_len(fd, name, max_report_len));
 
-    size_t max_report_len;
-    try(get_max_report_len(fd, name, &max_report_len));
+    return NO_ERROR;
+}
+
+static int hid_input_thread(void* arg) {
+    input_args_t* args = (input_args_t*)arg;
+    lprintf("hid: input thread started for %s\n", args->name);
+
+    input_report_size_t max_report_len = 0;
+    try(hid_status(args->fd, args->name, &max_report_len));
+
+    // Add 1 to the max report length to make room for a Report ID.
+    max_report_len++;
 
     uint8_t* report = calloc(1, max_report_len);
     if (!report) return ERR_NO_MEMORY;
 
-    for (;;) {
-        mxio_wait_fd(fd, MXIO_EVT_READABLE, NULL, MX_TIME_INFINITE);
-        int r = read(fd, report, max_report_len);
-        mxr_mutex_lock(&print_lock);
+    for (uint32_t i = 0; i < args->num_reads; i++) {
+        int r = read(args->fd, report, max_report_len);
+        mtx_lock(&print_lock);
         printf("read returned %d\n", r);
         if (r < 0) {
-            mxr_mutex_unlock(&print_lock);
+            printf("read errno=%d (%s)\n", errno, strerror(errno));
+            mtx_unlock(&print_lock);
             break;
         }
-        printf("hid: input from %s\n", name);
+        printf("hid: input from %s\n", args->name);
         print_hex(report, r);
-        mxr_mutex_unlock(&print_lock);
+        mtx_unlock(&print_lock);
     }
     free(report);
-    lprintf("hid: closing %s\n", name);
-    close(fd);
-    listener->fd = -1;
-    listener->flags &= ~INPUT_LISTENER_FLAG_RUNNING;
+    lprintf("hid: closing %s\n", args->name);
+    close(args->fd);
+    free(args);
+    return NO_ERROR;
+}
+
+static mx_status_t hid_input_device_added(int dirfd, int event, const char* fn, void* cookie) {
+    if (event != WATCH_EVENT_ADD_FILE) {
+        return NO_ERROR;
+    }
+
+    int fd = openat(dirfd, fn, O_RDONLY);
+    if (fd < 0) {
+        return NO_ERROR;
+    }
+
+    input_args_t* args = malloc(sizeof(*args));
+    args->fd = fd;
+    // TODO: support setting num_reads across all devices. requires a way to
+    // signal shutdown to all input threads.
+    args->num_reads = ULONG_MAX;
+    thrd_t t;
+    snprintf(args->name, sizeof(args->name), "hid-input-%s", fn);
+    int ret = thrd_create_with_name(&t, hid_input_thread, (void*)args, args->name);
+    if (ret != thrd_success) {
+        printf("hid: input thread %s did not start (error=%d)\n", args->name, ret);
+        close(fd);
+        return thrd_status_to_mx_status(ret);
+    }
+    thrd_detach(t);
     return NO_ERROR;
 }
 
 static int hid_input_devices_poll_thread(void* arg) {
-    for (;;) {
-        struct dirent* de;
-        DIR* dir = opendir(DEV_INPUT);
-        if (!dir) {
-            printf("hid: error opening %s\n", DEV_INPUT);
-            return ERR_INTERNAL;
-        }
-        char dname[128];
-        char tname[128];
-        mx_status_t status;
-        while ((de = readdir(dir)) != NULL) {
-            snprintf(dname, sizeof(dname), "%s/%s", DEV_INPUT, de->d_name);
-
-            // is there already a listener for this device?
-            bool found = false;
-            input_listener_t* listener = NULL;
-            list_for_every_entry(&input_listeners_list, listener, input_listener_t, node) {
-                if ((listener->flags & INPUT_LISTENER_FLAG_RUNNING) && !strcmp(listener->dev_name, dname)) {
-                    found = true;
-                    break;
-                }
-            }
-            if (found) continue;
-            input_listener_t* free = NULL;
-            list_for_every_entry(&input_listeners_list, listener, input_listener_t, node) {
-                if (!(listener->flags & INPUT_LISTENER_FLAG_RUNNING)) {
-                    free = listener;
-                    break;
-                }
-            }
-            if (!free) {
-                free = calloc(1, sizeof(input_listener_t));
-                if (!free) {
-                    break;
-                }
-                list_add_tail(&input_listeners_list, &free->node);
-            }
-            free->flags |= INPUT_LISTENER_FLAG_RUNNING;
-            strncpy(free->dev_name, dname, sizeof(free->dev_name));
-            free->fd = open(free->dev_name, O_RDONLY);
-            if (free->fd < 0) {
-                free->flags &= ~INPUT_LISTENER_FLAG_RUNNING;
-                continue;
-            }
-            snprintf(tname, sizeof(tname), "hid-input-%s", de->d_name);
-            status = mxr_thread_create(hid_input_thread, (void*)free, tname, &free->t);
-            if (status < 0) {
-                printf("hid: input thread %s did not start (status=%d)\n", tname, status);
-                free->flags &= ~INPUT_LISTENER_FLAG_RUNNING;
-            }
-        }
-        closedir(dir);
-        usleep(1000 * 1000);
+    int dirfd = open(DEV_INPUT, O_DIRECTORY|O_RDONLY);
+    if (dirfd < 0) {
+        printf("hid: error opening %s\n", DEV_INPUT);
+        return ERR_INTERNAL;
     }
-    return NO_ERROR;
+    mxio_watch_directory(dirfd, hid_input_device_added, NULL);
+    close(dirfd);
+    return -1;
 }
 
 int read_reports(int argc, const char** argv) {
-    mx_status_t status = mxr_thread_create(hid_input_devices_poll_thread, NULL, "hid-inputdev-poll", &input_poll_thread);
-    if (status != NO_ERROR) {
-        return status;
+    argc--;
+    argv++;
+    if (argc < 1) {
+        usage();
+        return 0;
     }
 
-    mxr_thread_join(input_poll_thread, NULL);
+    uint32_t tmp = 0xffffffff;
+    if (argc > 1) {
+        mx_status_t res = parse_uint_arg(argv[1], 0, 0xffffffff, &tmp);
+        if (res != NO_ERROR) {
+            printf("Failed to parse <num reads> (res %d)\n", res);
+            usage();
+            return 0;
+        }
+    }
+
+    int fd = open(argv[0], O_RDWR);
+    if (fd < 0) {
+        printf("could not open %s: %d\n", argv[0], errno);
+        return -1;
+    }
+
+    input_args_t* args = calloc(1, sizeof(*args));
+    args->fd = fd;
+    args->num_reads = tmp;
+
+    strlcpy(args->name, argv[0], sizeof(args->name));
+    thrd_t t;
+    int ret = thrd_create_with_name(&t, hid_input_thread, (void*)args, args->name);
+    if (ret != thrd_success) {
+        printf("hid: input thread %s did not start (error=%d)\n", args->name, ret);
+        free(args);
+        close(fd);
+        return -1;
+    }
+    thrd_join(t, NULL);
+    return 0;
+}
+
+int readall_reports(int argc, const char** argv) {
+    int ret = thrd_create_with_name(&input_poll_thread,
+                                    hid_input_devices_poll_thread,
+                                    NULL,
+                                    "hid-inputdev-poll");
+    if (ret != thrd_success) {
+        return -1;
+    }
+
+    thrd_join(input_poll_thread, NULL);
     return 0;
 }
 
@@ -304,32 +388,62 @@ int get_report(int argc, const char** argv) {
         return 0;
     }
 
+    input_get_report_size_t size_arg;
+    mx_status_t res = parse_set_get_report_args(argc, argv, &size_arg.id, &size_arg.type);
+    if (res != NO_ERROR) {
+        printf("Failed to parse type/id for get report operation (res %d)\n", res);
+        usage();
+        return 0;
+    }
+
     int fd = open(argv[0], O_RDWR);
     if (fd < 0) {
         printf("could not open %s: %d\n", argv[0], errno);
         return -1;
     }
 
-    input_get_report_size_t arg;
-    arg.id = strtoul(argv[2], NULL, 16);
-    arg.type = strtoul(argv[1], NULL, 16);
-    xprintf("hid: getting report size for id=%u type=%u\n", arg.id, arg.type);
+    xprintf("hid: getting report size for id=0x%02x type=%u\n", size_arg.id, size_arg.type);
 
     input_report_size_t size;
-    int rc = mxio_ioctl(fd, INPUT_IOCTL_GET_REPORT_SIZE, &arg, sizeof(arg), &size, sizeof(size));
+    ssize_t rc = ioctl_input_get_report_size(fd, &size_arg, &size);
     if (rc < 0) {
-        printf("hid: could not get report id size from %s (status=%d)\n", argv[0], rc);
+        printf("hid: could not get report (id 0x%02x type %u) size from %s (status=%zd)\n",
+                size_arg.id, size_arg.type, argv[0], rc);
         return rc;
     }
     xprintf("hid: report size=%u\n", size);
 
-    uint8_t* buf = malloc(size);
-    rc = mxio_ioctl(fd, INPUT_IOCTL_GET_REPORT, &arg, sizeof(arg), buf, size);
+    input_get_report_t rpt_arg;
+    rpt_arg.id = size_arg.id;
+    rpt_arg.type = size_arg.type;
+
+    // TODO(johngro) : Come up with a better policy than this...  While devices
+    // are *supposed* to only deliver a report descriptor's computed size, in
+    // practice they frequently seem to deliver number of bytes either greater
+    // or fewer than the number of bytes originally requested.  For example...
+    //
+    // ++ Sometimes a device is expected to deliver a Report ID byte along with
+    //    the payload contents, but does not do so.
+    // ++ Sometimes it is unclear whether or not a device needs to deliver a
+    //    Report ID byte at all since there is only one report listed (and,
+    //    sometimes the device delivers that ID, and sometimes it chooses not
+    //    to).
+    // ++ Sometimes no bytes at all are returned for a report (this seems to
+    //    be relatively common for input reports)
+    // ++ Sometimes the number of bytes returned has basically nothing to do
+    //    with the expected size of the report (this seems to be relatively
+    //    common for vendor feature reports).
+    //
+    // Because of this uncertainty, we currently just provide a worst-case 4KB
+    // buffer to read into, and report the number of bytes which came back along
+    // with the expected size of the raw report.
+    uint8_t* buf = malloc(4u << 10);
+    rc = ioctl_input_get_report(fd, &rpt_arg, buf, sizeof(buf));
     if (rc < 0) {
-        printf("hid: could not get report: %d\n", rc);
+        printf("hid: could not get report: %zd\n", rc);
     } else {
-        printf("hid: report\n");
-        print_hex(buf, size);
+        printf("hid: got %zu bytes (raw report size %u)\n", rc, size);
+        print_hex(buf, rc);
     }
     free(buf);
     return rc;
@@ -343,44 +457,63 @@ int set_report(int argc, const char** argv) {
         return 0;
     }
 
+    input_get_report_size_t size_arg;
+    mx_status_t res = parse_set_get_report_args(argc, argv, &size_arg.id, &size_arg.type);
+    if (res != NO_ERROR) {
+        printf("Failed to parse type/id for get report operation (res %d)\n", res);
+        usage();
+        return 0;
+    }
+
+    xprintf("hid: getting report size for id=0x%02x type=%u\n", size_arg.id, size_arg.type);
+
+    input_set_report_t* arg = NULL;
     int fd = open(argv[0], O_RDWR);
     if (fd < 0) {
         printf("could not open %s: %d\n", argv[0], errno);
         return -1;
     }
 
-    input_get_report_size_t size_arg;
-    size_arg.id = strtoul(argv[2], NULL, 16);
-    size_arg.type = strtoul(argv[1], NULL, 16);
-    xprintf("hid: getting report size for id=%u type=%u\n", size_arg.id, size_arg.type);
-
     input_report_size_t size;
-    int rc = mxio_ioctl(fd, INPUT_IOCTL_GET_REPORT_SIZE, &size_arg, sizeof(size_arg), &size, sizeof(size));
+    ssize_t rc = ioctl_input_get_report_size(fd, &size_arg, &size);
     if (rc < 0) {
-        printf("hid: could not get report id size from %s (status=%d)\n", argv[0], rc);
-        return rc;
-    }
-    xprintf("hid: report size=%u\n", size);
-    if (argc - 3 < size) {
-        printf("not enough data for set\n");
-        return -1;
-    } else if (argc - 3 > size) {
-        printf("ignoring extra data\n");
+        printf("hid: could not get report (id 0x%02x type %u) size from %s (status=%zd)\n",
+                size_arg.id, size_arg.type, argv[0], rc);
+        goto finished;
     }
 
-    input_set_report_t* arg = malloc(sizeof(input_set_report_t) + size);
+    // If the set/get report args parsed, then we must have at least 3 arguments.
+    MX_DEBUG_ASSERT(argc >= 3);
+    input_report_size_t payload_size = argc - 3;
+
+    xprintf("hid: report size=%u, tx payload size=%u\n", size, payload_size);
+
+    size_t in_len = sizeof(input_set_report_t) + payload_size;
+    arg = malloc(in_len);
     arg->id = size_arg.id;
     arg->type = size_arg.type;
-    for (int i = 0; i < size; i++) {
-        arg->data[i] = strtoul(argv[i+3], NULL, 16);
+    for (int i = 0; i < payload_size; i++) {
+        uint32_t tmp;
+        mx_status_t res = parse_uint_arg(argv[i+3], 0, 255, &tmp);
+        if (res != NO_ERROR) {
+            printf("Failed to parse payload byte \"%s\" (res = %d)\n", argv[i+3], res);
+            rc = res;
+            goto finished;
+        }
+
+        arg->data[i] = tmp;
     }
-    rc = mxio_ioctl(fd, INPUT_IOCTL_SET_REPORT, arg, sizeof(input_set_report_t) + size, NULL, 0);
+
+    rc = ioctl_input_set_report(fd, arg, in_len);
     if (rc < 0) {
-        printf("hid: could not set report: %d\n", rc);
+        printf("hid: could not set report: %zd\n", rc);
     } else {
         printf("hid: success\n");
     }
-    free(arg);
+
+finished:
+    if (arg) { free(arg); }
+    close(fd);
     return rc;
 }
 
@@ -396,7 +529,13 @@ int main(int argc, const char** argv) {
         argc--;
         argv++;
     }
-    if (!strcmp("read", argv[0])) return read_reports(argc, argv);
+    if (!strcmp("read", argv[0])) {
+        if (argc > 1) {
+            return read_reports(argc, argv);
+        } else {
+            return readall_reports(argc, argv);
+        }
+    }
     if (!strcmp("get", argv[0])) return get_report(argc, argv);
     if (!strcmp("set", argv[0])) return set_report(argc, argv);
     usage();

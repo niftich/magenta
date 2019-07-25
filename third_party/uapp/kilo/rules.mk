@@ -22,11 +22,13 @@ MODULE_SRCS += $(LOCAL_DIR)/kilo.c
 
 MODULE_NAME := kilo
 
-MODULE_LIBS := ulib/mxio ulib/musl
+MODULE_LIBS := system/ulib/mxio system/ulib/c
 
-MODULE_HEADER_DEPS := ulib/ddk ulib/magenta
-
-MODULE_CFLAGS := -Wno-discarded-qualifiers
+ifeq ($(call TOBOOL,$(USE_CLANG)),false)
+MODULE_CFLAGS += -Wno-discarded-qualifiers
+else
+MODULE_CFLAGS += -Wno-incompatible-pointer-types-discards-qualifiers
+endif
 
 USER_MANIFEST_LINES += src/kilo.c=$(LOCAL_DIR)/kilo.c
 

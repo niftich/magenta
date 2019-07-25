@@ -1,7 +1,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-extern char** __environ;
+#include "libc.h"
+#include "env_impl.h"
+
 char** __env_map;
 
 int __putenv(char* s, int a) {

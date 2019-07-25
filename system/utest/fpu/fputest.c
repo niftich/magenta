@@ -1,30 +1,20 @@
-// Copyright 2016 The Fuchsia Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
 
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <threads.h>
 #include <unistd.h>
 
+#include <magenta/compiler.h>
 #include <magenta/syscalls.h>
 #include <unittest/unittest.h>
-#include <runtime/thread.h>
 
 #define THREAD_COUNT 8
 #define ITER 1000000
-
-#define countof(a) (sizeof(a) / sizeof((a)[0]))
 
 /* expected double bit pattern for each thread */
 static const uint64_t expected[THREAD_COUNT] = {
@@ -71,7 +61,7 @@ bool fpu_test(void) {
     unittest_printf("welcome to floating point test\n");
 
     /* test lazy fpu load on separate thread */
-    mxr_thread_t *t[THREAD_COUNT];
+    thrd_t t[THREAD_COUNT];
     double val[countof(t)];
     char name[MX_MAX_NAME_LEN];
 
@@ -79,15 +69,17 @@ bool fpu_test(void) {
     for (unsigned int i = 0; i < countof(t); i++) {
         val[i] = i;
         snprintf(name, sizeof(name), "fpu thread %u", i);
-        mxr_thread_create(float_thread, &val[i], name, &t[i]);
+        thrd_create_with_name(&t[i], float_thread, &val[i], name);
     }
 
     for (unsigned int i = 0; i < countof(t); i++) {
-        mxr_thread_join(t[i], NULL);
+        thrd_join(t[i], NULL);
         void* v = &val[i];
         uint64_t int64_val = *(uint64_t*)v;
 
-        unittest_printf("float thread %u returns val %f 0x%llx, expected 0x%llx\n", i, val[i], int64_val, expected[i]);
+        unittest_printf("float thread %u returns val %f %#"
+                        PRIx64 ", expected %#" PRIx64 "\n",
+                        i, val[i], int64_val, expected[i]);
         EXPECT_EQ(int64_val, expected[i], "Value does not match as expected");
     }
 

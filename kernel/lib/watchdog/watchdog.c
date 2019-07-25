@@ -8,8 +8,9 @@
 
 
 #include <assert.h>
-#include <compiler.h>
 #include <err.h>
+#include <inttypes.h>
+#include <magenta/compiler.h>
 #include <platform.h>
 
 #include <kernel/thread.h>
@@ -22,8 +23,8 @@ static spin_lock_t lock = SPIN_LOCK_INITIAL_VALUE;
 
 __WEAK void watchdog_handler(watchdog_t *dog)
 {
-    dprintf(INFO, "Watchdog \"%s\" (timeout %u mSec) just fired!!\n",
-            dog->name, (uint32_t)dog->timeout);
+    dprintf(INFO, "Watchdog \"%s\" (timeout %" PRIu64 " mSec) just fired!!\n",
+            dog->name, dog->timeout / (1000 * 1000));
     platform_halt(HALT_ACTION_HALT, HALT_REASON_SW_WATCHDOG);
 }
 
@@ -62,8 +63,9 @@ void watchdog_set_enabled(watchdog_t *dog, bool enabled)
         goto done;
 
     dog->enabled = enabled;
+    lk_time_t deadline = current_time() + dog->timeout;
     if (enabled)
-        timer_set_oneshot(&dog->expire_timer, dog->timeout, watchdog_timer_callback, dog);
+        timer_set_oneshot(&dog->expire_timer, deadline, watchdog_timer_callback, dog);
     else
         timer_cancel(&dog->expire_timer);
 
@@ -82,7 +84,8 @@ void watchdog_pet(watchdog_t *dog)
         goto done;
 
     timer_cancel(&dog->expire_timer);
-    timer_set_oneshot(&dog->expire_timer, dog->timeout, watchdog_timer_callback, dog);
+    lk_time_t deadline = current_time() + dog->timeout;
+    timer_set_oneshot(&dog->expire_timer, deadline, watchdog_timer_callback, dog);
 
 done:
     spin_unlock_irqrestore(&lock, state);

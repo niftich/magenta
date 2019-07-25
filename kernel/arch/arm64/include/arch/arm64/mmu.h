@@ -41,6 +41,8 @@
 #define MMU_IDENT_SIZE_SHIFT 42 /* Max size supported by block mappings */
 #endif
 
+#define MMU_MAX_PAGE_SIZE_SHIFT 48
+
 #define MMU_KERNEL_PAGE_SIZE_SHIFT      (PAGE_SIZE_SHIFT)
 #define MMU_USER_PAGE_SIZE_SHIFT        (USER_PAGE_SIZE_SHIFT)
 
@@ -254,8 +256,18 @@
                         MMU_TCR_IRGN0(MMU_RGN_WRITE_BACK_ALLOCATE) | \
                         MMU_TCR_T0SZ(64 - MMU_IDENT_SIZE_SHIFT))
 #define MMU_TCR_FLAGS_IDENT (MMU_TCR_IPS_DEFAULT | MMU_TCR_FLAGS1 | MMU_TCR_FLAGS0_IDENT)
-#define MMU_TCR_FLAGS_KERNEL (MMU_TCR_IPS_DEFAULT | MMU_TCR_FLAGS1 | MMU_TCR_FLAGS0 | MMU_TCR_EPD0)
-#define MMU_TCR_FLAGS_USER (MMU_TCR_IPS_DEFAULT | MMU_TCR_FLAGS1 | MMU_TCR_FLAGS0)
+
+#define MMU_TCR_FLAGS_KERNEL (MMU_TCR_IPS_DEFAULT | \
+                              MMU_TCR_FLAGS1 | \
+                              MMU_TCR_FLAGS0 | \
+                              MMU_TCR_EPD0 | \
+                              MMU_TCR_AS | \
+                              MMU_TCR_A1)
+
+#define MMU_TCR_FLAGS_USER (MMU_TCR_IPS_DEFAULT | \
+                            MMU_TCR_FLAGS1 | \
+                            MMU_TCR_FLAGS0 | \
+                            MMU_TCR_AS)
 
 
 #if MMU_IDENT_SIZE_SHIFT > MMU_LX_X(MMU_IDENT_PAGE_SIZE_SHIFT, 2)
@@ -303,7 +315,7 @@
 
 #include <sys/types.h>
 #include <assert.h>
-#include <compiler.h>
+#include <magenta/compiler.h>
 #include <arch/arm64.h>
 
 typedef uint64_t pte_t;
@@ -318,20 +330,15 @@ __BEGIN_CDECLS
 
 #define ARM64_TLBI(op, val) \
 ({ \
-    __asm__ volatile("tlbi " #op ", %0" :: "r" (val)); \
+    __asm__ volatile("tlbi " #op ", %0" :: "r" ((uint64_t)(val))); \
     ISB; \
 })
 
 #define MMU_ARM64_GLOBAL_ASID (~0U)
 #define MMU_ARM64_USER_ASID (0U)
-int arm64_mmu_map(vaddr_t vaddr, paddr_t paddr, size_t size, pte_t attrs,
-                  vaddr_t vaddr_base, uint top_size_shift,
-                  uint top_index_shift, uint page_size_shift,
-                  pte_t *top_page_table, uint asid);
-int arm64_mmu_unmap(vaddr_t vaddr, size_t size,
-                    vaddr_t vaddr_base, uint top_size_shift,
-                    uint top_index_shift, uint page_size_shift,
-                    pte_t *top_page_table, uint asid);
+
+#define MMU_ARM64_ASID_BITS     (16U)
+
 
 __END_CDECLS
 #endif /* ASSEMBLY */

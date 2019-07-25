@@ -9,10 +9,11 @@ LOCAL_DIR := $(GET_LOCAL_DIR)
 MODULE := $(LOCAL_DIR)
 
 MODULE_DEPS += \
-    lib/gfx \
-    lib/gfxconsole
+    kernel/lib/gfx \
+    kernel/lib/gfxconsole \
+    third_party/lib/qrcodegen
 
 MODULE_SRCS += \
-	$(LOCAL_DIR)/udisplay.c
+	$(LOCAL_DIR)/udisplay.cpp
 
 include make/module.mk

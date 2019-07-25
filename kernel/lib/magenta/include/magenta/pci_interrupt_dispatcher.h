@@ -5,42 +5,38 @@
 // https://opensource.org/licenses/MIT
 
 #pragma once
+#if WITH_DEV_PCIE
 
-#include <dev/pcie.h>
-#include <kernel/event.h>
-#include <magenta/dispatcher.h>
+#include <dev/pcie_irqs.h>
+#include <magenta/interrupt_dispatcher.h>
 #include <magenta/pci_device_dispatcher.h>
 #include <sys/types.h>
 
 class PciDeviceDispatcher;
 
-class PciInterruptDispatcher final : public Dispatcher {
+class PciInterruptDispatcher final : public InterruptDispatcher {
 public:
-    static status_t Create(const utils::RefPtr<PciDeviceDispatcher::PciDeviceWrapper>& device,
+    static status_t Create(const mxtl::RefPtr<PciDeviceDispatcher::PciDeviceWrapper>& device,
                            uint32_t irq_id,
                            bool maskable,
                            mx_rights_t* out_rights,
-                           utils::RefPtr<Dispatcher>* out_interrupt);
+                           mxtl::RefPtr<Dispatcher>* out_interrupt);
 
     ~PciInterruptDispatcher() final;
-    mx_obj_type_t GetType() const final { return MX_OBJ_TYPE_PCI_INT; }
-    PciInterruptDispatcher* get_pci_interrupt_dispatcher() final { return this; }
-
-    // TODO(cpu): this should be removed when device waiting is refactored.
-    void Close();
-
-    status_t InterruptWait();
+    status_t InterruptComplete() final;
+    status_t UserSignal() final;
 
 private:
-    static pcie_irq_handler_retval_t IrqThunk(struct pcie_device_state* dev,
+    static pcie_irq_handler_retval_t IrqThunk(const PcieDevice& dev,
                                               uint irq_id,
                                               void* ctx);
-    PciInterruptDispatcher(uint32_t irq);
+    PciInterruptDispatcher(uint32_t irq_id, bool maskable)
+        : irq_id_(irq_id),
+          maskable_(maskable) { }
 
-    uint32_t irq_id_;
-    bool     maskable_;
-    event_t  event_;
-    mutex_t  lock_;
-    mutex_t  wait_lock_;
-    utils::RefPtr<PciDeviceDispatcher::PciDeviceWrapper> device_;
+    const uint32_t irq_id_;
+    const bool     maskable_;
+    mxtl::RefPtr<PciDeviceDispatcher::PciDeviceWrapper> device_;
 };
+
+#endif  // if WITH_DEV_PCIE

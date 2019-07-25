@@ -5,41 +5,25 @@
 # license that can be found in the LICENSE file or at
 # https://opensource.org/licenses/MIT
 
-# x86-32 toolchain
-ifeq ($(SUBARCH),x86-32)
-ifndef ARCH_x86_TOOLCHAIN_INCLUDED
-ARCH_x86_TOOLCHAIN_INCLUDED := 1
-
-ifndef ARCH_x86_TOOLCHAIN_PREFIX
-ARCH_x86_TOOLCHAIN_PREFIX := i386-elf-
-endif
-FOUNDTOOL=$(shell which $(ARCH_x86_TOOLCHAIN_PREFIX)gcc)
-
-ifeq ($(FOUNDTOOL),)
-$(error cannot find toolchain, please set ARCH_x86_TOOLCHAIN_PREFIX or add it to your path)
-endif
-
-endif
-endif
-
 # x86-64 toolchain
-ifeq ($(SUBARCH),x86-64)
 ifndef ARCH_x86_64_TOOLCHAIN_INCLUDED
 ARCH_x86_64_TOOLCHAIN_INCLUDED := 1
 
 ifndef ARCH_x86_64_TOOLCHAIN_PREFIX
 ARCH_x86_64_TOOLCHAIN_PREFIX := x86_64-elf-
 endif
-ifeq ($(CLANG),1)
-FOUNDTOOL=$(shell which $(ARCH_x86_64_TOOLCHAIN_PREFIX)clang)
-else
 FOUNDTOOL=$(shell which $(ARCH_x86_64_TOOLCHAIN_PREFIX)gcc)
-endif
 
 ifeq ($(FOUNDTOOL),)
 $(error cannot find toolchain, please set ARCH_x86_64_TOOLCHAIN_PREFIX or add it to your path)
 endif
 
-endif
-endif
+endif # ifndef ARCH_x86_64_TOOLCHAIN_INCLUDED
 
+# Clang
+ifeq ($(call TOBOOL,$(USE_CLANG)),true)
+FOUNDTOOL=$(shell which $(CLANG_TOOLCHAIN_PREFIX)clang)
+ifeq ($(FOUNDTOOL),)
+$(error cannot find toolchain, please set CLANG_TOOLCHAIN_PREFIX or add it to your path)
+endif
+endif # USE_CLANG==true

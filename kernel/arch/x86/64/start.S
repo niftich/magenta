@@ -12,12 +12,10 @@
 #include <arch/x86/descriptor.h>
 #include <arch/x86/mmu.h>
 #include <arch/x86/registers.h>
+#include <magenta/tls.h>
 
 /* shared code to set up a default 64bit page table structure */
 .macro page_table_init
-    /* load the physical pointer to the top level page table */
-    movl $PHYS(pml4), %eax
-
     /* Setting the First PML4E with a PDP table reference*/
     movl $PHYS(pdp), %eax
     orl  $X86_KERNEL_PD_FLAGS, %eax
@@ -86,17 +84,8 @@
 /* The magic number passed by a Multiboot-compliant boot loader. */
 #define MULTIBOOT_BOOTLOADER_MAGIC 0x2BADB002
 
-.section ".text.boot"
+.section .text.boot, "ax", @progbits
 .code32
-FUNCTION(_protected_start)
-    /* attempt to detect if %esi points to a zero page structure */
-    cmp $0, %esi
-    je .Lcommon_boot
-    cmpl $0x53726448, 0x202(%esi)
-    jne .Lcommon_boot
-    mov %esi, PHYS(_zero_page_boot_params)
-    jmp .Lcommon_boot
-
 FUNCTION(_multiboot_start)
     cmpl $MULTIBOOT_BOOTLOADER_MAGIC, %eax
     jne .Lcommon_boot
@@ -136,7 +125,7 @@ paging_setup:
     mov %eax, %cr4
 
     /* Long Mode Enabled at this point */
-    movl $X86_MSR_EFER, %ecx
+    movl $X86_MSR_IA32_EFER, %ecx
     rdmsr
     orl $X86_EFER_LME,%eax
     wrmsr
@@ -153,6 +142,9 @@ paging_setup:
     mov %cr0,  %eax
     btsl $(31), %eax
     mov %eax,  %cr0
+
+    /* Start using the magenta stack from its physical address. */
+    mov $PHYS(_kstack + 4096), %esp
 
     /* Using another long jump to be on 64 bit mode
     after this we will be on real 64 bit mode */
@@ -183,13 +175,25 @@ high_entry:
     lgdt _gdtr
 
     /* set up the idt */
-    mov $_idt, %rdi
+    mov $_idt_startup, %rdi
     call idt_setup
     lidt _idtr
 
     /* assign this core CPU# 0 and initialize its per cpu state */
-    mov $0, %rdi
+    xor %edi, %edi
     call x86_init_percpu
+
+    // Fill the stack canary with a random value as early as possible.
+    // This isn't done in x86_init_percpu because the hw_rng_get_entropy
+    // call would make it eligible for stack-guard checking itself.  But
+    // %gs is not set up yet in the prologue of the function, so it would
+    // crash if it tried to use the stack-guard.
+    call choose_stack_guard
+
+    // Move it into place.
+    mov %rcx, %gs:MX_TLS_STACK_GUARD_OFFSET
+    // Don't leak that value to other code.
+    xor %ecx, %ecx
 
     /* call the main module */
     call lk_main
@@ -201,10 +205,8 @@ high_entry:
 
     /* 64bit entry point from a secondary loader */
 .align 8
-.org 0x200
 FUNCTION(_entry64)
-    mov %esi, PHYS(_zero_page_boot_params)
-
+    mov %esi, PHYS(_bootdata_base)
     /* ensure the stack pointer is sane */
 
     /* This is enough space for the 2x push + lretq below.
@@ -220,6 +222,13 @@ FUNCTION(_entry64)
 .Lpaging_setup64:
     /* initialize the default page tables */
     page_table_init
+
+    /*
+     * Set PGE to enable global kernel pages
+     */
+    mov   %cr4, %rax
+    or    $(X86_CR4_PGE), %rax
+    mov   %rax, %cr4
 
     /* load the physical pointer to the top level page table */
     mov  $PHYS(pml4), %rax

@@ -9,48 +9,66 @@
 #include "vm_priv.h"
 #include <assert.h>
 #include <err.h>
+#include <inttypes.h>
 #include <kernel/auto_lock.h>
+#include <kernel/cmdline.h>
 #include <kernel/thread.h>
 #include <kernel/vm.h>
+#include <kernel/vm/vm_address_region.h>
 #include <kernel/vm/vm_object.h>
-#include <kernel/vm/vm_region.h>
-#include <lk/init.h>
-#include <new.h>
+#include <kernel/vm/vm_object_paged.h>
+#include <kernel/vm/vm_object_physical.h>
+#include <lib/crypto/global_prng.h>
+#include <lib/crypto/prng.h>
+#include <mxtl/auto_call.h>
+#include <mxtl/intrusive_double_list.h>
+#include <mxtl/type_support.h>
+#include <mxalloc/new.h>
+#include <safeint/safe_math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <trace.h>
-#include <utils/auto_call.h>
-#include <utils/intrusive_double_list.h>
-#include <utils/type_support.h>
+
+#if WITH_LIB_VDSO
+#include <lib/vdso.h>
+#endif
 
 #define LOCAL_TRACE MAX(VM_GLOBAL_TRACE, 0)
 
 // pointer to a singleton kernel address space
 VmAspace* VmAspace::kernel_aspace_ = nullptr;
 
+// pointer to the dummy root VMAR singleton
+static VmAddressRegion* dummy_root_vmar = nullptr;
+
 // list of all address spaces
 static mutex_t aspace_list_lock = MUTEX_INITIAL_VALUE(aspace_list_lock);
-static utils::DoublyLinkedList<VmAspace*> aspaces;
+static mxtl::DoublyLinkedList<VmAspace*> aspaces;
 
 // called once at boot to initialize the singleton kernel address space
 void VmAspace::KernelAspaceInitPreHeap() {
     // the singleton kernel address space
-    static VmAspace _kernel_aspace(KERNEL_ASPACE_BASE, KERNEL_ASPACE_SIZE, VmAspace::TYPE_KERNEL,
-                                   "kernel");
+    static VmAspace _kernel_aspace(KERNEL_ASPACE_BASE, KERNEL_ASPACE_SIZE, VmAspace::TYPE_KERNEL, "kernel");
+
+    // the singleton dummy root vmar (used to break a reference cycle in
+    // Destroy())
+    static VmAddressRegionDummy dummy_vmar;
+#if LK_DEBUGLEVEL > 1
+    _kernel_aspace.Adopt();
+    dummy_vmar.Adopt();
+#endif
+
+    dummy_root_vmar = &dummy_vmar;
+
+    static VmAddressRegion _kernel_root_vmar(_kernel_aspace);
+
+    _kernel_aspace.root_vmar_ = mxtl::AdoptRef(&_kernel_root_vmar);
+
     auto err = _kernel_aspace.Init();
     ASSERT(err >= 0);
 
-#if LK_DEBUGLEVEL > 0
-    _kernel_aspace.Adopt();
-#endif
-
     // save a pointer to the singleton kernel address space
     VmAspace::kernel_aspace_ = &_kernel_aspace;
-}
-
-void VmAspace::KernelAspaceInitPostCtors() {
-    // Now that global .ctors are guaranteed to have run, add the singleton
-    // kernel address space to the list of all address spaces.
     aspaces.push_front(kernel_aspace_);
 }
 
@@ -59,7 +77,7 @@ static inline bool is_inside(VmAspace& aspace, vaddr_t vaddr) {
     return (vaddr >= aspace.base() && vaddr <= aspace.base() + aspace.size() - 1);
 }
 
-static inline bool is_inside(VmAspace& aspace, VmRegion& r) {
+static inline bool is_inside(VmAspace& aspace, VmAddressRegion& r) {
     // is the starting address within the address space
     if (!is_inside(aspace, r.base()))
         return false;
@@ -103,7 +121,7 @@ static inline size_t trim_to_aspace(VmAspace& aspace, vaddr_t vaddr, size_t size
 }
 
 VmAspace::VmAspace(vaddr_t base, size_t size, uint32_t flags, const char* name)
-    : base_(base), size_(size), flags_(flags) {
+    : base_(base), size_(size), flags_(flags), root_vmar_(nullptr), aslr_prng_(nullptr, 0) {
 
     DEBUG_ASSERT(size != 0);
     DEBUG_ASSERT(base + size - 1 >= base);
@@ -114,17 +132,27 @@ VmAspace::VmAspace(vaddr_t base, size_t size, uint32_t flags, const char* name)
 }
 
 status_t VmAspace::Init() {
-    DEBUG_ASSERT(magic_ == MAGIC);
+    canary_.Assert();
 
     LTRACEF("%p '%s'\n", this, name_);
 
     // intialize the architectually specific part
     bool is_high_kernel = (flags_ & TYPE_MASK) == TYPE_KERNEL;
     uint arch_aspace_flags = is_high_kernel ? ARCH_ASPACE_FLAG_KERNEL : 0;
-    return arch_mmu_init_aspace(&arch_aspace_, base_, size_, arch_aspace_flags);
+    status_t status = arch_mmu_init_aspace(&arch_aspace_, base_, size_, arch_aspace_flags);
+    if (status != NO_ERROR) {
+        return status;
+    }
+
+    InitializeAslr();
+
+    if (likely(!root_vmar_)) {
+        return VmAddressRegion::CreateRoot(*this, VMAR_FLAG_CAN_MAP_SPECIFIC, &root_vmar_);
+    }
+    return NO_ERROR;
 }
 
-utils::RefPtr<VmAspace> VmAspace::Create(uint32_t flags, const char* name) {
+mxtl::RefPtr<VmAspace> VmAspace::Create(uint32_t flags, const char* name) {
     LTRACEF("flags 0x%x, name '%s'\n", flags, name);
 
     vaddr_t base;
@@ -147,7 +175,7 @@ utils::RefPtr<VmAspace> VmAspace::Create(uint32_t flags, const char* name) {
     }
 
     AllocChecker ac;
-    auto aspace = utils::AdoptRef(new (&ac) VmAspace(base, size, flags, name));
+    auto aspace = mxtl::AdoptRef(new (&ac) VmAspace(base, size, flags, name));
     if (!ac.check())
         return nullptr;
 
@@ -159,115 +187,73 @@ utils::RefPtr<VmAspace> VmAspace::Create(uint32_t flags, const char* name) {
 
     // add it to the global list
     {
-        AutoLock a(aspace_list_lock);
+        AutoLock a(&aspace_list_lock);
         aspaces.push_back(aspace.get());
     }
 
     // return a ref pointer to the aspace
-    return utils::move(aspace);
+    return mxtl::move(aspace);
 }
 
 void VmAspace::Rename(const char* name) {
-    DEBUG_ASSERT(magic_ == MAGIC);
+    canary_.Assert();
     strlcpy(name_, name ? name : "unnamed", sizeof(name_));
 }
 
 VmAspace::~VmAspace() {
-    DEBUG_ASSERT(magic_ == MAGIC);
+    canary_.Assert();
     LTRACEF("%p '%s'\n", this, name_);
 
     // we have to have already been destroyed before freeing
-    DEBUG_ASSERT(regions_.is_empty());
+    DEBUG_ASSERT(aspace_destroyed_);
 
     // pop it out of the global aspace list
     {
-        AutoLock a(aspace_list_lock);
+        AutoLock a(&aspace_list_lock);
         aspaces.erase(*this);
     }
 
     // destroy the arch portion of the aspace
+    // TODO(teisenbe): Move this to Destroy().  Currently can't move since
+    // ProcessDispatcher calls Destroy() from the context of a thread in the
+    // aspace.
     arch_mmu_destroy_aspace(&arch_aspace_);
+}
 
-    // clear the magic
-    magic_ = 0;
+mxtl::RefPtr<VmAddressRegion> VmAspace::RootVmar() {
+    AutoLock guard(&lock_);
+    mxtl::RefPtr<VmAddressRegion> ref(root_vmar_);
+    return mxtl::move(ref);
 }
 
 status_t VmAspace::Destroy() {
-    DEBUG_ASSERT(magic_ == MAGIC);
+    canary_.Assert();
     LTRACEF("%p '%s'\n", this, name_);
 
+    AutoLock guard(&lock_);
+
+#if WITH_LIB_VDSO
+    // Don't let a vDSO mapping prevent destroying a VMAR
+    // when the whole process is being destroyed.
+    vdso_code_mapping_.reset();
+#endif
+
     // tear down and free all of the regions in our address space
-    mutex_acquire(&lock_);
-    utils::RefPtr<VmRegion> r;
-    while ((r = regions_.pop_front()) != nullptr) {
-        r->Unmap();
-
-        mutex_release(&lock_);
-
-        // free any resources the region holds
-        r->Destroy();
-
-        // Explicitly release the reference.  We don't want to cause the object
-        // to destruct while in the lock.
-        r.reset();
-
-        mutex_acquire(&lock_);
+    status_t status = root_vmar_->DestroyLocked();
+    if (status != NO_ERROR && status != ERR_BAD_STATE) {
+        return status;
     }
+    aspace_destroyed_ = true;
 
-    mutex_release(&lock_);
+    // Break the reference cycle between this aspace and the root VMAR
+    root_vmar_.reset(dummy_root_vmar);
 
     return NO_ERROR;
 }
 
-// add a region to the appropriate spot in the address space list,
-// testing to see if there's a space
-status_t VmAspace::AddRegion(const utils::RefPtr<VmRegion>& r) {
-    DEBUG_ASSERT(magic_ == MAGIC);
-    DEBUG_ASSERT(r);
-
-    LTRACEF_LEVEL(2, "aspace %p base 0x%lx size 0x%zx r %p base 0x%lx size 0x%zx\n", this, base_,
-                  size_, r.get(), r->base(), r->size());
-
-    // only try if the region will at least fit in the address space
-    if (r->size() == 0 || !is_inside(*this, *r)) {
-        LTRACEF_LEVEL(2, "region was out of range\n");
-        return ERR_OUT_OF_RANGE;
-    }
-
-    // TODO(johngro) : The operation of finding a place for this region should
-    // be O(log).  Replace the O(n) linked list container used here with some
-    // form of O(log) container, when we have one.
-    //
-    // regions are sorted in ascending base address order.  If this region's
-    // base address is before the end of the last region's end, we will not
-    // find a place for it in the list.
-    vaddr_t r_end = r->base() + r->size() - 1;
-
-    // does it fit in front
-    auto iter = regions_.begin();
-    if ((iter == regions_.end()) || r_end < iter->base()) {
-        // empty list or not empty and fits before the first element
-        regions_.insert(iter, r);
-        return NO_ERROR;
-    }
-
-    do {
-        vaddr_t last_end = iter->base() + iter->size() - 1;
-        if (r->base() <= last_end)
-            break;
-
-        ++iter;
-
-        // Does this region fit before the next region?
-        if ((iter == regions_.end()) || (r_end < iter->base())) {
-            regions_.insert(iter, r);
-            return NO_ERROR;
-        }
-    } while (iter != regions_.end());
-
-
-    LTRACEF_LEVEL(2, "couldn't find spot\n");
-    return ERR_NO_MEMORY;
+bool VmAspace::is_destroyed() const {
+    AutoLock guard(&lock_);
+    return aspace_destroyed_;
 }
 
 //
@@ -275,164 +261,24 @@ status_t VmAspace::AddRegion(const utils::RefPtr<VmRegion>& r) {
 //
 //  Arch can override this to impose it's own restrictions.
 
-__WEAK vaddr_t arch_mmu_pick_spot(arch_aspace_t* aspace, vaddr_t base,
-                                  uint prev_region_arch_mmu_flags, vaddr_t end,
-                                  uint next_region_arch_mmu_flags, vaddr_t align, size_t size,
-                                  uint arch_mmu_flags) {
+__WEAK vaddr_t arch_mmu_pick_spot(const arch_aspace_t* aspace,
+                                  vaddr_t base, uint prev_region_mmu_flags,
+                                  vaddr_t end, uint next_region_mmu_flags,
+                                  vaddr_t align, size_t size, uint mmu_flags) {
     // just align it by default
     return ALIGN(base, align);
 }
 
-//
-//  Returns true if the caller has to stop search
+status_t VmAspace::MapObjectInternal(mxtl::RefPtr<VmObject> vmo, const char* name, uint64_t offset,
+                                     size_t size, void** ptr, uint8_t align_pow2, uint vmm_flags,
+                                     uint arch_mmu_flags) {
 
-bool VmAspace::CheckGap(const RegionList::iterator& prev,
-                        const RegionList::iterator& next,
-                        vaddr_t* pva, vaddr_t align, size_t region_size, uint arch_mmu_flags) {
-    vaddr_t gap_beg; // first byte of a gap
-    vaddr_t gap_end; // last byte of a gap
+    canary_.Assert();
+    LTRACEF("aspace %p name '%s' vmo %p, offset %#" PRIx64 " size %#zx "
+            "ptr %p align %hhu vmm_flags %#x arch_mmu_flags %#x\n",
+            this, name, vmo.get(), offset, size, ptr ? *ptr : 0, align_pow2, vmm_flags, arch_mmu_flags);
 
-    DEBUG_ASSERT(pva);
-
-    if (prev.IsValid())
-        gap_beg = prev->base() + prev->size();
-    else
-        gap_beg = base_;
-
-    if (next.IsValid()) {
-        if (gap_beg == next->base())
-            goto next_gap; // no gap between regions
-        gap_end = next->base() - 1;
-    } else {
-        if (gap_beg == (base_ + size_))
-            goto not_found; // no gap at the end of address space. Stop search
-        gap_end = base_ + size_ - 1;
-    }
-
-    *pva = arch_mmu_pick_spot(&arch_aspace(), gap_beg,
-                              prev.IsValid() ? prev->arch_mmu_flags() : ARCH_MMU_FLAG_INVALID,
-                              gap_end,
-                              next.IsValid() ? next->arch_mmu_flags() : ARCH_MMU_FLAG_INVALID,
-                              align, region_size, arch_mmu_flags);
-    if (*pva < gap_beg)
-        goto not_found; // address wrapped around
-
-    if (*pva < gap_end && ((gap_end - *pva + 1) >= region_size)) {
-        // we have enough room
-        return true; // found spot, stop search
-    }
-
-next_gap:
-    return false; // continue search
-
-not_found:
-    *pva = -1;
-    return true; // not_found: stop search
-}
-
-// search for a spot to allocate for a region of a given size, returning an
-// iterator to the region after it in the list.
-vaddr_t VmAspace::AllocSpot(size_t size, uint8_t align_pow2, uint arch_mmu_flags,
-                            RegionList::iterator* after) {
-    DEBUG_ASSERT(magic_ == MAGIC);
-    DEBUG_ASSERT(size > 0 && IS_PAGE_ALIGNED(size));
-
-    LTRACEF_LEVEL(2, "aspace %p size 0x%zx align %hhu\n", this, size, align_pow2);
-
-    if (align_pow2 < PAGE_SIZE_SHIFT)
-        align_pow2 = PAGE_SIZE_SHIFT;
-    vaddr_t align = 1UL << align_pow2;
-
-    vaddr_t spot;
-
-    // Find the first gap in the address space which can contain a region of the requested size.
-    auto before_iter = regions_.end();
-    auto after_iter  = regions_.begin();
-    do {
-        if (CheckGap(before_iter, after_iter, &spot, align, size, arch_mmu_flags)) {
-            if (after)
-                *after = after_iter;
-            return spot;
-        }
-
-        before_iter = after_iter++;
-    } while (before_iter.IsValid());
-
-    // couldn't find anything
-    return -1;
-}
-
-// allocate a region and insert it into the list
-utils::RefPtr<VmRegion> VmAspace::AllocRegion(const char* name, size_t size, vaddr_t vaddr,
-                                              uint8_t align_pow2, uint vmm_flags,
-                                              uint arch_mmu_flags) {
-    DEBUG_ASSERT(magic_ == MAGIC);
-    DEBUG_ASSERT(is_mutex_held(&lock_));
-    LTRACEF_LEVEL(2, "aspace %p name '%s' size 0x%zx vaddr 0x%lx\n", this, name, size, vaddr);
-
-    // make a region struct for it and stick it in the list
-    utils::RefPtr<VmRegion> r = VmRegion::Create(*this, vaddr, size, arch_mmu_flags, name);
-    if (!r)
-        return nullptr;
-
-    // if they ask us for a specific spot, put it there
-    if (vmm_flags & VMM_FLAG_VALLOC_SPECIFIC) {
-        DEBUG_ASSERT(IS_PAGE_ALIGNED(vaddr));
-
-        // stick it in the list, checking to see if it fits
-        if (AddRegion(r) < 0) {
-            // didn't fit
-            return nullptr;
-        }
-    } else {
-        // allocate a virtual slot for it
-        RegionList::iterator after;
-        vaddr = AllocSpot(size, align_pow2, arch_mmu_flags, &after);
-        LTRACEF_LEVEL(2, "alloc_spot returns 0x%lx, before %p\n", vaddr, after);
-
-        if (vaddr == (vaddr_t)-1) {
-            LTRACEF_LEVEL(2, "failed to find spot\n");
-            return nullptr;
-        }
-
-        r->set_base(vaddr);
-
-        // add it to the region list
-        regions_.insert(after, r);
-    }
-
-    return r;
-}
-
-// internal find region search routine
-utils::RefPtr<VmRegion> VmAspace::FindRegionLocked(vaddr_t vaddr) {
-    DEBUG_ASSERT(magic_ == MAGIC);
-    DEBUG_ASSERT(is_mutex_held(&lock_));
-
-    // search the region list
-    for (auto iter = regions_.begin(); iter != regions_.end(); ++iter) {
-        if ((vaddr >= iter->base()) && (vaddr <= iter->base() + iter->size() - 1))
-            return iter.CopyPointer();
-    }
-
-    return nullptr;
-}
-
-// return a ref pointer to a region
-utils::RefPtr<VmRegion> VmAspace::FindRegion(vaddr_t vaddr) {
-    AutoLock a(lock_);
-    return FindRegionLocked(vaddr);
-}
-
-status_t VmAspace::MapObject(utils::RefPtr<VmObject> vmo, const char* name, uint64_t offset,
-                             size_t size, void** ptr, uint8_t align_pow2, uint vmm_flags,
-                             uint arch_mmu_flags) {
-
-    DEBUG_ASSERT(magic_ == MAGIC);
-    LTRACEF(
-        "aspace %p name '%s' vmo %p, offset 0x%llx size 0x%zx ptr %p align %hhu vmm_flags 0x%x "
-        "arch_mmu_flags 0x%x\n",
-        this, name, vmo.get(), offset, size, ptr ? *ptr : 0, align_pow2, vmm_flags, arch_mmu_flags);
+    DEBUG_ASSERT(!is_user() || !(arch_mmu_flags & ARCH_MMU_FLAG_PERM_USER));
 
     size = ROUNDUP(size, PAGE_SIZE);
     if (size == 0)
@@ -442,31 +288,40 @@ status_t VmAspace::MapObject(utils::RefPtr<VmObject> vmo, const char* name, uint
     if (!IS_PAGE_ALIGNED(offset))
         return ERR_INVALID_ARGS;
 
-    vaddr_t vaddr = 0;
-    // if they're asking for a specific spot, copy the address
+    vaddr_t vmar_offset = 0;
+    // if they're asking for a specific spot or starting address, copy the address
     if (vmm_flags & VMM_FLAG_VALLOC_SPECIFIC) {
         // can't ask for a specific spot and then not provide one
         if (!ptr) {
             return ERR_INVALID_ARGS;
         }
-        vaddr = (vaddr_t)*ptr;
+        vmar_offset = reinterpret_cast<vaddr_t>(*ptr);
 
         // check that it's page aligned
-        if (!IS_PAGE_ALIGNED(vaddr))
+        if (!IS_PAGE_ALIGNED(vmar_offset) || vmar_offset < base_)
             return ERR_INVALID_ARGS;
+
+        vmar_offset -= base_;
     }
 
-    // hold the vmm lock for the rest of the function
-    AutoLock a(lock_);
+    uint32_t vmar_flags = 0;
+    if (vmm_flags & VMM_FLAG_VALLOC_SPECIFIC) {
+        vmar_flags |= VMAR_FLAG_SPECIFIC;
+    }
+
+    // Create the mappings with all of the CAN_* RWX flags, so that
+    // Protect() can transition them arbitrarily.  This is not desirable for the
+    // long-term.
+    vmar_flags |= VMAR_CAN_RWX_FLAGS;
 
     // allocate a region and put it in the aspace list
-    auto r = AllocRegion(name, size, vaddr, align_pow2, vmm_flags, arch_mmu_flags);
-    if (!r) {
-        return ERR_NO_MEMORY;
+    mxtl::RefPtr<VmMapping> r(nullptr);
+    status_t status = RootVmar()->CreateVmMapping(vmar_offset, size, align_pow2,
+                                                  vmar_flags,
+                                                  vmo, offset, arch_mmu_flags, name, &r);
+    if (status != NO_ERROR) {
+        return status;
     }
-
-    // associate the vm object with it
-    r->SetObject(utils::move(vmo), offset);
 
     // if we're committing it, map the region now
     if (vmm_flags & VMM_FLAG_COMMIT) {
@@ -483,8 +338,8 @@ status_t VmAspace::MapObject(utils::RefPtr<VmObject> vmo, const char* name, uint
 }
 
 status_t VmAspace::ReserveSpace(const char* name, size_t size, vaddr_t vaddr) {
-    DEBUG_ASSERT(magic_ == MAGIC);
-    LTRACEF("aspace %p name '%s' size 0x%zx vaddr 0x%lx\n", this, name, size, vaddr);
+    canary_.Assert();
+    LTRACEF("aspace %p name '%s' size %#zx vaddr %#" PRIxPTR "\n", this, name, size, vaddr);
 
     DEBUG_ASSERT(IS_PAGE_ALIGNED(vaddr));
     DEBUG_ASSERT(IS_PAGE_ALIGNED(size));
@@ -500,29 +355,31 @@ status_t VmAspace::ReserveSpace(const char* name, size_t size, vaddr_t vaddr) {
     // trim the size
     size = trim_to_aspace(*this, vaddr, size);
 
-    AutoLock a(lock_);
+    // allocate a zero length vm object to back it
+    // TODO: decide if a null vmo object is worth it
+    auto vmo = VmObjectPaged::Create(PMM_ALLOC_FLAG_ANY, 0);
+    if (!vmo)
+        return ERR_NO_MEMORY;
 
     // lookup how it's already mapped
     uint arch_mmu_flags = 0;
     auto err = arch_mmu_query(&arch_aspace_, vaddr, nullptr, &arch_mmu_flags);
     if (err) {
         // if it wasn't already mapped, use some sort of strict default
-        arch_mmu_flags =
-            ARCH_MMU_FLAG_CACHED | ARCH_MMU_FLAG_PERM_RO | ARCH_MMU_FLAG_PERM_NO_EXECUTE;
+        arch_mmu_flags = ARCH_MMU_FLAG_CACHED | ARCH_MMU_FLAG_PERM_READ;
     }
 
-    // build a new region structure without any backing vm object
-    auto r = AllocRegion(name, size, vaddr, 0, VMM_FLAG_VALLOC_SPECIFIC, arch_mmu_flags);
-
-    return r ? NO_ERROR : ERR_NO_MEMORY;
+    // map it, creating a new region
+    void* ptr = reinterpret_cast<void*>(vaddr);
+    return MapObjectInternal(mxtl::move(vmo), name, 0, size, &ptr, 0, VMM_FLAG_VALLOC_SPECIFIC,
+                             arch_mmu_flags);
 }
 
-status_t VmAspace::AllocPhysical(const char* name, size_t size, void** ptr, uint8_t align_log2,
+status_t VmAspace::AllocPhysical(const char* name, size_t size, void** ptr, uint8_t align_pow2,
                                  paddr_t paddr, uint vmm_flags, uint arch_mmu_flags) {
-    DEBUG_ASSERT(magic_ == MAGIC);
-    LTRACEF(
-        "aspace %p name '%s' size 0x%zx ptr %p paddr 0x%lx vmm_flags 0x%x arch_mmu_flags 0x%x\n",
-        this, name, size, ptr ? *ptr : 0, paddr, vmm_flags, arch_mmu_flags);
+    canary_.Assert();
+    LTRACEF("aspace %p name '%s' size %#zx ptr %p paddr %#" PRIxPTR " vmm_flags 0x%x arch_mmu_flags 0x%x\n",
+            this, name, size, ptr ? *ptr : 0, paddr, vmm_flags, arch_mmu_flags);
 
     DEBUG_ASSERT(IS_PAGE_ALIGNED(paddr));
 
@@ -533,52 +390,29 @@ status_t VmAspace::AllocPhysical(const char* name, size_t size, void** ptr, uint
 
     size = ROUNDUP_PAGE_SIZE(size);
 
-    // test for invalid flags
-    if (vmm_flags & VMM_FLAG_COMMIT)
+    // create a vm object to back it
+    auto vmo = VmObjectPhysical::Create(paddr, size);
+    if (!vmo)
+        return ERR_NO_MEMORY;
+
+    // force it to be mapped up front
+    // TODO: add new flag to precisely mean pre-map
+    vmm_flags |= VMM_FLAG_COMMIT;
+
+    // Apply the cache policy
+    if (vmo->SetMappingCachePolicy(arch_mmu_flags & ARCH_MMU_FLAG_CACHE_MASK) != NO_ERROR)
         return ERR_INVALID_ARGS;
 
-    vaddr_t vaddr = 0;
-
-    // if they're asking for a specific spot, copy the address
-    if (vmm_flags & VMM_FLAG_VALLOC_SPECIFIC) {
-        // can't ask for a specific spot and then not provide one
-        if (!ptr) {
-            return ERR_INVALID_ARGS;
-        }
-        vaddr = reinterpret_cast<vaddr_t>(*ptr);
-
-        // check that it's page aligned
-        if (!IS_PAGE_ALIGNED(vaddr))
-            return ERR_INVALID_ARGS;
-    }
-
-    AutoLock a(lock_);
-
-    // allocate a region and put it in the aspace list
-    auto r = AllocRegion(name, size, vaddr, align_log2, vmm_flags, arch_mmu_flags);
-    if (!r) {
-        return ERR_NO_MEMORY;
-    }
-
-    // map memory physically
-    auto err = r->MapPhysicalRange(0, size, paddr, false);
-    if (err < 0) {
-        // TODO: remove the region from the aspace
-        return err;
-    }
-
-    // return the vaddr if requested
-    if (ptr)
-        *ptr = reinterpret_cast<void*>(r->base());
-
-    return NO_ERROR;
+    arch_mmu_flags &= ~ARCH_MMU_FLAG_CACHE_MASK;
+    return MapObjectInternal(mxtl::move(vmo), name, 0, size, ptr, align_pow2, vmm_flags,
+                     arch_mmu_flags);
 }
 
 status_t VmAspace::AllocContiguous(const char* name, size_t size, void** ptr, uint8_t align_pow2,
                                    uint vmm_flags, uint arch_mmu_flags) {
-    DEBUG_ASSERT(magic_ == MAGIC);
-    LTRACEF("aspace %p name '%s' size 0x%zx ptr %p align %hhu vmm_flags 0x%x arch_mmu_flags 0x%x\n",
-            this, name, size, ptr ? *ptr : 0, align_pow2, vmm_flags, arch_mmu_flags);
+    canary_.Assert();
+    LTRACEF("aspace %p name '%s' size 0x%zx ptr %p align %hhu vmm_flags 0x%x arch_mmu_flags 0x%x\n", this,
+            name, size, ptr ? *ptr : 0, align_pow2, vmm_flags, arch_mmu_flags);
 
     size = ROUNDUP(size, PAGE_SIZE);
     if (size == 0)
@@ -589,78 +423,88 @@ status_t VmAspace::AllocContiguous(const char* name, size_t size, void** ptr, ui
         return ERR_INVALID_ARGS;
 
     // create a vm object to back it
-    auto vmo = VmObject::Create(PMM_ALLOC_FLAG_ANY, size);
+    auto vmo = VmObjectPaged::Create(PMM_ALLOC_FLAG_ANY, size);
     if (!vmo)
         return ERR_NO_MEMORY;
 
     // always immediately commit memory to the object
-    int64_t committed = vmo->CommitRangeContiguous(0, size, align_pow2);
-    if (committed < 0 || (size_t)committed < size) {
+    uint64_t committed;
+    auto status = vmo->CommitRangeContiguous(0, size, &committed, align_pow2);
+    if (status < 0)
+        return status;
+    if (static_cast<size_t>(committed) < size) {
         LTRACEF("failed to allocate enough pages (asked for %zu, got %zu)\n", size / PAGE_SIZE,
-                (size_t)committed / PAGE_SIZE);
+                static_cast<size_t>(committed) / PAGE_SIZE);
         return ERR_NO_MEMORY;
     }
 
-    return MapObject(utils::move(vmo), name, 0, size, ptr, align_pow2, vmm_flags, arch_mmu_flags);
+    return MapObjectInternal(mxtl::move(vmo), name, 0, size, ptr, align_pow2, vmm_flags,
+                     arch_mmu_flags);
 }
 
 status_t VmAspace::Alloc(const char* name, size_t size, void** ptr, uint8_t align_pow2,
                          uint vmm_flags, uint arch_mmu_flags) {
-    DEBUG_ASSERT(magic_ == MAGIC);
-    LTRACEF("aspace %p name '%s' size 0x%zx ptr %p align %hhu vmm_flags 0x%x arch_mmu_flags 0x%x\n",
-            this, name, size, ptr ? *ptr : 0, align_pow2, vmm_flags, arch_mmu_flags);
+    canary_.Assert();
+    LTRACEF("aspace %p name '%s' size 0x%zx ptr %p align %hhu vmm_flags 0x%x arch_mmu_flags 0x%x\n", this,
+            name, size, ptr ? *ptr : 0, align_pow2, vmm_flags, arch_mmu_flags);
 
     size = ROUNDUP(size, PAGE_SIZE);
     if (size == 0)
         return ERR_INVALID_ARGS;
 
     // allocate a vm object to back it
-    auto vmo = VmObject::Create(PMM_ALLOC_FLAG_ANY, size);
+    auto vmo = VmObjectPaged::Create(PMM_ALLOC_FLAG_ANY, size);
     if (!vmo)
         return ERR_NO_MEMORY;
 
     // commit memory up front if requested
     if (vmm_flags & VMM_FLAG_COMMIT) {
         // commit memory to the object
-        int64_t committed = vmo->CommitRange(0, size);
-        if (committed < 0 || (size_t)committed < size) {
+        uint64_t committed;
+        auto status = vmo->CommitRange(0, size, &committed);
+        if (status < 0)
+            return status;
+        if (static_cast<size_t>(committed) < size) {
             LTRACEF("failed to allocate enough pages (asked for %zu, got %zu)\n", size / PAGE_SIZE,
-                    (size_t)committed / PAGE_SIZE);
+                    static_cast<size_t>(committed) / PAGE_SIZE);
             return ERR_NO_MEMORY;
         }
     }
 
     // map it, creating a new region
-    return MapObject(utils::move(vmo), name, 0, size, ptr, align_pow2, vmm_flags, arch_mmu_flags);
+    return MapObjectInternal(mxtl::move(vmo), name, 0, size, ptr, align_pow2, vmm_flags,
+                     arch_mmu_flags);
 }
 
-status_t VmAspace::FreeRegion(vaddr_t vaddr) {
-    DEBUG_ASSERT(magic_ == MAGIC);
-    LTRACEF("vaddr 0x%lx\n", vaddr);
+status_t VmAspace::FreeRegion(vaddr_t va) {
+    DEBUG_ASSERT(!is_user());
 
-    utils::RefPtr<VmRegion> r;
-    {
-        AutoLock a(lock_);
-
-        r = FindRegionLocked(vaddr);
-        if (!r)
-            return ERR_NOT_FOUND;
-
-        // remove it from the address space list
-        regions_.erase(*r);
-
-        // unmap it
-        r->Unmap();
+    mxtl::RefPtr<VmAddressRegionOrMapping> r = RootVmar()->FindRegion(va);
+    if (!r) {
+        return ERR_NOT_FOUND;
     }
 
-    // destroy the region
-    r->Destroy();
+    return r->Destroy();
+}
 
-    return NO_ERROR;
+mxtl::RefPtr<VmAddressRegionOrMapping> VmAspace::FindRegion(vaddr_t va) {
+    mxtl::RefPtr<VmAddressRegion> vmar(RootVmar());
+    while (1) {
+        mxtl::RefPtr<VmAddressRegionOrMapping> next(vmar->FindRegion(va));
+        if (!next) {
+            return vmar;
+        }
+
+        if (next->is_mapping()) {
+            return next;
+        }
+
+        vmar = next->as_vm_address_region();
+    }
 }
 
 void VmAspace::AttachToThread(thread_t* t) {
-    DEBUG_ASSERT(magic_ == MAGIC);
+    canary_.Assert();
     DEBUG_ASSERT(t);
 
     // point the lk thread at our object via the dummy C vmm_aspace_t struct
@@ -675,36 +519,74 @@ void VmAspace::AttachToThread(thread_t* t) {
 }
 
 status_t VmAspace::PageFault(vaddr_t va, uint flags) {
-    DEBUG_ASSERT(magic_ == MAGIC);
-    LTRACEF("va 0x%lx, flags 0x%x\n", va, flags);
+    canary_.Assert();
+    DEBUG_ASSERT(!aspace_destroyed_);
+    LTRACEF("va %#" PRIxPTR ", flags %#x\n", va, flags);
 
     // for now, hold the aspace lock across the page fault operation,
     // which stops any other operations on the address space from moving
     // the region out from underneath it
-    AutoLock a(lock_);
+    AutoLock a(&lock_);
 
-    auto r = FindRegionLocked(va);
-    if (unlikely(!r))
-        return ERR_NOT_FOUND;
-
-    return r->PageFault(va, flags);
+    return root_vmar_->PageFault(va, flags);
 }
 
-void VmAspace::Dump() const {
-    DEBUG_ASSERT(magic_ == MAGIC);
-    printf("aspace %p: ref %u name '%s' range 0x%lx - 0x%lx size 0x%zx flags 0x%x\n", this,
-           ref_count_debug(), name_, base_, base_ + size_ - 1, size_, flags_);
+void VmAspace::Dump(bool verbose) const {
+    canary_.Assert();
+    printf("as %p [%#" PRIxPTR " %#" PRIxPTR "] sz %#zx fl %#x ref %d '%s'\n", this,
+           base_, base_ + size_ - 1, size_, flags_, ref_count_debug(), name_);
 
-    printf("regions:\n");
-    AutoLock a(lock_);
-    for (const auto& r : regions_) {
-        r.Dump();
+    AutoLock a(&lock_);
+
+    if (verbose)
+        root_vmar_->Dump(1, verbose);
+}
+
+bool VmAspace::EnumerateChildren(VmEnumerator* ve) {
+    canary_.Assert();
+    DEBUG_ASSERT(ve != nullptr);
+    AutoLock a(&lock_);
+    if (root_vmar_ == nullptr || aspace_destroyed_) {
+        // Aspace hasn't been initialized or has already been destroyed.
+        return true;
     }
+    DEBUG_ASSERT(root_vmar_->IsAliveLocked());
+    if (!ve->OnVmAddressRegion(root_vmar_.get(), 0)) {
+        return false;
+    }
+    return root_vmar_->EnumerateChildrenLocked(ve, 1);
 }
 
-void DumpAllAspaces() {
-    AutoLock a(aspace_list_lock);
+void DumpAllAspaces(bool verbose) {
+    AutoLock a(&aspace_list_lock);
 
     for (const auto& a : aspaces)
-        a.Dump();
+        a.Dump(verbose);
 }
+
+// TODO(dbort): Use GetMemoryUsage()
+size_t VmAspace::AllocatedPages() const {
+    canary_.Assert();
+
+    AutoLock a(&lock_);
+    return root_vmar_->AllocatedPagesLocked();
+}
+
+void VmAspace::InitializeAslr() {
+    aslr_enabled_ = is_user() && !cmdline_get_bool("aslr.disable", false);
+
+    crypto::GlobalPRNG::GetInstance()->Draw(aslr_seed_, sizeof(aslr_seed_));
+    aslr_prng_.AddEntropy(aslr_seed_, sizeof(aslr_seed_));
+}
+
+#if WITH_LIB_VDSO
+uintptr_t VmAspace::vdso_base_address() const {
+    AutoLock a(&lock_);
+    return VDso::base_address(vdso_code_mapping_);
+}
+
+uintptr_t VmAspace::vdso_code_address() const {
+    AutoLock a(&lock_);
+    return vdso_code_mapping_ ? vdso_code_mapping_->base() : 0;
+}
+#endif

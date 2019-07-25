@@ -1,143 +1,164 @@
-// Copyright 2016 The Fuchsia Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
 
+#include <ddk/binding.h>
 #include <ddk/device.h>
 #include <ddk/driver.h>
 #include <ddk/protocol/pci.h>
 
 #include <hw/pci.h>
 #include <magenta/syscalls.h>
-#include <magenta/syscalls-ddk.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
-#include <system/compiler.h>
+#include <magenta/compiler.h>
 
 #include "kpci-private.h"
 
+#include "protocol.c"
+
 // kpci is a driver that communicates with the kernel to publish a list of pci devices.
 
-static mx_device_t* kpci_root_dev;
-
-extern pci_protocol_t _pci_protocol;
-
-static mx_status_t kpci_release(mx_device_t* dev) {
-    kpci_device_t* device = get_kpci_device(dev);
-    mx_handle_close(device->handle);
+static void kpci_release(void* ctx) {
+    kpci_device_t* device = ctx;
+    if (device->handle != MX_HANDLE_INVALID) {
+        mx_handle_close(device->handle);
+    }
     free(device);
-    return NO_ERROR;
 }
 
 static mx_protocol_device_t kpci_device_proto = {
+    .version = DEVICE_OPS_VERSION,
     .release = kpci_release,
 };
 
-static mx_status_t kpci_init_child(mx_driver_t* drv, mx_device_t** out, uint32_t index) {
-    mx_pcie_get_nth_info_t info;
+// initializes and optionally adds a new child device
+// device will be added if parent is not NULL
+static mx_status_t kpci_init_child(mx_device_t* parent, uint32_t index, bool save_handle,
+                                   mx_device_t** out) {
+    mx_pcie_device_info_t info;
 
-    mx_handle_t handle = mx_pci_get_nth_device(index, &info);
+    mx_handle_t handle = mx_pci_get_nth_device(get_root_resource(), index, &info);
     if (handle < 0) {
         return handle;
     }
 
     kpci_device_t* device = calloc(1, sizeof(kpci_device_t));
-    mx_status_t status = ERR_NO_MEMORY;
-    if (!device)
-        goto finished;
+    if (!device) {
+        mx_handle_close(handle);
+        return ERR_NO_MEMORY;
+    }
+    memcpy(&device->info, &info, sizeof(info));
+    if (save_handle) {
+        device->handle = handle;
+    } else {
+        mx_handle_close(handle);
+        handle = MX_HANDLE_INVALID;
+    }
+    device->index = index;
 
     char name[20];
     snprintf(name, sizeof(name), "%02x:%02x:%02x", info.bus_id, info.dev_id, info.func_id);
-    status = device_init(&device->device, drv, name, &kpci_device_proto);
-    if (status != NO_ERROR)
-        goto finished;
 
-    device->device.protocol_id = MX_PROTOCOL_PCI;
-    device->device.protocol_ops = &_pci_protocol;
-    device->handle = handle;
-    device->index = index;
-    *out = &device->device;
+    mx_device_prop_t device_props[] = {
+        (mx_device_prop_t){ BIND_PROTOCOL, 0, MX_PROTOCOL_PCI },
+        (mx_device_prop_t){ BIND_PCI_VID, 0, info.vendor_id },
+        (mx_device_prop_t){ BIND_PCI_DID, 0, info.device_id },
+        (mx_device_prop_t){ BIND_PCI_CLASS, 0, info.base_class },
+        (mx_device_prop_t){ BIND_PCI_SUBCLASS, 0, info.sub_class },
+        (mx_device_prop_t){ BIND_PCI_INTERFACE, 0, info.program_interface },
+        (mx_device_prop_t){ BIND_PCI_REVISION, 0, info.revision_id },
+        (mx_device_prop_t){ BIND_PCI_BDF_ADDR, 0, BIND_PCI_BDF_PACK(info.bus_id,
+                                                                    info.dev_id,
+                                                                    info.func_id) },
+    };
 
-    device->props[0] = (mx_device_prop_t){ BIND_PROTOCOL, 0, MX_PROTOCOL_PCI };
-    device->props[1] = (mx_device_prop_t){ BIND_PCI_VID, 0, info.vendor_id };
-    device->props[2] = (mx_device_prop_t){ BIND_PCI_DID, 0, info.device_id };
-    device->props[3] = (mx_device_prop_t){ BIND_PCI_CLASS, 0, info.base_class };
-    device->props[4] = (mx_device_prop_t){ BIND_PCI_SUBCLASS, 0, info.sub_class };
-    device->props[5] = (mx_device_prop_t){ BIND_PCI_INTERFACE, 0, info.program_interface };
-    device->props[6] = (mx_device_prop_t){ BIND_PCI_REVISION, 0, info.revision_id };
-    device->device.props = device->props;
-    device->device.prop_count = countof(device->props);
+    static_assert(sizeof(device_props) == sizeof(device->props),
+                 "Invalid number of PCI properties in kpci_device_t!");
 
-    memcpy(&device->info, &info, sizeof(info));
-finished:
-    if (status != NO_ERROR) {
-        if (device)
-            free(device);
-        if (handle >= 0)
-            mx_handle_close(handle);
+    memcpy(device->props, device_props, sizeof(device->props));
+
+    mx_status_t status;
+    if (parent) {
+        char busdev_args[64];
+        snprintf(busdev_args, sizeof(busdev_args),
+                 "pci#%u:%04x:%04x,%u", index,
+                 info.vendor_id, info.device_id, index);
+
+        device_add_args_t args = {
+            .version = DEVICE_ADD_ARGS_VERSION,
+            .name = name,
+            .ctx = device,
+            .ops = &kpci_device_proto,
+            .proto_id = MX_PROTOCOL_PCI,
+            .proto_ops = &_pci_protocol,
+            .props = device->props,
+            .prop_count = countof(device->props),
+            .busdev_args = busdev_args,
+            .rsrc = MX_HANDLE_INVALID,
+            .flags = DEVICE_ADD_BUSDEV,
+        };
+
+        status = device_add(parent, &args, &device->mxdev);
+    } else {
+        return ERR_BAD_STATE;
     }
+
+    if (status == NO_ERROR) {
+        *out = device->mxdev;
+    } else {
+        if (handle != MX_HANDLE_INVALID) {
+            mx_handle_close(handle);
+        }
+        free(device);
+    }
+
     return status;
 }
 
-static mx_status_t kpci_init_children(mx_driver_t* drv, mx_device_t* parent) {
+static mx_status_t kpci_drv_bind(void* ctx, mx_device_t* parent, void** cookie) {
+    mx_status_t status;
+    mx_device_t* pcidev;
+
+    device_add_args_t args = {
+        .version = DEVICE_ADD_ARGS_VERSION,
+        .name = "pci",
+        .ops =  &kpci_device_proto,
+        .flags = DEVICE_ADD_NON_BINDABLE,
+    };
+
+    if ((status = device_add(parent, &args, &pcidev)) < 0) {
+        return status;
+    }
     for (uint32_t index = 0;; index++) {
-        mx_device_t* device;
-        if (kpci_init_child(drv, &device, index) != NO_ERROR) {
+        mx_device_t* dev;
+        // don't hang onto the PCI handle - we don't need it any more
+        if (kpci_init_child(pcidev, index, false, &dev) != NO_ERROR) {
             break;
         }
-        device_add(device, parent);
     }
-
     return NO_ERROR;
 }
 
-static mx_status_t kpci_drv_init(mx_driver_t* drv) {
-    mx_status_t status;
-
-    if ((status = device_create(&kpci_root_dev, drv, "pci", &kpci_device_proto))) {
-        return status;
+static mx_status_t kpci_drv_create(void* ctx, mx_device_t* parent,
+                                   const char* name, const char* args, mx_handle_t resource) {
+    if (resource != MX_HANDLE_INVALID) {
+        mx_handle_close(resource);
     }
-
-    // make the pci root non-bindable
-    device_set_bindable(kpci_root_dev, false);
-
-    if (device_add(kpci_root_dev, NULL) < 0) {
-        free(kpci_root_dev);
-        return NO_ERROR;
-    } else {
-        return kpci_init_children(drv, kpci_root_dev);
-    }
+    uint32_t index = strtoul(args, NULL, 10);
+    mx_device_t* dev;
+    return kpci_init_child(parent, index, true, &dev);
 }
 
-mx_driver_t _driver_kpci BUILTIN_DRIVER = {
-    .name = "pci",
-    .ops = {
-        .init = kpci_drv_init,
-    },
+static mx_driver_ops_t kpci_driver_ops = {
+    .version = DRIVER_OPS_VERSION,
+    .bind = kpci_drv_bind,
+    .create = kpci_drv_create,
 };
 
-mx_status_t devmgr_create_pcidev(mx_device_t** out, uint32_t index) {
-    return kpci_init_child(&_driver_kpci, out, index);
-}
-
-int devmgr_get_pcidev_index(mx_device_t* dev, uint16_t* vid, uint16_t* did) {
-    if (dev->parent == kpci_root_dev) {
-        kpci_device_t* pcidev = get_kpci_device(dev);
-        *vid = pcidev->info.vendor_id;
-        *did = pcidev->info.device_id;
-        return (int)pcidev->index;
-    } else {
-        return -1;
-    }
-}
+MAGENTA_DRIVER_BEGIN(pci, kpci_driver_ops, "magenta", "0.1", 1)
+    BI_MATCH_IF(EQ, BIND_PROTOCOL, MX_PROTOCOL_ROOT),
+MAGENTA_DRIVER_END(pci)

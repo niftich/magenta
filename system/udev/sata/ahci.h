@@ -1,16 +1,6 @@
-// Copyright 2016 The Fuchsia Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
 
 #pragma once
 
@@ -20,7 +10,8 @@
 
 #define AHCI_MAX_PORTS    32
 #define AHCI_MAX_COMMANDS 32
-#define AHCI_MAX_PRDS     128 // just a random choice, hardware max is 64k-1
+#define AHCI_MAX_PRDS     8192 // for 32M max xfer size for fully discontiguous iotxn,
+                               // hardware max is 64k-1
 
 #define AHCI_PRD_MAX_SIZE 0x400000 // 4mb
 
@@ -28,7 +19,7 @@
 #define AHCI_PORT_INT_TFE (1 << 30)
 #define AHCI_PORT_INT_HBF (1 << 29)
 #define AHCI_PORT_INT_HBD (1 << 28)
-#define AHCI_PORT_INT_IF  (1 << 28)
+#define AHCI_PORT_INT_IF  (1 << 27)
 #define AHCI_PORT_INT_INF (1 << 26)
 #define AHCI_PORT_INT_OF  (1 << 24)
 #define AHCI_PORT_INT_IPM (1 << 23)
@@ -94,9 +85,10 @@ typedef struct {
     uint32_t vendor[4];     // vendor specific
 } __attribute__((packed)) ahci_port_reg_t;
 
-#define AHCI_GHC_HR (1 << 0)
-#define AHCI_GHC_IE (1 << 1)
-#define AHCI_GHC_AE (1 << 31)
+#define AHCI_CAP_NCQ (1 << 30)
+#define AHCI_GHC_HR  (1 << 0)
+#define AHCI_GHC_IE  (1 << 1)
+#define AHCI_GHC_AE  (1 << 31)
 
 typedef struct {
     uint32_t cap;              // host capabilities
@@ -166,5 +158,3 @@ static_assert(sizeof(ahci_cl_t) == 0x20, "unexpected command list size");
 static_assert(sizeof(ahci_fis_t) == 0x100, "unexpected fis size");
 static_assert(sizeof(ahci_ct_t) == 0x80, "unexpected command table header size");
 static_assert(sizeof(ahci_prd_t) == 0x10, "unexpected prd entry size");
-
-void ahci_iotxn_queue(mx_device_t* dev, iotxn_t* txn);

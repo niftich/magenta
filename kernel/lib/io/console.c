@@ -44,9 +44,7 @@ void __kernel_serial_write(const char *str, size_t len) {
     spin_lock_saved_state_t state;
     spin_lock_save(&dputc_spin_lock, &state, PRINT_LOCK_FLAGS);
     /* write out the serial port */
-    for (size_t i = 0; i < len; i++) {
-        platform_dputc(str[i]);
-    }
+    platform_dputs(str, len);
     spin_unlock_restore(&dputc_spin_lock, state, PRINT_LOCK_FLAGS);
 }
 
@@ -90,13 +88,20 @@ static void __kernel_stdout_write(const char *str, size_t len)
 static void __kernel_stdout_write_buffered(const char *str, size_t len) {
     thread_t *t = get_current_thread();
 
-    if (t == NULL) {
+    if (unlikely(t == NULL)) {
         __kernel_stdout_write(str, len);
         return;
     }
 
     char *buf = t->linebuffer;
     size_t pos = t->linebuffer_pos;
+
+    // look for corruption and don't continue
+    if (unlikely(!is_kernel_address((uintptr_t)buf) || pos >= THREAD_LINEBUFFER_LENGTH)) {
+        const char *str = "<linebuffer corruption>\n";
+        __kernel_stdout_write(str, strlen(str));
+        return;
+    }
 
     while (len-- > 0) {
         char c = *str++;
@@ -137,7 +142,7 @@ void unregister_print_callback(print_callback_t *cb)
     spin_unlock_restore(&print_spin_lock, state, PRINT_LOCK_FLAGS);
 }
 
-static ssize_t __debug_stdio_write(io_handle_t *io, const char *s, size_t len)
+int __printf_output_func(const char *s, size_t len, void *state)
 {
 #if WITH_DEBUG_LINEBUFFER
     __kernel_stdout_write_buffered(s, len);
@@ -147,22 +152,3 @@ static ssize_t __debug_stdio_write(io_handle_t *io, const char *s, size_t len)
     return len;
 }
 
-static ssize_t __debug_stdio_read(io_handle_t *io, char *s, size_t len)
-{
-    if (len == 0)
-        return 0;
-
-    int err = platform_dgetc(s, true);
-    if (err < 0)
-        return err;
-
-    return 1;
-}
-
-/* global console io handle */
-static const io_handle_hooks_t console_io_hooks = {
-    .write  = __debug_stdio_write,
-    .read   = __debug_stdio_read,
-};
-
-io_handle_t console_io = IO_HANDLE_INITIAL_VALUE(&console_io_hooks);

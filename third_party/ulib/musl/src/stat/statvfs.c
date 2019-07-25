@@ -1,31 +1,25 @@
 #include "libc.h"
-#include "syscall.h"
+#include <errno.h>
 #include <sys/statfs.h>
 #include <sys/statvfs.h>
 
 int __statfs(const char* path, struct statfs* buf) {
-    *buf = (struct statfs){0};
-#ifdef SYS_statfs64
-    return syscall(SYS_statfs64, path, sizeof *buf, buf);
-#else
-    return syscall(SYS_statfs, path, buf);
-#endif
+    *buf = (struct statfs){};
+    errno = ENOSYS;
+    return -1;
 }
 
 int __fstatfs(int fd, struct statfs* buf) {
-    *buf = (struct statfs){0};
-#ifdef SYS_fstatfs64
-    return syscall(SYS_fstatfs64, fd, sizeof *buf, buf);
-#else
-    return syscall(SYS_fstatfs, fd, buf);
-#endif
+    *buf = (struct statfs){};
+    errno = ENOSYS;
+    return -1;
 }
 
 weak_alias(__statfs, statfs);
 weak_alias(__fstatfs, fstatfs);
 
 static void fixup(struct statvfs* out, const struct statfs* in) {
-    *out = (struct statvfs){0};
+    *out = (struct statvfs){};
     out->f_bsize = in->f_bsize;
     out->f_frsize = in->f_frsize ? in->f_frsize : in->f_bsize;
     out->f_blocks = in->f_blocks;

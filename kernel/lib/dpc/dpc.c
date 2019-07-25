@@ -23,6 +23,9 @@ status_t dpc_queue(dpc_t *dpc, bool reschedule)
     DEBUG_ASSERT(dpc);
     DEBUG_ASSERT(dpc->func);
 
+    if (list_in_list(&dpc->node))
+        return NO_ERROR;
+
     spin_lock_saved_state_t state;
     spin_lock_irqsave(&dpc_lock, state);
 
@@ -34,7 +37,27 @@ status_t dpc_queue(dpc_t *dpc, bool reschedule)
 
     // reschedule here if asked to
     if (reschedule)
-        thread_yield();
+        thread_preempt(false);
+
+    return NO_ERROR;
+}
+
+status_t dpc_queue_thread_locked(dpc_t *dpc)
+{
+    DEBUG_ASSERT(dpc);
+    DEBUG_ASSERT(dpc->func);
+
+    if (list_in_list(&dpc->node))
+        return NO_ERROR;
+
+    spin_lock_saved_state_t state;
+    spin_lock_irqsave(&dpc_lock, state);
+
+    // put the dpc at the tail of the list and signal the worker
+    list_add_tail(&dpc_list, &dpc->node);
+    event_signal_thread_locked(&dpc_event);
+
+    spin_unlock_irqrestore(&dpc_lock, state);
 
     return NO_ERROR;
 }

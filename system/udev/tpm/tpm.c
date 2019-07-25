@@ -1,18 +1,6 @@
-//
-// Copyright 2016 The Fuchsia Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-//
+// Copyright 2016 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
 
 /*
  * Very basic TPM driver
@@ -26,17 +14,16 @@
 
 #include <assert.h>
 #include <endian.h>
+#include <ddk/binding.h>
 #include <ddk/device.h>
 #include <ddk/driver.h>
-#include <ddk/protocol/tpm.h>
+#include <magenta/device/tpm.h>
 #include <magenta/syscalls.h>
-#include <magenta/syscalls-ddk.h>
 #include <magenta/types.h>
-#include <runtime/mutex.h>
-#include <runtime/thread.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <threads.h>
 
 #include "tpm.h"
 #include "tpm-commands.h"
@@ -48,7 +35,7 @@
 // that we need to allocate.
 #define MAX_RAND_BYTES 256
 
-mxr_mutex_t tpm_lock = MXR_MUTEX_INIT;
+mtx_t tpm_lock = MTX_INIT;
 void *tpm_base;
 mx_handle_t irq_handle;
 
@@ -65,7 +52,7 @@ static ssize_t tpm_get_random(mx_device_t* dev, void* buf, size_t count) {
         return ERR_NO_MEMORY;
     }
 
-    mxr_mutex_lock(&tpm_lock);
+    mtx_lock(&tpm_lock);
 
     mx_status_t status = tpm_send_cmd(LOCALITY0, (uint8_t*)&cmd, sizeof(cmd));
     if (status != NO_ERROR) {
@@ -95,16 +82,16 @@ static ssize_t tpm_get_random(mx_device_t* dev, void* buf, size_t count) {
     status = bytes_returned;
 cleanup:
     free(resp);
-    mxr_mutex_unlock(&tpm_lock);
+    mtx_unlock(&tpm_lock);
     return status;
 }
 
-static mx_status_t tpm_save_state(mx_device_t *dev) {
+static mx_status_t tpm_save_state(void) {
     struct tpm_savestate_cmd cmd;
     uint32_t resp_len = tpm_init_savestate(&cmd);
     struct tpm_savestate_resp resp;
 
-    mxr_mutex_lock(&tpm_lock);
+    mtx_lock(&tpm_lock);
 
     mx_status_t status = tpm_send_cmd(LOCALITY0, (uint8_t*)&cmd, sizeof(cmd));
     if (status != NO_ERROR) {
@@ -124,50 +111,49 @@ static mx_status_t tpm_save_state(mx_device_t *dev) {
     }
     status = NO_ERROR;
 cleanup:
-    mxr_mutex_unlock(&tpm_lock);
+    mtx_unlock(&tpm_lock);
     return status;
 }
 
-static mx_protocol_tpm_t tpm_proto = {
-    .get_random = tpm_get_random,
-    .save_state = tpm_save_state,
-};
-
-static ssize_t tpm_device_ioctl(mx_device_t* dev, uint32_t op,
-                             const void* in_buf, size_t in_len,
-                             void* out_buf, size_t out_len) {
+static mx_status_t tpm_device_ioctl(void* ctx, uint32_t op,
+                                    const void* in_buf, size_t in_len,
+                                    void* out_buf, size_t out_len, size_t* out_actual) {
     switch (op) {
-        case TPM_IOCTL_SAVE_STATE: return tpm_save_state(dev);
+        case IOCTL_TPM_SAVE_STATE: return tpm_save_state();
     }
     return ERR_NOT_SUPPORTED;
 }
 
 // implement device protocol:
-static mx_protocol_device_t tpm_device_proto = {
+static mx_protocol_device_t tpm_device_proto __UNUSED = {
+    .version = DEVICE_OPS_VERSION,
     .ioctl = tpm_device_ioctl,
 };
 
-// implement driver object:
 
-mx_status_t tpm_init(mx_driver_t* driver) {
+//TODO: bind against hw, not misc
+mx_status_t tpm_bind(void* ctx, mx_device_t* parent, void** cookie) {
 #if defined(__x86_64__) || defined(__i386__)
+    uintptr_t tmp;
     mx_status_t status = mx_mmap_device_memory(
-            TPM_PHYS_ADDRESS, TPM_PHYS_LENGTH, &tpm_base);
+            get_root_resource(),
+            TPM_PHYS_ADDRESS, TPM_PHYS_LENGTH,
+            MX_CACHE_POLICY_UNCACHED, &tmp);
     if (status != NO_ERROR) {
         return status;
     }
+    tpm_base = (void*)(tmp);
+
+    device_add_args_t args = {
+        .version = DEVICE_ADD_ARGS_VERSION,
+        .name = "tpm",
+        .ops = &tpm_device_proto,
+        .proto_id = MX_PROTOCOL_TPM,
+    };
 
     mx_device_t* dev;
-    status = device_create(&dev, driver, "tpm", &tpm_device_proto);
+    status =  device_add(parent, &args, &dev);
     if (status != NO_ERROR) {
-        return status;
-    }
-    dev->protocol_id = MX_PROTOCOL_TPM;
-    dev->protocol_ops = &tpm_proto;
-
-    status = device_add(dev, NULL);
-    if (status != NO_ERROR) {
-        free(dev);
         return status;
     }
 
@@ -191,7 +177,7 @@ mx_status_t tpm_init(mx_driver_t* driver) {
         goto cleanup_device;
     }
 
-    irq_handle = mx_interrupt_event_create(10, MX_FLAG_REMAP_IRQ);
+    irq_handle = mx_interrupt_create(get_root_resource(), 10, MX_FLAG_REMAP_IRQ);
     if (irq_handle < 0) {
         status = irq_handle;
         goto cleanup_device;
@@ -222,18 +208,17 @@ cleanup_device:
         mx_handle_close(irq_handle);
     }
     device_remove(dev);
-    free(dev);
     return status;
 #else
-    tpm_proto = tpm_proto;
-    tpm_device_proto = tpm_device_proto;
     return ERR_NOT_SUPPORTED;
 #endif
 }
 
-mx_driver_t _driver_tpm BUILTIN_DRIVER = {
-    .name = "tpm",
-    .ops = {
-        .init = tpm_init,
-    },
+static mx_driver_ops_t tpm_driver_ops = {
+    .version = DRIVER_OPS_VERSION,
+    .bind = tpm_bind,
 };
+
+MAGENTA_DRIVER_BEGIN(tpm, tpm_driver_ops, "magenta", "0.1", 1)
+    BI_MATCH_IF(EQ, BIND_PROTOCOL, MX_PROTOCOL_MISC_PARENT),
+MAGENTA_DRIVER_END(tpm)

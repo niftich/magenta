@@ -15,7 +15,6 @@ extern "C" {
 
 #if defined(_POSIX_SOURCE) || defined(_POSIX_C_SOURCE) || defined(_XOPEN_SOURCE) || \
     defined(_GNU_SOURCE) || defined(_BSD_SOURCE)
-#define __NEED_locale_t
 #define __NEED_va_list
 #endif
 
@@ -25,12 +24,11 @@ extern "C" {
 
 #include <bits/alltypes.h>
 
-#if L'\0' - 1 > 0
-#define WCHAR_MAX (0xffffffffu + L'\0')
-#define WCHAR_MIN (0 + L'\0')
-#else
-#define WCHAR_MAX (0x7fffffff + L'\0')
-#define WCHAR_MIN (-1 - 0x7fffffff + L'\0')
+#ifndef WCHAR_MIN
+#define WCHAR_MIN __WCHAR_MIN__
+#endif
+#ifndef WCHAR_MAX
+#define WCHAR_MAX __WCHAR_MAX__
 #endif
 
 #ifdef __cplusplus
@@ -145,11 +143,7 @@ size_t wcsnlen(const wchar_t*, size_t);
 wchar_t* wcpcpy(wchar_t* __restrict, const wchar_t* __restrict);
 wchar_t* wcpncpy(wchar_t* __restrict, const wchar_t* __restrict, size_t);
 int wcscasecmp(const wchar_t*, const wchar_t*);
-int wcscasecmp_l(const wchar_t*, const wchar_t*, locale_t);
 int wcsncasecmp(const wchar_t*, const wchar_t*, size_t);
-int wcsncasecmp_l(const wchar_t*, const wchar_t*, size_t, locale_t);
-int wcscoll_l(const wchar_t*, const wchar_t*, locale_t);
-size_t wcsxfrm_l(wchar_t* __restrict, const wchar_t* __restrict, size_t n, locale_t);
 #endif
 
 #if defined(_XOPEN_SOURCE) || defined(_GNU_SOURCE) || defined(_BSD_SOURCE)

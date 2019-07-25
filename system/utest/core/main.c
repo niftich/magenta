@@ -1,16 +1,6 @@
-// Copyright 2016 The Fuchsia Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
 
 #include <errno.h>
 #include <stdio.h>
@@ -19,6 +9,7 @@
 
 #include <magenta/processargs.h>
 #include <magenta/syscalls.h>
+#include <magenta/syscalls/log.h>
 
 #include <unittest/unittest.h>
 
@@ -42,7 +33,21 @@ static void log_write(const void* data, size_t len) {
 // The reason these are here is that the "core" tests intentionally do not
 // use mxio. See ./README.md.
 
-void __libc_extensions_init(mx_proc_info_t* pi) {
+mx_handle_t root_resource;
+
+void __libc_extensions_init(uint32_t count, mx_handle_t handle[], uint32_t info[]) {
+    for (unsigned n = 0; n < count; n++) {
+        if (info[n] == PA_HND(PA_RESOURCE, 0)) {
+            root_resource = handle[n];
+            handle[n] = 0;
+            info[n] = 0;
+            break;
+        }
+    }
+}
+
+mx_handle_t get_root_resource(void) {
+    return root_resource;
 }
 
 ssize_t write(int fd, const void* data, size_t count) {
@@ -86,9 +91,8 @@ int isatty(int fd) {
     return 1;
 }
 
-
 int main(int argc, char** argv) {
-    if ((log_handle = mx_log_create(0)) < 0) {
+    if (mx_log_create(0, &log_handle) < 0) {
         return -2;
     }
     mx_log_write(log_handle, 4, "TEST", 0);

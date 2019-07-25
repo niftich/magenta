@@ -59,9 +59,9 @@ void event_destroy(event_t *e)
     THREAD_LOCK(state);
 
     e->magic = 0;
-    e->signalled = false;
+    e->signaled = false;
     e->flags = 0;
-    wait_queue_destroy(&e->wait, true);
+    wait_queue_destroy(&e->wait);
 
     THREAD_UNLOCK(state);
 }
@@ -72,43 +72,38 @@ void event_destroy(event_t *e)
  * If the event has already been signaled, this function
  * returns immediately.  Otherwise, the current thread
  * goes to sleep until the event object is signaled,
- * the timeout is reached, or the event object is destroyed
+ * the deadline is reached, or the event object is destroyed
  * by another thread.
  *
  * @param e        Event object
- * @param timeout  Timeout value, in ms
- * @param interruptable  Allowed to interrupt if thread is signalled
+ * @param deadline Deadline to abort at, in ns
+ * @param interruptable  Allowed to interrupt if thread is signaled
  *
  * @return  0 on success, ERR_TIMED_OUT on timeout,
  *          other values depending on wait_result value
  *          when event_signal_etc is used.
  */
-status_t event_wait_timeout(event_t *e, lk_time_t timeout, bool interruptable)
+status_t event_wait_deadline(event_t *e, lk_time_t deadline, bool interruptable)
 {
     thread_t *current_thread = get_current_thread();
     status_t ret = NO_ERROR;
 
     DEBUG_ASSERT(e->magic == EVENT_MAGIC);
+    DEBUG_ASSERT(!arch_in_int_handler());
 
     THREAD_LOCK(state);
 
-    /* if we've been killed and going in interruptable, abort here */
-    if (interruptable && unlikely((current_thread->signals & THREAD_SIGNAL_KILL))) {
-        ret = ERR_INTERRUPTED;
-        goto out;
-    }
-
     current_thread->interruptable = interruptable;
 
-    if (e->signalled) {
-        /* signalled, we're going to fall through */
+    if (e->signaled) {
+        /* signaled, we're going to fall through */
         if (e->flags & EVENT_FLAG_AUTOUNSIGNAL) {
-            /* autounsignal flag lets one thread fall through before unsignalling */
-            e->signalled = false;
+            /* autounsignal flag lets one thread fall through before unsignaling */
+            e->signaled = false;
         }
     } else {
-        /* unsignalled, block here */
-        ret = wait_queue_block(&e->wait, timeout);
+        /* unsignaled, block here */
+        ret = wait_queue_block(&e->wait, deadline);
     }
 
     current_thread->interruptable = false;
@@ -117,6 +112,45 @@ out:
     THREAD_UNLOCK(state);
 
     return ret;
+}
+
+static int event_signal_internal(event_t *e, bool reschedule, status_t wait_result, bool thread_lock_held)
+{
+    DEBUG_ASSERT(e->magic == EVENT_MAGIC);
+    DEBUG_ASSERT(!reschedule || !arch_in_int_handler());
+
+    // conditionally acquire/release the thread lock
+    // NOTE: using the manual spinlock grab/release instead of THREAD_LOCK because
+    // the state variable needs to exit in either path.
+    spin_lock_saved_state_t state = 0;
+    if (!thread_lock_held)
+        spin_lock_irqsave(&thread_lock, state);
+
+    int wake_count = 0;
+
+    if (!e->signaled) {
+        if (e->flags & EVENT_FLAG_AUTOUNSIGNAL) {
+            /* try to release one thread and leave unsignaled if successful */
+            if ((wake_count = wait_queue_wake_one(&e->wait, reschedule, wait_result)) <= 0) {
+                /*
+                 * if we didn't actually find a thread to wake up, go to
+                 * signaled state and let the next call to event_wait
+                 * unsignal the event.
+                 */
+                e->signaled = true;
+            }
+        } else {
+            /* release all threads and remain signaled */
+            e->signaled = true;
+            wake_count = wait_queue_wake_all(&e->wait, reschedule, wait_result);
+        }
+    }
+
+    // conditionally THREAD_UNLOCK
+    if (!thread_lock_held)
+        spin_unlock_irqrestore(&thread_lock, state);
+
+    return wake_count;
 }
 
 /**
@@ -133,40 +167,14 @@ out:
  *                    waiting threads have been satisfied. If false,
  *                    waiting threads are placed at the head of the run
  *                    queue.
- * @param wait_result What status event_wait_timeout will return to the
+ * @param wait_result What status event_wait_deadline will return to the
  *                    thread or threads that are woken up.
  *
  * @return  Returns the number of threads that have been unblocked.
  */
 int event_signal_etc(event_t *e, bool reschedule, status_t wait_result)
 {
-    DEBUG_ASSERT(e->magic == EVENT_MAGIC);
-
-    THREAD_LOCK(state);
-
-    int wake_count = 0;
-
-    if (!e->signalled) {
-        if (e->flags & EVENT_FLAG_AUTOUNSIGNAL) {
-            /* try to release one thread and leave unsignalled if successful */
-            if ((wake_count = wait_queue_wake_one(&e->wait, reschedule, wait_result)) <= 0) {
-                /*
-                 * if we didn't actually find a thread to wake up, go to
-                 * signalled state and let the next call to event_wait
-                 * unsignal the event.
-                 */
-                e->signalled = true;
-            }
-        } else {
-            /* release all threads and remain signalled */
-            e->signalled = true;
-            wake_count = wait_queue_wake_all(&e->wait, reschedule, wait_result);
-        }
-    }
-
-    THREAD_UNLOCK(state);
-
-    return wake_count;
+    return event_signal_internal(e, reschedule, wait_result, false);
 }
 
 /**
@@ -188,7 +196,16 @@ int event_signal_etc(event_t *e, bool reschedule, status_t wait_result)
  */
 int event_signal(event_t *e, bool reschedule)
 {
-    return event_signal_etc(e, reschedule, NO_ERROR);
+    return event_signal_internal(e, reschedule, NO_ERROR, false);
+}
+
+/* same as above, but the thread lock must already be held */
+int event_signal_thread_locked(event_t *e)
+{
+    DEBUG_ASSERT(arch_ints_disabled());
+    DEBUG_ASSERT(spin_lock_held(&thread_lock));
+
+    return event_signal_internal(e, false, NO_ERROR, true);
 }
 
 /**
@@ -207,7 +224,7 @@ status_t event_unsignal(event_t *e)
 {
     DEBUG_ASSERT(e->magic == EVENT_MAGIC);
 
-    e->signalled = false;
+    e->signaled = false;
 
     return NO_ERROR;
 }

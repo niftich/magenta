@@ -2,7 +2,6 @@
 #include "fdop.h"
 #include "libc.h"
 #include "pthread_impl.h"
-#include "syscall.h"
 #include <fcntl.h>
 #include <sched.h>
 #include <signal.h>
@@ -22,13 +21,9 @@ struct args {
 
 void __get_handler_set(sigset_t*);
 
-static int __sys_dup2(int old, int new) {
-    return dup2(old, new);
-}
-
 static int child(void* args_vp) {
     int i, ret;
-    struct sigaction sa = {0};
+    struct sigaction sa = {};
     struct args* args = args_vp;
     int p = args->p[1];
     const posix_spawn_file_actions_t* fa = args->fa;
@@ -85,25 +80,27 @@ static int child(void* args_vp) {
                 ret = dup(p);
                 if (ret < 0)
                     goto fail;
-                __syscall(SYS_close, p);
+                close(p);
                 p = ret;
             }
             switch (op->cmd) {
             case FDOP_CLOSE:
-                __syscall(SYS_close, op->fd);
+                close(op->fd);
                 break;
             case FDOP_DUP2:
-                if ((ret = __sys_dup2(op->srcfd, op->fd)) < 0)
+                if ((ret = dup2(op->srcfd, op->fd)) < 0)
                     goto fail;
                 break;
             case FDOP_OPEN:
-                fd = __sys_open(op->path, op->oflag, op->mode);
-                if ((ret = fd) < 0)
+                fd = open(op->path, op->oflag, op->mode);
+                if (fd < 0) {
+                    ret = errno;
                     goto fail;
+                }
                 if (fd != op->fd) {
-                    if ((ret = __sys_dup2(fd, op->fd)) < 0)
+                    if ((ret = dup2(fd, op->fd)) < 0)
                         goto fail;
-                    __syscall(SYS_close, fd);
+                    close(fd);
                 }
                 break;
             }
@@ -136,24 +133,22 @@ int __posix_spawnx(pid_t* restrict res, const char* restrict path,
                    const posix_spawn_file_actions_t* fa, const posix_spawnattr_t* restrict attr,
                    char* const argv[restrict], char* const envp[restrict]) {
     pid_t pid;
-    char stack[1024];
-    int ec = 0, cs;
+    int ec = 0;
     struct args args;
 
     if (pipe2(args.p, O_CLOEXEC))
         return errno;
 
-    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cs);
-
     args.path = path;
     args.exec = exec;
     args.fa = fa;
-    args.attr = attr ? attr : &(const posix_spawnattr_t){0};
+    args.attr = attr ? attr : &(const posix_spawnattr_t){};
     args.argv = argv;
     args.envp = envp;
     pthread_sigmask(SIG_BLOCK, SIGALL_SET, &args.oldmask);
 
-    pid = __clone(child, stack + sizeof stack, CLONE_VM | CLONE_VFORK | SIGCHLD, &args);
+    // TODO(kulakowski) Launchpad up a process here.
+    pid = -ENOSYS;
     close(args.p[1]);
 
     if (pid > 0) {
@@ -171,7 +166,6 @@ int __posix_spawnx(pid_t* restrict res, const char* restrict path,
         *res = pid;
 
     pthread_sigmask(SIG_SETMASK, &args.oldmask, 0);
-    pthread_setcancelstate(cs, 0);
 
     return ec;
 }

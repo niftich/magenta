@@ -4,6 +4,8 @@
 // license that can be found in the LICENSE file or at
 // https://opensource.org/licenses/MIT
 
+#if WITH_DEV_PCIE
+
 #include <kernel/auto_lock.h>
 #include <lib/user_copy.h>
 #include <magenta/pci_device_dispatcher.h>
@@ -11,31 +13,21 @@
 #include <magenta/pci_io_mapping_dispatcher.h>
 #include <magenta/process_dispatcher.h>
 
+#include <mxalloc/new.h>
+
 #include <assert.h>
 #include <err.h>
-#include <new.h>
 #include <trace.h>
 
 constexpr mx_rights_t kDefaultPciDeviceRights =
     MX_RIGHT_READ | MX_RIGHT_WRITE | MX_RIGHT_DUPLICATE | MX_RIGHT_TRANSFER;
 
-static const pcie_driver_fn_table_t PCIE_FN_TABLE = {
-    .pcie_probe_fn    = nullptr,
-    .pcie_startup_fn  = nullptr,
-    .pcie_shutdown_fn = nullptr,
-    .pcie_release_fn  = nullptr,
-};
-
-static const pcie_driver_registration_t PCIE_DRIVER_REGISTRATION = {
-    .name = "userspace PCI driver", .fn_table = &PCIE_FN_TABLE,
-};
-
-status_t PciDeviceDispatcher::Create(uint32_t                   index,
-                                     mx_pcie_get_nth_info_t*    out_info,
-                                     utils::RefPtr<Dispatcher>* out_dispatcher,
-                                     mx_rights_t*               out_rights) {
+status_t PciDeviceDispatcher::Create(uint32_t                  index,
+                                     mx_pcie_device_info_t*    out_info,
+                                     mxtl::RefPtr<Dispatcher>* out_dispatcher,
+                                     mx_rights_t*              out_rights) {
     status_t status;
-    utils::RefPtr<PciDeviceWrapper> device_wrapper;
+    mxtl::RefPtr<PciDeviceWrapper> device_wrapper;
 
     status = PciDeviceWrapper::Create(index, &device_wrapper);
     if (status != NO_ERROR)
@@ -48,29 +40,25 @@ status_t PciDeviceDispatcher::Create(uint32_t                   index,
     if (!ac.check())
         return ERR_NO_MEMORY;
 
-    *out_dispatcher = utils::AdoptRef<Dispatcher>(disp);
+    *out_dispatcher = mxtl::AdoptRef<Dispatcher>(disp);
     *out_rights     = kDefaultPciDeviceRights;
     return NO_ERROR;
 }
 
-PciDeviceDispatcher::PciDeviceDispatcher(utils::RefPtr<PciDeviceWrapper> device,
-                                         mx_pcie_get_nth_info_t* out_info)
+PciDeviceDispatcher::PciDeviceDispatcher(mxtl::RefPtr<PciDeviceWrapper> device,
+                                         mx_pcie_device_info_t* out_info)
     : device_(device) {
-    mutex_init(&lock_);
+    const PcieDevice& dev = *device_->device();
 
-    const pcie_device_state_t& dev = *device_->device();
-    const pcie_config_t* cfg = dev.cfg;
-    DEBUG_ASSERT(cfg);
-
-    out_info->vendor_id         = pcie_read16(&cfg->base.vendor_id);
-    out_info->device_id         = pcie_read16(&cfg->base.device_id);
-    out_info->base_class        = pcie_read8 (&cfg->base.base_class);
-    out_info->sub_class         = pcie_read8 (&cfg->base.sub_class);
-    out_info->program_interface = pcie_read8 (&cfg->base.program_interface);
-    out_info->revision_id       = pcie_read8 (&cfg->base.revision_id_0);
-    out_info->bus_id            = static_cast<uint8_t>(dev.bus_id);
-    out_info->dev_id            = static_cast<uint8_t>(dev.dev_id);
-    out_info->func_id           = static_cast<uint8_t>(dev.func_id);
+    out_info->vendor_id         = dev.vendor_id();
+    out_info->device_id         = dev.device_id();
+    out_info->base_class        = dev.class_id();
+    out_info->sub_class         = dev.subclass();
+    out_info->program_interface = dev.prog_if();
+    out_info->revision_id       = dev.rev_id();
+    out_info->bus_id            = static_cast<uint8_t>(dev.bus_id());
+    out_info->dev_id            = static_cast<uint8_t>(dev.dev_id());
+    out_info->func_id           = static_cast<uint8_t>(dev.func_id());
 }
 
 PciDeviceDispatcher::~PciDeviceDispatcher() {
@@ -84,11 +72,13 @@ PciDeviceDispatcher::~PciDeviceDispatcher() {
 }
 
 status_t PciDeviceDispatcher::ClaimDevice() {
+    canary_.Assert();
+
     status_t result;
     AutoLock lock(&lock_);
     DEBUG_ASSERT(device_ && device_->device());
 
-    if (device_->claimed()) return ERR_BUSY;  // Are we claimed already?
+    if (device_->claimed()) return ERR_ALREADY_BOUND;  // Are we claimed already?
 
     result = device_->Claim();
     if (result != NO_ERROR)
@@ -98,36 +88,101 @@ status_t PciDeviceDispatcher::ClaimDevice() {
 }
 
 status_t PciDeviceDispatcher::EnableBusMaster(bool enable) {
+    canary_.Assert();
+
     AutoLock lock(&lock_);
     DEBUG_ASSERT(device_ && device_->device());
 
     if (!device_->claimed()) return ERR_BAD_STATE;  // Are we not claimed yet?
 
-    pcie_enable_bus_master(device_->device(), enable);
+    device_->device()->EnableBusMaster(enable);
+
+    return NO_ERROR;
+}
+
+status_t PciDeviceDispatcher::EnablePio(bool enable) {
+    canary_.Assert();
+
+    AutoLock lock(&lock_);
+    DEBUG_ASSERT(device_ && device_->device());
+
+    if (!device_->claimed()) return ERR_BAD_STATE;  // Are we not claimed yet?
+
+    device_->device()->EnablePio(enable);
+
+    return NO_ERROR;
+}
+
+status_t PciDeviceDispatcher::EnableMmio(bool enable) {
+    canary_.Assert();
+
+    AutoLock lock(&lock_);
+    DEBUG_ASSERT(device_ && device_->device());
+
+    if (!device_->claimed()) return ERR_BAD_STATE;  // Are we not claimed yet?
+
+    device_->device()->EnableMmio(enable);
+
+    return NO_ERROR;
+}
+
+const pcie_bar_info_t* PciDeviceDispatcher::GetBar(uint32_t bar_num) {
+    AutoLock lock(&lock_);
+    DEBUG_ASSERT(device_ && device_->device());
+
+    if (!device_->claimed()) return nullptr;  // Are we not claimed yet?
+
+    return device_->device()->GetBarInfo(bar_num);
+}
+
+status_t PciDeviceDispatcher::GetConfig(pci_config_info_t* out) {
+    AutoLock lock(&lock_);
+    DEBUG_ASSERT(device_ && device_->device());
+
+    if (!device_->claimed()) {
+        return ERR_BAD_STATE;
+    }
+
+    if (!out) {
+        return ERR_INVALID_ARGS;
+    }
+
+    auto dev = device_->device();
+    auto cfg = dev->config();
+    out->size = (dev->is_pcie()) ? PCIE_EXTENDED_CONFIG_SIZE : PCIE_BASE_CONFIG_SIZE;
+    out->base_addr = cfg->base();
+    out->is_mmio = (cfg->addr_space() == PciAddrSpace::MMIO);
+
+    if (out->is_mmio) {
+        out->vmo = dev->config_vmo();
+    }
 
     return NO_ERROR;
 }
 
 status_t PciDeviceDispatcher::ResetDevice() {
+    canary_.Assert();
+
     AutoLock lock(&lock_);
     DEBUG_ASSERT(device_ && device_->device());
 
     if (!device_->claimed()) return ERR_BAD_STATE;  // Are we not claimed yet?
 
-    return pcie_do_function_level_reset(device_->device());
+    return device_->device()->DoFunctionLevelReset();
 }
 
-status_t PciDeviceDispatcher::MapConfig(utils::RefPtr<Dispatcher>* out_mapping,
+status_t PciDeviceDispatcher::MapConfig(mxtl::RefPtr<Dispatcher>* out_mapping,
                                         mx_rights_t* out_rights) {
+    canary_.Assert();
+
     AutoLock lock(&lock_);
     return PciIoMappingDispatcher::Create(device_,
                                          "cfg",
-                                          device_->device()->cfg_phys,
+                                          device_->device()->config_phys(),
                                           PCIE_EXTENDED_CONFIG_SIZE,
                                           0 /* vmm flags */,
                                           ARCH_MMU_FLAG_UNCACHED_DEVICE |
-                                          ARCH_MMU_FLAG_PERM_RO         |
-                                          ARCH_MMU_FLAG_PERM_NO_EXECUTE |
+                                          ARCH_MMU_FLAG_PERM_READ       |
                                           ARCH_MMU_FLAG_PERM_USER,
                                           out_mapping,
                                           out_rights);
@@ -135,8 +190,10 @@ status_t PciDeviceDispatcher::MapConfig(utils::RefPtr<Dispatcher>* out_mapping,
 
 status_t PciDeviceDispatcher::MapMmio(uint32_t bar_num,
                                       uint32_t cache_policy,
-                                      utils::RefPtr<Dispatcher>* out_mapping,
+                                      mxtl::RefPtr<Dispatcher>* out_mapping,
                                       mx_rights_t* out_rights) {
+    canary_.Assert();
+
     AutoLock lock(&lock_);
     DEBUG_ASSERT(device_ && device_->device());
 
@@ -152,20 +209,22 @@ status_t PciDeviceDispatcher::MapMmio(uint32_t bar_num,
 
     // If things went well, make sure that mmio is turned on
     if (status == NO_ERROR)
-        pcie_enable_mmio(device_->device(), true);
+        device_->device()->EnableMmio(true);
 
     return status;
 }
 
 status_t PciDeviceDispatcher::MapInterrupt(int32_t which_irq,
-                                           utils::RefPtr<Dispatcher>* interrupt_dispatcher,
+                                           mxtl::RefPtr<Dispatcher>* interrupt_dispatcher,
                                            mx_rights_t* rights) {
+    canary_.Assert();
+
     AutoLock lock(&lock_);
     DEBUG_ASSERT(device_ && device_->device());
 
     if (!device_->claimed()) return ERR_BAD_STATE;  // Are we not claimed yet?
     if ((which_irq < 0) ||
-        (static_cast<uint32_t>(which_irq) >= irqs_supported_)) return ERR_INVALID_ARGS;
+        (static_cast<uint32_t>(which_irq) >= irqs_avail_cnt_)) return ERR_INVALID_ARGS;
 
     // Attempt to create the dispatcher.  It will take care of things like checking for
     // duplicate registration.
@@ -193,58 +252,67 @@ status_t PciDeviceDispatcher::QueryIrqModeCaps(mx_pci_irq_mode_t mode, uint32_t*
     DEBUG_ASSERT(device_ && device_->device());
 
     pcie_irq_mode_caps_t caps;
-    status_t ret = pcie_query_irq_mode_capabilities(device_->device(),
-                                                    static_cast<pcie_irq_mode_t>(mode),
-                                                    &caps);
+    status_t ret = device_->device()->QueryIrqModeCapabilities(static_cast<pcie_irq_mode_t>(mode),
+                                                               &caps);
 
     *out_max_irqs = (ret == NO_ERROR) ? caps.max_irqs : 0;
     return ret;
 }
 
 status_t PciDeviceDispatcher::SetIrqMode(mx_pci_irq_mode_t mode, uint32_t requested_irq_count) {
+    canary_.Assert();
+
     AutoLock lock(&lock_);
     DEBUG_ASSERT(device_ && device_->device());
 
-    if (!device_->claimed()) return ERR_BAD_STATE;  // Are we not claimed yet?
+    // Are we not claimed yet?
+    if (!device_->claimed())
+        return ERR_BAD_STATE;
+
+    if (mode == MX_PCIE_IRQ_MODE_DISABLED)
+        requested_irq_count = 0;
 
     status_t ret;
-    ret = pcie_set_irq_mode(device_->device(),
-                            static_cast<pcie_irq_mode_t>(mode),
-                            requested_irq_count);
+    ret = device_->device()->SetIrqMode(static_cast<pcie_irq_mode_t>(mode),
+                                        requested_irq_count);
     if (ret == NO_ERROR) {
         pcie_irq_mode_caps_t caps;
-        __UNUSED status_t tmp;
-        tmp = pcie_query_irq_mode_capabilities(device_->device(),
-                                               static_cast<pcie_irq_mode_t>(mode),
-                                               &caps);
-        DEBUG_ASSERT(tmp == NO_ERROR);
-        irqs_supported_ = caps.max_irqs;
-        irqs_maskable_  = caps.per_vector_masking_supported;
+        ret = device_->device()->QueryIrqModeCapabilities(static_cast<pcie_irq_mode_t>(mode),
+                                                          &caps);
+
+        // The only way for QueryIrqMode to fail at this point should be for the
+        // device to have become unplugged.
+        if (ret == NO_ERROR) {
+            irqs_avail_cnt_ = requested_irq_count;
+            irqs_maskable_  = caps.per_vector_masking_supported;
+        } else {
+            device_->device()->SetIrqMode(PCIE_IRQ_MODE_DISABLED, 0);
+            irqs_avail_cnt_ = 0;
+            irqs_maskable_  = false;
+        }
     }
 
     return ret;
 }
 
-PciDeviceDispatcher::PciDeviceWrapper::PciDeviceWrapper(pcie_device_state_t* device)
-    : device_(device) {
+PciDeviceDispatcher::PciDeviceWrapper::PciDeviceWrapper(
+        mxtl::RefPtr<PcieDevice>&& device)
+    : device_(mxtl::move(device)) {
     DEBUG_ASSERT(device_);
-    mutex_init(&cp_ref_lock_);
     memset(&cp_refs_, 0, sizeof(cp_refs_));
 }
 
 PciDeviceDispatcher::PciDeviceWrapper::~PciDeviceWrapper() {
     DEBUG_ASSERT(device_);
-    pcie_shutdown_device(device_);
-
-    // Release the reference we are holding because of our call to pcie_get_nth_device
-    pcie_release_device(device_);
+    device_->Unclaim();
+    device_ = nullptr;
 }
 
 status_t PciDeviceDispatcher::PciDeviceWrapper::Claim() {
     if (claimed_)
-        return ERR_BUSY;
+        return ERR_ALREADY_BOUND;
 
-    status_t result = pcie_claim_and_start_device(device_, &PCIE_DRIVER_REGISTRATION, NULL);
+    status_t result = device_->Claim();
     if (result != NO_ERROR)
         return result;
 
@@ -255,23 +323,21 @@ status_t PciDeviceDispatcher::PciDeviceWrapper::Claim() {
 
 status_t PciDeviceDispatcher::PciDeviceWrapper::Create(
         uint32_t index,
-        utils::RefPtr<PciDeviceWrapper>* out_device) {
+        mxtl::RefPtr<PciDeviceWrapper>* out_device) {
     if (!out_device)
         return ERR_INVALID_ARGS;
 
-    pcie_device_state_t* device = pcie_get_nth_device(index);
-    if (!device)
+    auto bus_drv = PcieBusDriver::GetDriver();
+    if (bus_drv == nullptr)
+        return ERR_BAD_STATE;
+
+    auto device = bus_drv->GetNthDevice(index);
+    if (device == nullptr)
         return ERR_OUT_OF_RANGE;
 
     AllocChecker ac;
-
-    *out_device = utils::AdoptRef<PciDeviceWrapper>(new (&ac) PciDeviceWrapper(device));
-    if (!ac.check()) {
-        pcie_release_device(device);
-        return ERR_NO_MEMORY;
-    }
-
-    return NO_ERROR;
+    *out_device = mxtl::AdoptRef<PciDeviceWrapper>(new (&ac) PciDeviceWrapper(mxtl::move(device)));
+    return ac.check() ? NO_ERROR : ERR_NO_MEMORY;
 }
 
 status_t PciDeviceDispatcher::PciDeviceWrapper::AddBarCachePolicyRef(uint bar_num,
@@ -300,3 +366,5 @@ void PciDeviceDispatcher::PciDeviceWrapper::ReleaseBarCachePolicyRef(uint bar_nu
 
     r.ref_count--;
 }
+
+#endif  // if WITH_DEV_PCIE

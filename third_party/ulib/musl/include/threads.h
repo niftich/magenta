@@ -37,9 +37,20 @@ enum {
     mtx_timed = 2,
 };
 
+#ifdef _ALL_SOURCE
+#define MTX_INIT \
+    {}
+#define CND_INIT \
+    {}
+#endif
+
 #define ONCE_FLAG_INIT 0
 
 int thrd_create(thrd_t*, thrd_start_t, void*);
+#ifdef _ALL_SOURCE
+// |name| is silently truncated to a maximum of MX_MAX_NAME_LEN-1 characters.
+int thrd_create_with_name(thrd_t*, thrd_start_t, void*, const char* name);
+#endif
 _Noreturn void thrd_exit(int);
 
 int thrd_detach(thrd_t);

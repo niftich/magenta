@@ -1,4 +1,10 @@
+// Copyright 2016 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
 #pragma once
+
+#include <threads.h>
 
 #include "ie-hw.h"
 
@@ -35,13 +41,15 @@ struct ethdev {
     void* rxb;
 
     uint8_t mac[6];
+
+    mtx_t send_lock;
 };
 
 #define ETH_RXBUF_SIZE  2048
 #define ETH_RXBUF_COUNT 32
 
 #define ETH_TXBUF_SIZE  2048
-#define ETH_TXBUF_COUNT 8
+#define ETH_TXBUF_COUNT 32
 #define ETH_TXBUF_HSIZE 128
 #define ETH_TXBUF_DSIZE (ETH_TXBUF_SIZE - ETH_TXBUF_HSIZE)
 
@@ -57,7 +65,9 @@ void eth_init_hw(ethdev_t* eth);
 
 void eth_dump_regs(ethdev_t* eth);
 
-status_t eth_rx(ethdev_t* eth, void* data);
+status_t eth_rx(ethdev_t* eth, void** data, size_t* len);
+void eth_rx_ack(ethdev_t* eth);
+
 status_t eth_tx(ethdev_t* eth, const void* data, size_t len);
 
 #define ETH_IRQ_RX IE_INT_RXT0

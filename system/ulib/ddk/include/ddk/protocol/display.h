@@ -1,45 +1,23 @@
-// Copyright 2016 The Fuchsia Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
 
 #pragma once
 
 #include <ddk/driver.h>
+#include <ddk/ioctl.h>
+#include <magenta/compiler.h>
 #include <magenta/types.h>
+#include <magenta/pixelformat.h>
+#include <magenta/device/display.h>
+
+__BEGIN_CDECLS;
 
 /**
  * protocol/display.h - display protocol definitions
  */
 
-#define MX_DISPLAY_FORMAT_NONE (-1)
-#define MX_DISPLAY_FORMAT_RGB_565 (0)
-#define MX_DISPLAY_FORMAT_RGB_332 (1)
-#define MX_DISPLAY_FORMAT_RGB_2220 (2)
-#define MX_DISPLAY_FORMAT_ARGB_8888 (3)
-#define MX_DISPLAY_FORMAT_RGB_x888 (4)
-#define MX_DISPLAY_FORMAT_MONO_1 (5)
-#define MX_DISPLAY_FORMAT_MONO_8 (6)
-
-#define MX_DISPLAY_FLAG_HW_FRAMEBUFFER (1 << 0)
-
-typedef struct mx_display_info {
-    unsigned format;
-    unsigned width;
-    unsigned height;
-    unsigned stride;
-    unsigned pixelsize;
-    unsigned flags;
-} mx_display_info_t;
+typedef void (*mx_display_cb_t)(bool acquired);
 
 typedef struct mx_display_protocol {
     mx_status_t (*set_mode)(mx_device_t* dev, mx_display_info_t* info);
@@ -53,13 +31,22 @@ typedef struct mx_display_protocol {
 
     void (*flush)(mx_device_t* dev);
     // flushes the framebuffer
+
+    void (*acquire_or_release_display)(mx_device_t* dev);
+    // Controls ownership of the display between multiple display clients.
+    // Useful for switching to and from the gfxconsole.
+    // If the framebuffer is visible, release ownership of the display and
+    // allow other clients to scanout buffers.
+    // If the framebuffer is not visible, make it visible and acquire ownership
+    // of the display, preventing other clients from scanning out buffers.
+    // If the display is owned when when a new graphics client is created,
+    // ownership will automatically be released.
+
+    void (*set_ownership_change_callback)(mx_device_t* dev, mx_display_cb_t callback);
+    // Registers a callback to be invoked when display ownership changes.
+    // The provided callback will be invoked with a value of true if the display
+    // has been acquired, false if it has been released.
+
 } mx_display_protocol_t;
 
-
-#define DISPLAY_OP_GET_FB 0x7FFF0001
-typedef struct {
-    mx_handle_t vmo;
-    mx_display_info_t info;
-} ioctl_display_get_fb_t;
-
-#define DISPLAY_OP_FLUSH_FB 2
+__END_CDECLS;

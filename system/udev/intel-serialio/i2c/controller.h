@@ -1,23 +1,13 @@
-// Copyright 2016 The Fuchsia Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
 
 #pragma once
 
 #include <magenta/types.h>
-#include <runtime/mutex.h>
 #include <stdint.h>
-#include <system/listnode.h>
+#include <magenta/listnode.h>
+#include <threads.h>
 
 typedef struct __attribute__((packed)) intel_serialio_i2c_regs {
     uint32_t ctl;
@@ -134,7 +124,8 @@ enum {
 };
 
 typedef struct intel_serialio_i2c_device {
-    mx_device_t device;
+    mx_device_t* mxdev;
+    mx_device_t* pcidev;
 
     intel_serialio_i2c_regs* regs;
     volatile uint32_t* soft_reset;
@@ -147,11 +138,8 @@ typedef struct intel_serialio_i2c_device {
 
     struct list_node slave_list;
 
-    mxr_mutex_t mutex;
+    mtx_t mutex;
 } intel_serialio_i2c_device_t;
 
 mx_status_t intel_serialio_i2c_reset_controller(
     intel_serialio_i2c_device_t* controller);
-
-#define get_intel_serialio_i2c_device(dev) \
-    containerof(dev, intel_serialio_i2c_device_t, device)

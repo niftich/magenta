@@ -14,24 +14,23 @@ MODULE_SRCS += \
     $(LOCAL_DIR)/cache_tests.c \
     $(LOCAL_DIR)/clock_tests.c \
     $(LOCAL_DIR)/fibo.c \
-    $(LOCAL_DIR)/float.c \
-    $(LOCAL_DIR)/float_instructions.S \
-    $(LOCAL_DIR)/float_test_vec.c \
-    $(LOCAL_DIR)/mem_tests.c \
-    $(LOCAL_DIR)/port_tests.c \
+    $(LOCAL_DIR)/mem_tests.cpp \
     $(LOCAL_DIR)/printf_tests.c \
     $(LOCAL_DIR)/sync_ipi_tests.c \
     $(LOCAL_DIR)/sleep_tests.c \
     $(LOCAL_DIR)/tests.c \
     $(LOCAL_DIR)/thread_tests.c \
     $(LOCAL_DIR)/alloc_checker_tests.cpp \
+    $(LOCAL_DIR)/timer_tests.c \
 
 
 MODULE_DEPS += \
-    lib/safeint \
-    lib/unittest \
-    lib/utils \
-    lib/crypto \
+    kernel/lib/crypto \
+    kernel/lib/header_tests \
+    kernel/lib/mxalloc \
+    kernel/lib/mxtl \
+    third_party/lib/safeint \
+    kernel/lib/unittest \
 
 MODULE_COMPILEFLAGS += -Wno-format -fno-builtin
 

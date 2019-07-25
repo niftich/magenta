@@ -26,7 +26,10 @@
 #include <dev/display.h>
 
 #define TEXT_COLOR 0xffffffff
-#define BACK_COLOR 0x00000000
+#define BACK_COLOR 0xff000000
+
+#define CRASH_TEXT_COLOR 0xffffffff
+#define CRASH_BACK_COLOR 0xffe000e0
 
 /** @addtogroup graphics
  * @{
@@ -58,6 +61,10 @@ static void draw_char(char c)
 {
     font_draw_char(gfxconsole.surface, c, gfxconsole.x * FONT_X, gfxconsole.y * FONT_Y,
                    gfxconsole.front_color, gfxconsole.back_color);
+}
+
+void gfxconsole_putpixel(unsigned x, unsigned y, unsigned color) {
+    gfx_putpixel(gfxconsole.surface, x, y, color);
 }
 
 static bool gfxconsole_putc(char c)
@@ -129,7 +136,7 @@ static bool gfxconsole_putc(char c)
     return inval;
 }
 
-void gfxconsole_print_callback(print_callback_t *cb, const char *str, size_t len)
+static void gfxconsole_print_callback(print_callback_t *cb, const char *str, size_t len)
 {
     int refresh_full_screen = 0;
     for (size_t i = 0; i < len; i++) {
@@ -156,7 +163,7 @@ void gfxconsole_print_callback(print_callback_t *cb, const char *str, size_t len
 }
 
 static print_callback_t cb = {
-    .entry = { 0 },
+    .entry = {},
     .print = gfxconsole_print_callback,
     .context = NULL
 };
@@ -177,19 +184,23 @@ static void gfxconsole_setup(gfx_surface *surface, gfx_surface *hw_surface)
     gfxconsole.columns = surface->width / FONT_X;
     gfxconsole.extray = surface->height - (gfxconsole.rows * FONT_Y);
 
-    dprintf(SPEW, "gfxconsole: rows %d, columns %d, extray %d\n", gfxconsole.rows,
+    dprintf(SPEW, "gfxconsole: rows %u, columns %u, extray %u\n", gfxconsole.rows,
             gfxconsole.columns, gfxconsole.extray);
 }
 
-static void gfxconsole_clear(void)
+static void gfxconsole_clear(bool crash_console)
 {
     // start in the upper left
     gfxconsole.x = 0;
     gfxconsole.y = 0;
 
-    // colors are black and magenta
-    gfxconsole.front_color = TEXT_COLOR;
-    gfxconsole.back_color = BACK_COLOR;
+    if (crash_console) {
+        gfxconsole.front_color = CRASH_TEXT_COLOR;
+        gfxconsole.back_color = CRASH_BACK_COLOR;
+    } else {
+        gfxconsole.front_color = TEXT_COLOR;
+        gfxconsole.back_color = BACK_COLOR;
+    }
 
     // fill screen with back color
     gfx_fillrect(gfxconsole.surface, 0, 0, gfxconsole.surface->width, gfxconsole.surface->height,
@@ -208,7 +219,7 @@ void gfxconsole_start(gfx_surface *surface, gfx_surface *hw_surface)
     DEBUG_ASSERT(gfxconsole.surface == NULL);
 
     gfxconsole_setup(surface, hw_surface);
-    gfxconsole_clear();
+    gfxconsole_clear(false);
 
     // register for debug callbacks
     register_print_callback(&cb);
@@ -258,6 +269,16 @@ void gfxconsole_bind_display(struct display_info *info, void *raw_sw_fb) {
     if (gfx_init_surface_from_display(&hw, info)) {
         return;
     }
+    if (info->flags & DISPLAY_FLAG_CRASH_FRAMEBUFFER) {
+        // "bluescreen" path. no allocations allowed
+        memcpy(&hw_surface, &hw, sizeof(hw));
+        gfxconsole_setup(&hw_surface, &hw_surface);
+        memcpy(&dispinfo, info, sizeof(*info));
+        gfxconsole_clear(true);
+        register_print_callback(&cb);
+        active = true;
+        return;
+    }
     if ((hw.format == hw_surface.format) && (hw.width == hw_surface.width) &&
         (hw.height == hw_surface.height) && (hw.stride == hw_surface.stride) &&
         (hw.pixelsize == hw_surface.pixelsize)) {
@@ -294,7 +315,7 @@ void gfxconsole_bind_display(struct display_info *info, void *raw_sw_fb) {
     if (!same_as_before) {
         // on first init, or different-backing-buffer re-init
         // we clear and reset to x,y @ 0,0
-        gfxconsole_clear();
+        gfxconsole_clear(false);
     }
 
     memcpy(&dispinfo, info, sizeof(*info));

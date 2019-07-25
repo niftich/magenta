@@ -23,7 +23,7 @@
 #define USER_DATA_SELECTOR      (0x28 | 3)
 #define USER_CODE_64_SELECTOR   (0x30 | 3)
 
-#define TSS_SELECTOR(i)            (0x38 + 16 * (i))
+#define TSS_SELECTOR(i)            ((uint16_t)(0x38 + 16 * (i)))
 /* 0x40 is used by the second half of the first TSS descriptor */
 
 /* selector priviledge level */
@@ -41,19 +41,24 @@
 
 #ifndef ASSEMBLY
 
-#include <compiler.h>
-#include <sys/types.h>
+#include <arch/aspace.h>
+#include <magenta/compiler.h>
 #include <reg.h>
+#include <sys/types.h>
+
+#ifdef __cplusplus
+#include <bitmap/rle-bitmap.h>
+
+void x86_set_tss_io_bitmap(const bitmap::RleBitmap& extent);
+void x86_clear_tss_io_bitmap(const bitmap::RleBitmap& extent);
+void x86_reset_tss_io_bitmap(void);
+#endif // __cplusplus
 
 __BEGIN_CDECLS
 
 typedef uint16_t seg_sel_t;
 
 /* fill in a descriptor in the GDT */
-void set_global_desc_32(seg_sel_t sel, uint32_t base, uint32_t limit,
-                        uint8_t present, uint8_t ring, uint8_t sys,
-                        uint8_t type, uint8_t gran, uint8_t bits);
-
 void set_global_desc_64(seg_sel_t sel, uint64_t base, uint32_t limit,
                         uint8_t present, uint8_t ring, uint8_t sys,
                         uint8_t type, uint8_t gran, uint8_t bits);
@@ -62,10 +67,7 @@ void set_global_desc_64(seg_sel_t sel, uint64_t base, uint32_t limit,
 void x86_initialize_percpu_tss(void);
 
 void x86_set_tss_sp(vaddr_t sp);
-
-void x86_set_tss_io_bitmap(uint8_t *bitmap);
-
-void x86_clear_tss_io_bitmap(void);
+void x86_clear_tss_busy(seg_sel_t sel);
 
 __END_CDECLS
 

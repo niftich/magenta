@@ -10,9 +10,10 @@
 #ifndef ASSEMBLY
 
 #include <stdbool.h>
-#include <compiler.h>
+#include <magenta/compiler.h>
 #include <reg.h>
 #include <arch/arm64.h>
+#include <arch/arm64/mp.h>
 
 __BEGIN_CDECLS
 
@@ -33,7 +34,7 @@ static inline void arch_disable_ints(void)
 
 static inline bool arch_ints_disabled(void)
 {
-    unsigned int state;
+    unsigned long state;
 
     __asm__ volatile("mrs %0, daif" : "=r"(state));
     state &= (1<<7);
@@ -56,7 +57,7 @@ static inline void arch_disable_fiqs(void)
 // XXX
 static inline bool arch_fiqs_disabled(void)
 {
-    unsigned int state;
+    unsigned long state;
 
     __asm__ volatile("mrs %0, daif" : "=r"(state));
     state &= (1<<6);
@@ -66,12 +67,12 @@ static inline bool arch_fiqs_disabled(void)
 
 static inline void arch_spinloop_pause(void)
 {
-    __asm__ volatile("wfe");
+    __asm__ volatile("wfe" ::: "memory");
 }
 
 static inline void arch_spinloop_signal(void)
 {
-    __asm__ volatile("sev");
+    __asm__ volatile("sev" ::: "memory");
 }
 
 #define mb()        __asm__ volatile("dsb sy" : : : "memory")
@@ -88,61 +89,33 @@ static inline void arch_spinloop_signal(void)
 #define smp_rmb()   CF
 #endif
 
-static inline uint32_t arch_cycle_count(void)
+static inline uint64_t arch_cycle_count(void)
 {
-#if ARM_ISA_ARM7M
-#if ENABLE_CYCLE_COUNTER
-#define DWT_CYCCNT (0xE0001004)
-    return *REG32(DWT_CYCCNT);
-#else
-    return 0;
-#endif
-#elif ARM_ISA_ARMV7
-    uint32_t count;
-    __asm__ volatile("mrc       p15, 0, %0, c9, c13, 0"
-                     : "=r" (count)
-                    );
-    return count;
-#else
-//#warning no arch_cycle_count implementation
-    return 0;
-#endif
+    return ARM64_READ_SYSREG(pmccntr_el0);
 }
 
-/* use the cpu local thread context pointer to store current_thread */
-static inline struct thread *get_current_thread(void)
-{
-    return (struct thread *)ARM64_READ_SYSREG(tpidr_el1);
+static inline uint32_t arch_dcache_line_size(void) {
+    // According to ARMv8 manual D7.2.21, the Cache Type Register (CTR)
+    // is a 32 bit control register that contains the smallest icache
+    // line size and smallest dcache line size.
+    uint32_t ctr = (uint32_t)ARM64_READ_SYSREG(ctr_el0);
+
+    // Bits 16:19 of the CTR tell us the log_2 of the number of _words_
+    // in the smallest _data_ cache line on this system.
+    uint32_t dcache_log2 = (ctr >> 16) & 0xf;
+    return 4u << dcache_log2;
 }
 
-static inline void set_current_thread(struct thread *t)
-{
-    ARM64_WRITE_SYSREG(tpidr_el1, (uint64_t)t);
+// Log architecture-specific data for process creation.
+// This can only be called after the process has been created and before
+// it is running: |aspace| is assumed to live across the call.
+// Alas we can't use mx_koid_t here as the arch layer is at a lower level
+// than magenta.
+struct arch_aspace;
+static inline void arch_trace_process_create(uint64_t pid, const struct arch_aspace* aspace) {
+    // nothing to do
 }
-
-#if WITH_SMP
-static inline uint arch_curr_cpu_num(void)
-{
-    uint64_t mpidr =  ARM64_READ_SYSREG(mpidr_el1);
-    return ((mpidr & ((1U << SMP_CPU_ID_BITS) - 1)) >> 8 << SMP_CPU_CLUSTER_SHIFT) | (mpidr & 0xff);
-}
-extern uint arm_num_cpus;
-static inline uint arch_max_num_cpus(void)
-{
-    return arm_num_cpus;
-}
-#else
-static inline uint arch_curr_cpu_num(void)
-{
-    return 0;
-}
-static inline uint arch_max_num_cpus(void)
-{
-    return 1;
-}
-#endif
 
 __END_CDECLS
 
 #endif // ASSEMBLY
-

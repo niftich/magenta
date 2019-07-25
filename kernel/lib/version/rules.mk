@@ -17,9 +17,9 @@ MODULE_SRCS += \
 # suffix it with _LOCAL if OFFICIAL_BUILD is unset
 ifeq ($(strip $(BUILDID)),)
 ifneq ($(OFFICIAL_BUILD),)
-BUILDID := "$(shell $(LOCAL_DIR)/buildid.sh)"
+BUILDID := "$(shell $(SHELLEXEC) $(LOCAL_DIR)/buildid.sh)"
 else
-BUILDID := "$(shell $(LOCAL_DIR)/buildid.sh)_LOCAL"
+BUILDID := "$(shell $(SHELLEXEC) $(LOCAL_DIR)/buildid.sh)_LOCAL"
 endif
 endif
 
@@ -28,7 +28,7 @@ endif
 # included yet set BUILDID.
 BUILDID_DEFINE="BUILDID=\"$(BUILDID)\""
 BUILDID_H := $(BUILDDIR)/config-buildid.h
-$(BUILDID_H): .PHONY
+$(BUILDID_H): FORCE
 	@$(call MAKECONFIGHEADER,$@,BUILDID_DEFINE)
 
 GENERATED += $(BUILDID_H)

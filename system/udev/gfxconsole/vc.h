@@ -1,44 +1,24 @@
-// Copyright 2016 The Fuchsia Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#pragma once
 
 #include <assert.h>
-#include <ddk/device.h>
-#include <ddk/common/hid.h>
+
 #include <gfx/gfx.h>
 #include <hid/hid.h>
 #include <mxio/vfs.h>
-#include <system/listnode.h>
-#include <runtime/mutex.h>
+#include <magenta/listnode.h>
+#include <magenta/thread_annotations.h>
 #include <stdbool.h>
+#include <threads.h>
 
 #include "textcon.h"
 
-typedef uint16_t vc_char_t;
-#define CHARVAL(ch, fg, bg) (((ch)&0xff) | (((fg)&0xf) << 8) | (((bg)&0xf) << 12))
-#define TOCHAR(ch) ((ch)&0xff)
-#define TOFG(ch) (((ch) >> 8) & 0xf)
-#define TOBG(ch) (((ch) >> 12) & 0xf)
-
 #define MAX_COLOR 0xf
 
-typedef struct vc_device {
-    mx_device_t device;
-
-    mxr_mutex_t lock;
-    // protect output state of the vc
-    // fifo.lock below protects input state
-
+typedef struct vc {
     char title[8];
     // vc title, shown in status bar
     bool active;
@@ -50,92 +30,110 @@ typedef struct vc_device {
     gfx_surface* gfx;
     // surface to draw on
     gfx_surface* st_gfx;
-    // status bar surface
-    gfx_surface* hw_gfx;
+
+#if BUILD_FOR_TEST
+    gfx_surface* test_gfx;
+#endif
+
+    int fd;
+
     // backing store
     const gfx_font* font;
 
     vc_char_t* text_buf;
     // text buffer
+
+    // Buffer containing scrollback lines.  This is a circular buffer.
     vc_char_t* scrollback_buf;
-    // scrollback buffer
+    // Maximum number of rows that may be stored in the scrollback buffer.
+    unsigned scrollback_rows_max;
+    // Number of rows currently stored in the scrollback buffer.
+    unsigned scrollback_rows_count;
+    // Offset, in rows, of the oldest row in the scrollback buffer.
+    unsigned scrollback_offset;
 
     unsigned rows, columns;
     // screen size
     unsigned charw, charh;
     // size of character cell
-    unsigned scrollback_rows;
-    // number of rows in scrollback
 
     int invy0, invy1;
     // offscreen invalid lines, tracked during textcon drawing
 
-    unsigned x, y;
+    unsigned cursor_x, cursor_y;
     // cursor
     bool hide_cursor;
     // cursor visibility
-    int vpy;
+    int viewport_y;
     // viewport position, must be <= 0
-    unsigned sc_h, sc_t;
-    // offsets into the scrollback buffer in rows
 
     uint32_t palette[16];
-    unsigned front_color;
-    unsigned back_color;
+    uint8_t front_color;
+    uint8_t back_color;
     // color
 
     textcon_t textcon;
 
-    mx_hid_fifo_t fifo;
-    hid_keys_t key_states[2];
-    int key_idx;
     keychar_t* keymap;
-    // hid event fifo
 
     struct list_node node;
     // for virtual console list
+} vc_t;
 
-    // for char interface
-    uint32_t modifiers;
-    char chardata[4];
-    uint32_t charcount;
-} vc_device_t;
+// When VC_FLAG_HASOUTPUT is set, this indicates that there was output to
+// the console that hasn't been displayed yet, because this console isn't
+// visible.
+#define VC_FLAG_HASOUTPUT   (1 << 0)
+#define VC_FLAG_FULLSCREEN  (1 << 1)
 
-#define get_vc_device(dev) containerof(dev, vc_device_t, device)
+extern mtx_t g_vc_lock;
 
-#define VC_FLAG_HASINPUT (1 << 0)
-#define VC_FLAG_RESETSCROLL (1 << 1)
+const gfx_font* vc_get_font();
+mx_status_t vc_alloc(gfx_surface* test, int fd, vc_t** out_dev);
+void vc_free(vc_t* vc);
 
-mx_status_t vc_device_alloc(gfx_surface* hw_gfx, vc_device_t** out_dev);
-void vc_device_free(vc_device_t* dev);
+void vc_get_status_line(char* str, int n) TA_REQ(g_vc_lock);
 
-mx_status_t vc_set_active_console(unsigned console);
-void vc_get_status_line(char* str, int n);
+enum vc_battery_state {
+    UNAVAILABLE = 0, NOT_CHARGING, CHARGING, ERROR
+};
 
-void vc_device_write_status(vc_device_t* dev);
-void vc_device_render(vc_device_t* dev);
-int vc_device_get_scrollback_lines(vc_device_t* dev);
-void vc_device_scroll_viewport(vc_device_t* dev, int dir);
+typedef struct vc_battery_info {
+    enum vc_battery_state state;
+    int pct;
+} vc_battery_info_t;
+void vc_get_battery_info(vc_battery_info_t* info) TA_REQ(g_vc_lock);
+
+void vc_write_status(vc_t* vc) TA_REQ(g_vc_lock);
+void vc_render(vc_t* vc) TA_REQ(g_vc_lock);
+void vc_invalidate_all_for_testing(vc_t* vc);
+int vc_get_scrollback_lines(vc_t* vc);
+vc_char_t* vc_get_scrollback_line_ptr(vc_t* vc, unsigned row);
+void vc_scroll_viewport(vc_t* vc, int dir) TA_REQ(g_vc_lock);
+void vc_scroll_viewport_top(vc_t* vc) TA_REQ(g_vc_lock);
+void vc_scroll_viewport_bottom(vc_t* vc) TA_REQ(g_vc_lock);
+void vc_set_fullscreen(vc_t* vc, bool fullscreen)
+    TA_REQ(g_vc_lock);
+
+ssize_t vc_write(vc_t* vc, const void* buf, size_t count,
+                        mx_off_t off);
+
+static inline int vc_rows(vc_t* vc) {
+    return vc->flags & VC_FLAG_FULLSCREEN ? vc->rows : vc->rows - 1;
+}
 
 // drawing:
 
-void vc_gfx_invalidate_all(vc_device_t* dev);
-void vc_gfx_invalidate_status(vc_device_t* dev);
-void vc_gfx_invalidate(vc_device_t* dev, unsigned x, unsigned y, unsigned w, unsigned h);
-void vc_gfx_draw_char(vc_device_t* dev, vc_char_t ch, unsigned x, unsigned y);
+void vc_gfx_invalidate_all(vc_t* vc);
+void vc_gfx_invalidate_status(vc_t* vc);
+// invalidates a region in characters
+void vc_gfx_invalidate(vc_t* vc, unsigned x, unsigned y, unsigned w, unsigned h);
+// invalidates a region in pixels
+void vc_gfx_invalidate_region(vc_t* vc, unsigned x, unsigned y, unsigned w, unsigned h);
+void vc_gfx_draw_char(vc_t* vc, vc_char_t ch, unsigned x, unsigned y,
+                      bool invert);
 
-static inline uint32_t palette_to_color(vc_device_t* dev, uint8_t color) {
+static inline uint32_t palette_to_color(vc_t* vc, uint8_t color) {
     assert(color <= MAX_COLOR);
-    return dev->palette[color];
+    return vc->palette[color];
 }
-
-#define MOD_LSHIFT (1 << 0)
-#define MOD_RSHIFT (1 << 1)
-#define MOD_LALT (1 << 2)
-#define MOD_RALT (1 << 3)
-#define MOD_LCTRL (1 << 4)
-#define MOD_RCTRL (1 << 5)
-
-#define MOD_SHIFT (MOD_LSHIFT | MOD_RSHIFT)
-#define MOD_ALT (MOD_LALT | MOD_RALT)
-#define MOD_CTRL (MOD_LCTRL | MOD_RCTRL)

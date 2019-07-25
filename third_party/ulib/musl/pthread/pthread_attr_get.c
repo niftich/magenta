@@ -5,7 +5,7 @@ int pthread_attr_getdetachstate(const pthread_attr_t* a, int* state) {
     return 0;
 }
 int pthread_attr_getguardsize(const pthread_attr_t* restrict a, size_t* restrict size) {
-    *size = a->_a_guardsize + DEFAULT_GUARD_SIZE;
+    *size = a->_a_guardsize;
     return 0;
 }
 
@@ -32,15 +32,15 @@ int pthread_attr_getscope(const pthread_attr_t* restrict a, int* restrict scope)
 
 int pthread_attr_getstack(const pthread_attr_t* restrict a, void** restrict addr,
                           size_t* restrict size) {
-    if (!a->_a_stackaddr)
+    if (a->_a_stackaddr == NULL)
         return EINVAL;
-    *size = a->_a_stacksize + DEFAULT_STACK_SIZE;
-    *addr = (void*)(a->_a_stackaddr - *size);
+    *addr = a->_a_stackaddr;
+    *size = a->_a_stacksize;
     return 0;
 }
 
 int pthread_attr_getstacksize(const pthread_attr_t* restrict a, size_t* restrict size) {
-    *size = a->_a_stacksize + DEFAULT_STACK_SIZE;
+    *size = a->_a_stacksize;
     return 0;
 }
 
@@ -60,6 +60,6 @@ int pthread_mutexattr_getrobust(const pthread_mutexattr_t* restrict a, int* rest
 }
 
 int pthread_mutexattr_gettype(const pthread_mutexattr_t* restrict a, int* restrict type) {
-    *type = a->__attr & 3;
+    *type = a->__attr & PTHREAD_MUTEX_MASK;
     return 0;
 }

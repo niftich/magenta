@@ -9,7 +9,7 @@ mx_cprng_draw - Draw from the kernel's CPRNG
 ```
 #include <magenta/syscalls.h>
 
-mx_ssize_t mx_cprng_draw(void* buffer, mx_size_t len);
+mx_status_t mx_cprng_draw(void* buffer, size_t len, size_t* actual);
 ```
 
 ## DESCRIPTION
@@ -20,13 +20,18 @@ suitable for cryptographic applications.  It will return at most
 
 ## RETURN VALUE
 
-**mx_cprng_add_entropy**() returns **NO_ERROR** on success.
+**mx_cprng_draw**() returns NO_ERROR and the number of random bytes
+drawn into *buffer* (via *actual) on success.
 
 ## ERRORS
 
-**ERR_INVALID_ARGS**  *len* is too large.
+**ERR_INVALID_ARGS** *len* is too large, or *buffer* or *actual* is
+not a valid userspace pointer.
 
-**ERR_INVALID_ARGS**  *buffer* is not a valid user space pointer.
+## NOTES
+
+There are no other error conditions.  If its arguments are valid,
+**mx_cprng_draw**() will succeed.
 
 ## BUGS
 

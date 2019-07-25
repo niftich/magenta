@@ -10,29 +10,26 @@ LOCAL_DIR := $(GET_LOCAL_DIR)
 MODULE := $(LOCAL_DIR)
 
 MODULE_DEPS := \
-	lib/libc \
-	lib/debug \
-	lib/heap \
+	kernel/lib/debug \
+	kernel/lib/dpc \
+	kernel/lib/heap \
+	kernel/lib/libc \
+	kernel/lib/mxtl \
 
 
 MODULE_SRCS := \
-	$(LOCAL_DIR)/cond.c \
 	$(LOCAL_DIR)/debug.c \
 	$(LOCAL_DIR)/event.c \
 	$(LOCAL_DIR)/init.c \
 	$(LOCAL_DIR)/mutex.c \
+	$(LOCAL_DIR)/sched.c \
 	$(LOCAL_DIR)/thread.c \
 	$(LOCAL_DIR)/timer.c \
-	$(LOCAL_DIR)/semaphore.c \
 	$(LOCAL_DIR)/mp.c \
-	$(LOCAL_DIR)/port.c \
 	$(LOCAL_DIR)/cmdline.c \
 
+MODULE_DEPS += kernel/kernel/vm
 
-ifeq ($(WITH_KERNEL_VM),1)
-MODULE_DEPS += kernel/vm
-else
-MODULE_DEPS += kernel/novm
-endif
+MDI_INCLUDES += kernel/include/mdi/kernel-defs.mdi
 
 include make/module.mk

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Copyright 2016 The Fuchsia Authors
 #
@@ -28,7 +28,12 @@
 # ELF symbol bits consistently.  But the type letters map to these symbol
 # details when symbols are defined in the usual ways by a compiler.)
 
-set -o pipefail -e
+if [ "$(basename $0)" = "sh" ]
+then
+  set -e
+else
+  set -o pipefail -e
+fi
 
 show_address=false
 zero_function_size=false
@@ -60,7 +65,7 @@ massage() {
     # The numbers are printed in hex, but without a leading "0x" indicator.
     addr="0x$addr"
     if [ -z "$size" ]; then
-      size=0
+      size="0x0"
     else
       size="0x$size"
     fi
@@ -97,7 +102,7 @@ massage() {
 
     if $zero_function_size; then
       case $type in
-      FUNCTION|WEAK_FUNCTION) size=0 ;;
+      FUNCTION|WEAK_FUNCTION) size="0x0" ;;
       esac
     fi
 

@@ -10,7 +10,7 @@
 
 #include <sys/types.h>
 #include <list.h>
-#include <compiler.h>
+#include <magenta/compiler.h>
 #include <arch/defines.h>
 #include <arch/ops.h>
 #include <arch/thread.h>
@@ -37,20 +37,15 @@ typedef struct wait_queue {
 /* NOTE: must be inside critical section when using these */
 void wait_queue_init(wait_queue_t *wait);
 
-/*
- * release all the threads on this wait queue with a return code of ERR_CANCELLED.
- * the caller must assure that no other threads are operating on the wait queue during or
- * after the call.
- */
-void wait_queue_destroy(wait_queue_t *, bool reschedule);
+void wait_queue_destroy(wait_queue_t *);
 
 /*
  * block on a wait queue.
  * return status is whatever the caller of wait_queue_wake_*() specifies.
- * a timeout other than INFINITE_TIME will set abort after the specified time
- * and return ERR_TIMED_OUT. a timeout of 0 will immediately return.
+ * a deadline other than INFINITE_TIME will abort at the specified time
+ * and return ERR_TIMED_OUT. a deadline in the past will immediately return.
  */
-status_t wait_queue_block(wait_queue_t *, lk_time_t timeout);
+status_t wait_queue_block(wait_queue_t *, lk_time_t deadline);
 
 /*
  * release one or more threads from the wait queue.
@@ -59,12 +54,16 @@ status_t wait_queue_block(wait_queue_t *, lk_time_t timeout);
  */
 int wait_queue_wake_one(wait_queue_t *, bool reschedule, status_t wait_queue_error);
 int wait_queue_wake_all(wait_queue_t *, bool reschedule, status_t wait_queue_error);
+struct thread *wait_queue_dequeue_one(wait_queue_t *wait, status_t wait_queue_error);
 
 /*
  * remove the thread from whatever wait queue it's in.
  * return an error if the thread is not currently blocked (or is the current thread)
  */
 status_t thread_unblock_from_wait_queue(struct thread *t, status_t wait_queue_error);
+
+/* is the wait queue currently empty */
+bool wait_queue_is_empty(wait_queue_t *);
 
 __END_CDECLS;
 

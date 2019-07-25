@@ -5,24 +5,22 @@
 // license that can be found in the LICENSE file or at
 // https://opensource.org/licenses/MIT
 
-#ifndef __DEV_UART_H
-#define __DEV_UART_H
+#pragma once
 
+#include <magenta/compiler.h>
 #include <stdbool.h>
 #include <sys/types.h>
+
+__BEGIN_CDECLS
 
 void uart_init(void);
 void uart_init_early(void);
 
-int uart_putc(int port, char c);
-int uart_getc(int port, bool wait);
-void uart_flush_tx(int port);
-void uart_flush_rx(int port);
-void uart_init_port(int port, uint baud);
+int uart_putc(char c);
+int uart_getc(bool wait);
 
 /* panic-time uart accessors, intended to be run with interrupts disabled */
-int uart_pputc(int port, char c);
-int uart_pgetc(int port);
+int uart_pputc(char c);
+int uart_pgetc(void);
 
-#endif
-
+__END_CDECLS

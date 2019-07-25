@@ -1,39 +1,21 @@
-// Copyright 2016 The Fuchsia Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
 
 #pragma once
 
 #include <inttypes.h>
-#include <magenta/types.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
+#include <magenta/compiler.h>
+#include <magenta/types.h>
+#include <magenta/pixelformat.h>
+
+__BEGIN_CDECLS
+
 // gfx library
-
-// different graphics formats
-typedef enum {
-    GFX_FORMAT_NONE,
-    GFX_FORMAT_RGB_565,
-    GFX_FORMAT_RGB_332,
-    GFX_FORMAT_RGB_2220,
-    GFX_FORMAT_ARGB_8888,
-    GFX_FORMAT_RGB_x888,
-    GFX_FORMAT_MONO,
-
-    GFX_FORMAT_MAX
-} gfx_format;
 
 #define MAX_ALPHA 255
 
@@ -56,7 +38,7 @@ typedef struct gfx_font gfx_font;
 struct gfx_surface {
     void* ptr;
     uint32_t flags;
-    gfx_format format;
+    uint32_t format;
     unsigned width;
     unsigned height;
     unsigned stride;
@@ -74,7 +56,7 @@ struct gfx_surface {
 };
 
 struct gfx_font {
-    uint16_t* data;
+    const uint16_t* data;
     unsigned width;
     unsigned height;
 };
@@ -116,8 +98,8 @@ static inline void gfx_clear(gfx_surface* surface, unsigned color) {
 }
 
 // surface setup
-gfx_surface* gfx_create_surface(void* ptr, unsigned width, unsigned height, unsigned stride, gfx_format format, uint32_t flags);
-mx_status_t gfx_init_surface(gfx_surface* surface, void* ptr, unsigned width, unsigned height, unsigned stride, gfx_format format, uint32_t flags);
+gfx_surface* gfx_create_surface(void* ptr, unsigned width, unsigned height, unsigned stride, unsigned format, uint32_t flags);
+mx_status_t gfx_init_surface(gfx_surface* surface, void* ptr, unsigned width, unsigned height, unsigned stride, unsigned format, uint32_t flags);
 
 // free the surface
 // optionally frees the buffer if the free bit is set
@@ -128,3 +110,5 @@ void gfx_draw_pattern(void);
 
 extern const gfx_font font9x16;
 extern const gfx_font font18x32;
+
+__END_CDECLS

@@ -4,20 +4,24 @@
 // license that can be found in the LICENSE file or at
 // https://opensource.org/licenses/MIT
 
+#include "tests.h"
+
+#include <stdio.h>
+#include <inttypes.h>
 #include <kernel/thread.h>
 #include <platform.h>
 
-// Tests that thread_sleep and current_time_hires() are consistent.
+// Tests that thread_sleep and current_time() are consistent.
 static int thread_sleep_test(void)
 {
     int early = 0;
     for (int i = 0; i < 5; i++) {
-        lk_bigtime_t now = current_time_hires();
-        thread_sleep(500);
-        lk_bigtime_t actual_delay = current_time_hires() - now;
-        if (actual_delay < 500 * 1000) {
+        lk_time_t now = current_time();
+        thread_sleep_relative(LK_MSEC(500));
+        lk_time_t actual_delay = current_time() - now;
+        if (actual_delay < LK_MSEC(500)) {
             early = 1;
-            printf("thread_sleep(500) returned after %lluus\n", actual_delay);
+            printf("thread_sleep_relative(LK_MSEC(500)) returned after %" PRIu64 " ns\n", actual_delay);
         }
     }
     return early;

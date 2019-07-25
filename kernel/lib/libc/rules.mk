@@ -10,8 +10,8 @@ LOCAL_DIR := $(GET_LOCAL_DIR)
 MODULE := $(LOCAL_DIR)
 
 MODULE_DEPS := \
-	lib/heap \
-	lib/io
+	kernel/lib/heap \
+	kernel/lib/io
 
 MODULE_SRCS += \
 	$(LOCAL_DIR)/atoi.c \
@@ -26,7 +26,7 @@ MODULE_SRCS += \
 	$(LOCAL_DIR)/qsort.c \
 	$(LOCAL_DIR)/eabi.c \
 	$(LOCAL_DIR)/atexit.c \
-	$(LOCAL_DIR)/pure_virtual.cpp
+	$(LOCAL_DIR)/cxa_atexit.cpp
 
 include $(LOCAL_DIR)/string/rules.mk
 

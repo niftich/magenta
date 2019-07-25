@@ -1,22 +1,12 @@
-// Copyright 2016 The Fuchsia Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
 
 #pragma once
 
+#include <magenta/compiler.h>
 #include <magenta/processargs.h>
 #include <magenta/types.h>
-#include <system/compiler.h>
 #include <stdalign.h>
 
 __BEGIN_CDECLS
@@ -42,11 +32,13 @@ mx_status_t mxr_processargs_read(mx_handle_t bootstrap,
 // This assumes mxr_processargs_read has already succeeded on the same
 // buffer.  It unpacks the argument and environment strings into arrays
 // provided by the caller.  If not NULL, the argv[] array must have
-// mx_proc_args_t.args_num elements.  If not NULL, the envp[] array must
-// have mx_proc_args_t.environ_num + 1 elements, the last one being filled
-// with a NULL pointer.
+// mx_proc_args_t.args_num + 1 elements.  If not NULL, the envp[] array
+// must have mx_proc_args_t.environ_num + 1 elements.  If not NULL, the
+// names[] array must have mx_proc_args_t.names_num + 1 elements. The
+// last element of each array is filled with a NULL pointer.
 mx_status_t mxr_processargs_strings(void* msg, uint32_t bytes,
-                                    char* argv[], char* envp[]);
+                                    char* argv[], char* envp[],
+                                    char* names[]);
 
 #pragma GCC visibility pop
 

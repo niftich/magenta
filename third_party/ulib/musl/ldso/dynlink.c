@@ -1,7 +1,7 @@
 #define _GNU_SOURCE
 #include "dynlink.h"
 #include "libc.h"
-#include "malloc_impl.h"
+#include "magenta_impl.h"
 #include "pthread_impl.h"
 #include "stdio_impl.h"
 #include <ctype.h>
@@ -12,9 +12,13 @@
 #include <limits.h>
 #include <link.h>
 #include <magenta/dlfcn.h>
+#include <magenta/process.h>
+#include <magenta/status.h>
 #include <pthread.h>
 #include <setjmp.h>
+#include <stdalign.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -28,17 +32,17 @@
 
 #include <runtime/message.h>
 #include <runtime/processargs.h>
-#include <runtime/status.h>
-void __mxr_thread_main(void);
-
+#include <runtime/thread.h>
 
 static void error(const char*, ...);
 static void debugmsg(const char*, ...);
-static mx_handle_t get_library_vmo(const char* name);
+static mx_status_t get_library_vmo(const char* name, mx_handle_t* vmo);
 
 #define MAXP2(a, b) (-(-(a) & -(b)))
 #define ALIGN(x, y) ((x) + (y)-1 & -(y))
 
+// This matches struct r_debug in <link.h>.
+// TODO(mcgrathr): Use the type here.
 struct debug {
     int ver;
     void* head;
@@ -47,22 +51,20 @@ struct debug {
     void* base;
 };
 
-struct td_index {
-    size_t args[2];
-    struct td_index* next;
-};
-
 struct dso {
+    // These five fields match struct link_map in <link.h>.
+    // TODO(mcgrathr): Use the type here.
     unsigned char* base;
     char* name;
-    const char* soname;
-    size_t* dynv;
+    ElfW(Dyn)* dynv;
     struct dso *next, *prev;
 
+    const char* soname;
     Phdr* phdr;
     int phnum;
     size_t phentsize;
     int refcnt;
+    mx_handle_t vmar; // Closed after relocation.
     Sym* syms;
     uint32_t* hashtab;
     uint32_t* ghashtab;
@@ -73,22 +75,20 @@ struct dso {
     signed char global;
     char relocated;
     char constructed;
-    char kernel_mapped;
     struct dso **deps, *needed_by;
     struct tls_module tls;
     size_t tls_id;
     size_t relro_start, relro_end;
     void** new_dtv;
     unsigned char* new_tls;
-    volatile int new_dtv_idx, new_tls_idx;
-    struct td_index* td_index;
+    atomic_int new_dtv_idx, new_tls_idx;
     struct dso* fini_next;
     struct funcdesc {
         void* addr;
         size_t* got;
     } * funcdescs;
     size_t* got;
-    char buf[];
+    struct dso* buf[];
 };
 
 struct symdef {
@@ -96,27 +96,17 @@ struct symdef {
     struct dso* dso;
 };
 
-int __init_tp(void*);
-void __init_libc(char**, char*);
-void* __copy_tls(unsigned char*);
-
-static struct builtin_tls {
-    char c;
-    struct pthread pt;
-    void* space[16];
-} builtin_tls[1];
-#define MIN_TLS_ALIGN offsetof(struct builtin_tls, pt)
+#define MIN_TLS_ALIGN alignof(struct pthread)
 
 #define ADDEND_LIMIT 4096
 static size_t *saved_addends, *apply_addends_to;
 
-static struct dso ldso;
+static struct dso ldso, vdso;
 static struct dso *head, *tail, *fini_head;
 static unsigned long long gencnt;
 static int runtime;
 static int ldd_mode;
 static int ldso_fail;
-static int noload;
 static jmp_buf* rtld_fail;
 static pthread_rwlock_t lock;
 static struct debug debug;
@@ -128,7 +118,16 @@ static pthread_mutex_t init_fini_lock = {._m_type = PTHREAD_MUTEX_RECURSIVE};
 static mx_handle_t loader_svc = MX_HANDLE_INVALID;
 static mx_handle_t logger = MX_HANDLE_INVALID;
 
+// Various tools use this value to bootstrap their knowledge of the process.
+// E.g., the list of loaded shared libraries is obtained from here.
+// The value is stored in the process's MX_PROPERTY_PROCESS_DEBUG_ADDR so that
+// tools can obtain the value when aslr is enabled.
 struct debug* _dl_debug_addr = &debug;
+
+// If true then dump load map data in a specific format for tracing.
+// This is used by Intel PT (Processor Trace) support for example when
+// post-processing the h/w trace.
+static bool trace_maps = false;
 
 __attribute__((__visibility__("hidden"))) void (*const __init_array_start)(void) = 0,
                                                        (*const __fini_array_start)(void) = 0;
@@ -146,30 +145,99 @@ static int dl_strcmp(const char* l, const char* r) {
 }
 #define strcmp(l, r) dl_strcmp(l, r)
 
+
+// Simple bump allocator for dynamic linker internal data structures.
+// This allocator is single-threaded: it can be used only at startup or
+// while holding the big lock.  These allocations can never be freed
+// once in use.  But it does support a simple checkpoint and rollback
+// mechanism to undo all allocations since the checkpoint, used for the
+// abortive dlopen case.
+
+union allocated_types {
+    struct dso dso;
+    size_t tlsdesc[2];
+};
+#define DL_ALLOC_ALIGN alignof(union allocated_types)
+
+static uintptr_t alloc_base, alloc_limit, alloc_ptr;
+
+__NO_SAFESTACK __attribute__((malloc)) static void* dl_alloc(size_t size) {
+    // Round the size up so the allocation pointer always stays aligned.
+    size = (size + DL_ALLOC_ALIGN - 1) & -DL_ALLOC_ALIGN;
+
+    // Get more pages if needed.  The remaining partial page, if any,
+    // is wasted unless the system happens to give us the adjacent page.
+    if (alloc_limit - alloc_ptr < size) {
+        size_t chunk_size = (size + PAGE_SIZE - 1) & -PAGE_SIZE;
+        mx_handle_t vmo;
+        mx_status_t status = _mx_vmo_create(chunk_size, 0, &vmo);
+        if (status != NO_ERROR)
+            return NULL;
+        uintptr_t chunk;
+        status = _mx_vmar_map(_mx_vmar_root_self(), 0, vmo, 0, chunk_size,
+                              MX_VM_FLAG_PERM_READ | MX_VM_FLAG_PERM_WRITE,
+                              &chunk);
+        _mx_handle_close(vmo);
+        if (status != NO_ERROR)
+            return NULL;
+        if (chunk != alloc_limit)
+            alloc_ptr = alloc_base = chunk;
+        alloc_limit = chunk + chunk_size;
+    }
+
+    void* block = (void*)alloc_ptr;
+    alloc_ptr += size;
+
+    return block;
+}
+
+struct dl_alloc_checkpoint {
+    uintptr_t ptr, base;
+};
+
+__NO_SAFESTACK
+static void dl_alloc_checkpoint(struct dl_alloc_checkpoint *state) {
+    state->ptr = alloc_ptr;
+    state->base = alloc_base;
+}
+
+__NO_SAFESTACK
+static void dl_alloc_rollback(const struct dl_alloc_checkpoint *state) {
+    uintptr_t frontier = alloc_ptr;
+    // If we're still using the same contiguous chunk as the checkpoint
+    // state, we can just restore the old state directly and waste nothing.
+    // If we've allocated new chunks since then, the best we can do is
+    // reset to the beginning of the current chunk, since we haven't kept
+    // track of the past chunks.
+    alloc_ptr = alloc_base == state->base ? state->ptr : alloc_base;
+    memset((void*)alloc_ptr, 0, frontier - alloc_ptr);
+}
+
+
 /* Compute load address for a virtual address in a given dso. */
 #define laddr(p, v) (void*)((p)->base + (v))
 #define fpaddr(p, v) ((void (*)(void))laddr(p, v))
 
-static void decode_vec(size_t* v, size_t* a, size_t cnt) {
+__NO_SAFESTACK static void decode_vec(ElfW(Dyn)* v, size_t* a, size_t cnt) {
     size_t i;
     for (i = 0; i < cnt; i++)
         a[i] = 0;
-    for (; v[0]; v += 2)
-        if (v[0] - 1 < cnt - 1) {
-            a[0] |= 1UL << v[0];
-            a[v[0]] = v[1];
+    for (; v->d_tag; v++)
+        if (v->d_tag - 1 < cnt - 1) {
+            a[0] |= 1UL << v->d_tag;
+            a[v->d_tag] = v->d_un.d_val;
         }
 }
 
-static int search_vec(size_t* v, size_t* r, size_t key) {
-    for (; v[0] != key; v += 2)
-        if (!v[0])
+__NO_SAFESTACK static int search_vec(ElfW(Dyn)* v, size_t* r, size_t key) {
+    for (; v->d_tag != key; v++)
+        if (!v->d_tag)
             return 0;
-    *r = v[1];
+    *r = v->d_un.d_val;
     return 1;
 }
 
-static uint32_t sysv_hash(const char* s0) {
+__NO_SAFESTACK static uint32_t sysv_hash(const char* s0) {
     const unsigned char* s = (void*)s0;
     uint_fast32_t h = 0;
     while (*s) {
@@ -179,7 +247,7 @@ static uint32_t sysv_hash(const char* s0) {
     return h & 0xfffffff;
 }
 
-static uint32_t gnu_hash(const char* s0) {
+__NO_SAFESTACK static uint32_t gnu_hash(const char* s0) {
     const unsigned char* s = (void*)s0;
     uint_fast32_t h = 5381;
     for (; *s; s++)
@@ -187,7 +255,8 @@ static uint32_t gnu_hash(const char* s0) {
     return h;
 }
 
-static Sym* sysv_lookup(const char* s, uint32_t h, struct dso* dso) {
+__NO_SAFESTACK static Sym* sysv_lookup(const char* s, uint32_t h,
+                                       struct dso* dso) {
     size_t i;
     Sym* syms = dso->syms;
     uint32_t* hashtab = dso->hashtab;
@@ -199,7 +268,8 @@ static Sym* sysv_lookup(const char* s, uint32_t h, struct dso* dso) {
     return 0;
 }
 
-static Sym* gnu_lookup(uint32_t h1, uint32_t* hashtab, struct dso* dso, const char* s) {
+__NO_SAFESTACK static Sym* gnu_lookup(uint32_t h1, uint32_t* hashtab,
+                                      struct dso* dso, const char* s) {
     uint32_t nbuckets = hashtab[0];
     uint32_t* buckets = hashtab + 4 + hashtab[2] * (sizeof(size_t) / 4);
     uint32_t i = buckets[h1 % nbuckets];
@@ -221,8 +291,9 @@ static Sym* gnu_lookup(uint32_t h1, uint32_t* hashtab, struct dso* dso, const ch
     return 0;
 }
 
-static Sym* gnu_lookup_filtered(uint32_t h1, uint32_t* hashtab, struct dso* dso, const char* s,
-                                uint32_t fofs, size_t fmask) {
+__NO_SAFESTACK static Sym* gnu_lookup_filtered(uint32_t h1, uint32_t* hashtab,
+                                               struct dso* dso, const char* s,
+                                               uint32_t fofs, size_t fmask) {
     const size_t* bloomwords = (const void*)(hashtab + 4);
     size_t f = bloomwords[fofs & (hashtab[2] - 1)];
     if (!(f & fmask))
@@ -243,10 +314,11 @@ static Sym* gnu_lookup_filtered(uint32_t h1, uint32_t* hashtab, struct dso* dso,
 #define ARCH_SYM_REJECT_UND(s) 0
 #endif
 
-static struct symdef find_sym(struct dso* dso, const char* s, int need_def) {
+__NO_SAFESTACK static struct symdef find_sym(struct dso* dso,
+                                             const char* s, int need_def) {
     uint32_t h = 0, gh, gho, *ght;
     size_t ghm = 0;
-    struct symdef def = {0};
+    struct symdef def = {};
     for (; dso; dso = dso->next) {
         Sym* sym;
         if (!dso->global)
@@ -289,7 +361,8 @@ static struct symdef find_sym(struct dso* dso, const char* s, int need_def) {
 
 __attribute__((__visibility__("hidden"))) ptrdiff_t __tlsdesc_static(void), __tlsdesc_dynamic(void);
 
-static void do_relocs(struct dso* dso, size_t* rel, size_t rel_size, size_t stride) {
+__NO_SAFESTACK static void do_relocs(struct dso* dso, size_t* rel,
+                                     size_t rel_size, size_t stride) {
     unsigned char* base = dso->base;
     Sym* syms = dso->syms;
     char* strings = dso->strings;
@@ -413,16 +486,14 @@ static void do_relocs(struct dso* dso, size_t* rel, size_t rel_size, size_t stri
             if (stride < 3)
                 addend = reloc_addr[1];
             if (runtime && def.dso->tls_id >= static_tls_cnt) {
-                struct td_index* new = malloc(sizeof *new);
+                size_t* new = dl_alloc(2 * sizeof(size_t));
                 if (!new) {
                     error("Error relocating %s: cannot allocate TLSDESC for %s", dso->name,
                           sym ? name : "(local)");
                     longjmp(*rtld_fail, 1);
                 }
-                new->next = dso->td_index;
-                dso->td_index = new;
-                new->args[0] = def.dso->tls_id;
-                new->args[1] = tls_val + addend;
+                new[0] = def.dso->tls_id;
+                new[1] = tls_val + addend;
                 reloc_addr[0] = (size_t)__tlsdesc_dynamic;
                 reloc_addr[1] = (size_t) new;
             } else {
@@ -443,119 +514,60 @@ static void do_relocs(struct dso* dso, size_t* rel, size_t rel_size, size_t stri
     }
 }
 
-/* A huge hack: to make up for the wastefulness of shared libraries
- * needing at least a page of dirty memory even if they have no global
- * data, we reclaim the gaps at the beginning and end of writable maps
- * and "donate" them to the heap. */
-
-static void reclaim(struct dso* dso, size_t start, size_t end) {
-    if (start >= dso->relro_start && start < dso->relro_end)
-        start = dso->relro_end;
-    if (end >= dso->relro_start && end < dso->relro_end)
-        end = dso->relro_start;
-    __donate_heap(laddr(dso, start), laddr(dso, end));
-}
-
-static void reclaim_gaps(struct dso* dso) {
-    Phdr* ph = dso->phdr;
-    size_t phcnt = dso->phnum;
-
-    for (; phcnt--; ph = (void*)((char*)ph + dso->phentsize)) {
-        if (ph->p_type != PT_LOAD)
-            continue;
-        if ((ph->p_flags & (PF_R | PF_W)) != (PF_R | PF_W))
-            continue;
-        reclaim(dso, ph->p_vaddr & -PAGE_SIZE, ph->p_vaddr);
-        reclaim(dso, ph->p_vaddr + ph->p_memsz,
-                ph->p_vaddr + ph->p_memsz + PAGE_SIZE - 1 & -PAGE_SIZE);
-    }
-}
-
-static void unmap_library(struct dso* dso) {
+__NO_SAFESTACK static void unmap_library(struct dso* dso) {
     if (dso->map && dso->map_len) {
         munmap(dso->map, dso->map_len);
     }
+    if (dso->vmar != MX_HANDLE_INVALID) {
+        _mx_vmar_destroy(dso->vmar);
+        _mx_handle_close(dso->vmar);
+        dso->vmar = MX_HANDLE_INVALID;
+    }
 }
 
-static void* choose_load_address(size_t span) {
-    // vm_map requires some vm_object handle, so create a dummy one.
-    mx_handle_t vmo = mx_vm_object_create(0);
-
-    // Do a mapping to let the kernel choose an address range.
-    // TODO(MG-161): This really ought to be a no-access mapping (PROT_NONE
-    // in POSIX terms).  But the kernel currently doesn't allow that, so do
-    // a read-only mapping.
-    uintptr_t base;
-    mx_status_t status = mx_process_vm_map(libc.proc, vmo, 0, span, &base,
-                                           MX_VM_FLAG_PERM_READ);
-    mx_handle_close(vmo);
-    if (status < 0) {
-        error("failed to reserve %zu bytes of address space: %d\n",
-                span, status);
-        errno = ENOMEM;
-        return MAP_FAILED;
-    }
-
-    // TODO(MG-133): Really we should just leave the no-access mapping in
-    // place and let each PT_LOAD mapping overwrite it.  But the kernel
-    // currently doesn't allow splitting an existing mapping to overwrite
-    // part of it.  So we remove the address-reserving mapping before
-    // starting on the actual PT_LOAD mappings.  NOTE! THIS IS RACY!
-    // That is, in the general case of dlopen when there are multiple
-    // threads, it's racy.  For the startup case (or any time when there
-    // is only one thread), it's fine.
-    status = mx_process_vm_unmap(libc.proc, base, 0);
-    if (status < 0) {
-        error("vm_unmap failed on reservation %#" PRIxPTR "+%zu: %d\n",
-                base, span, status);
-        errno = ENOMEM;
-        return MAP_FAILED;
-    }
-
-    return (void*)base;
-}
-
-static void* map_library(mx_handle_t vmo, struct dso* dso) {
-    Ehdr buf[(896 + sizeof(Ehdr)) / sizeof(Ehdr)];
-    void* allocated_buf = 0;
+__NO_SAFESTACK static mx_status_t map_library(mx_handle_t vmo,
+                                              struct dso* dso) {
+    struct {
+        Ehdr ehdr;
+        // A typical ELF file has 7 or 8 phdrs, so in practice
+        // this is always enough.  Life is simpler if there is no
+        // need for dynamic allocation here.
+        Phdr phdrs[16];
+    } buf;
     size_t phsize;
     size_t addr_min = SIZE_MAX, addr_max = 0, map_len;
     size_t this_min, this_max;
     size_t nsegs = 0;
-    off_t off_start = 0;
-    Ehdr* eh;
+    const Ehdr* const eh = &buf.ehdr;
     Phdr *ph, *ph0;
     unsigned char *map = MAP_FAILED, *base;
     size_t dyn = 0;
     size_t tls_image = 0;
     size_t i;
 
-    ssize_t l = mx_vm_object_read(vmo, buf, 0, sizeof buf);
-    eh = buf;
-    if (l < 0)
-        return 0;
-    if (l < sizeof *eh || (eh->e_type != ET_DYN && eh->e_type != ET_EXEC))
+    size_t l;
+    mx_status_t status = _mx_vmo_read(vmo, &buf, 0, sizeof(buf), &l);
+    if (status != NO_ERROR)
+        return status;
+    // We cannot support ET_EXEC in the general case, because its fixed
+    // addresses might conflict with where the dynamic linker has already
+    // been loaded.  It's also policy in Fuchsia that all executables are
+    // PIEs to maximize ASLR security benefits.  So don't even try to
+    // handle loading ET_EXEC.
+    if (l < sizeof *eh || eh->e_type != ET_DYN)
         goto noexec;
     phsize = eh->e_phentsize * eh->e_phnum;
-    if (phsize > sizeof buf - sizeof *eh) {
-        allocated_buf = malloc(phsize);
-        if (!allocated_buf)
-            return 0;
-        l = mx_vm_object_read(vmo, allocated_buf, eh->e_phoff, phsize);
-        if (l < 0)
+    if (phsize > sizeof(buf.phdrs))
+        goto noexec;
+    if (eh->e_phoff + phsize > l) {
+        status = _mx_vmo_read(vmo, buf.phdrs, eh->e_phoff, phsize, &l);
+        if (status != NO_ERROR)
             goto error;
         if (l != phsize)
             goto noexec;
-        ph = ph0 = allocated_buf;
-    } else if (eh->e_phoff + phsize > l) {
-        l = mx_vm_object_read(vmo, buf + 1, eh->e_phoff, phsize);
-        if (l < 0)
-            goto error;
-        if (l != phsize)
-            goto noexec;
-        ph = ph0 = (void*)(buf + 1);
+        ph = ph0 = buf.phdrs;
     } else {
-        ph = ph0 = (void*)((char*)buf + eh->e_phoff);
+        ph = ph0 = (void*)((char*)&buf + eh->e_phoff);
     }
     for (i = eh->e_phnum; i; i--, ph = (void*)((char*)ph + eh->e_phentsize)) {
         if (ph->p_type == PT_DYNAMIC) {
@@ -574,7 +586,6 @@ static void* map_library(mx_handle_t vmo, struct dso* dso) {
         nsegs++;
         if (ph->p_vaddr < addr_min) {
             addr_min = ph->p_vaddr;
-            off_start = ph->p_offset;
         }
         if (ph->p_vaddr + ph->p_memsz > addr_max) {
             addr_max = ph->p_vaddr + ph->p_memsz;
@@ -585,19 +596,26 @@ static void* map_library(mx_handle_t vmo, struct dso* dso) {
     addr_max += PAGE_SIZE - 1;
     addr_max &= -PAGE_SIZE;
     addr_min &= -PAGE_SIZE;
-    off_start &= -PAGE_SIZE;
-    map_len = addr_max - addr_min + off_start;
-    map = choose_load_address(map_len);
-    if (map == MAP_FAILED)
-        goto error;
-    dso->map = map;
-    dso->map_len = map_len;
-    /* If the loaded file is not relocatable and the requested address is
-     * not available, then the load operation must fail. */
-    if (eh->e_type != ET_DYN && addr_min && map != (void*)addr_min) {
-        errno = EBUSY;
+    map_len = addr_max - addr_min;
+
+    // Allocate a VMAR to reserve the whole address range.  Stash
+    // the new VMAR's handle until relocation has finished, because
+    // we need it to adjust page protections for RELRO.
+    uintptr_t vmar_base;
+    status = _mx_vmar_allocate(__magenta_vmar_root_self, 0, map_len,
+                               MX_VM_FLAG_CAN_MAP_READ |
+                                   MX_VM_FLAG_CAN_MAP_WRITE |
+                                   MX_VM_FLAG_CAN_MAP_EXECUTE |
+                                   MX_VM_FLAG_CAN_MAP_SPECIFIC,
+                               &dso->vmar, &vmar_base);
+    if (status != NO_ERROR) {
+        error("failed to reserve %zu bytes of address space: %d\n",
+              map_len, status);
         goto error;
     }
+
+    dso->map = map = (void*)vmar_base;
+    dso->map_len = map_len;
     base = map - addr_min;
     dso->phdr = 0;
     dso->phnum = 0;
@@ -614,11 +632,8 @@ static void* map_library(mx_handle_t vmo, struct dso* dso) {
         }
         this_min = ph->p_vaddr & -PAGE_SIZE;
         this_max = ph->p_vaddr + ph->p_memsz + PAGE_SIZE - 1 & -PAGE_SIZE;
-        off_start = ph->p_offset & -PAGE_SIZE;
-        // TODO(mcgrathr): This should use the copy-on-write flag, but
-        // it doesn't exist yet.  Instead, for now this eagerly copies
-        // the data into a new VMO.
-        uint32_t mx_flags = MX_VM_FLAG_FIXED;
+        size_t off_start = ph->p_offset & -PAGE_SIZE;
+        uint32_t mx_flags = MX_VM_FLAG_SPECIFIC;
         mx_flags |= (ph->p_flags & PF_R) ? MX_VM_FLAG_PERM_READ : 0;
         mx_flags |= (ph->p_flags & PF_W) ? MX_VM_FLAG_PERM_WRITE : 0;
         mx_flags |= (ph->p_flags & PF_X) ? MX_VM_FLAG_PERM_EXECUTE : 0;
@@ -627,85 +642,75 @@ static void* map_library(mx_handle_t vmo, struct dso* dso) {
         size_t map_size = this_max - this_min;
         if (map_size == 0)
             continue;
-#if 1
-        // TODO(mcgrathr): Temporary hack to avoid modifying the file VMO.
-        // This will go away when we have copy-on-write.
+
         if (ph->p_flags & PF_W) {
+            // TODO(mcgrathr,MG-698): When MG-698 is fixed, we can clone to
+            // a size that's not whole pages, and then extending it with
+            // set_size will do the partial-page zeroing for us implicitly.
             size_t data_size =
                 ((ph->p_vaddr + ph->p_filesz + PAGE_SIZE - 1) & -PAGE_SIZE) -
                 this_min;
-            if (data_size > 0) {
-                mx_handle_t copy_vmo = mx_vm_object_create(data_size);
-                if (copy_vmo < 0)
-                    __builtin_trap();
-                uintptr_t window = 0;
-                mx_status_t status = mx_process_vm_map(
-                    0, vmo, off_start, data_size, &window,
-                    MX_VM_FLAG_PERM_READ);
-                if (status < 0)
-                    __builtin_trap();
-                mx_ssize_t n = mx_vm_object_write(copy_vmo, (void*)window,
-                                                  0, data_size);
-                mx_process_vm_unmap(0, window, 0);
-                if (n != (mx_ssize_t)data_size)
-                    __builtin_trap();
-                map_vmo = copy_vmo;         // Leak the handle.
-                off_start = 0;
-                map_size = data_size;
-            }
-        }
-#endif
-        mx_status_t status = mx_process_vm_map(libc.proc, map_vmo, off_start,
-                                               map_size, &mapaddr, mx_flags);
-        if (status < 0) {
-        mx_error:
-            // TODO(mcgrathr): Perhaps this should translate the kernel
-            // error in 'status' into an errno value.  Or perhaps it should
-            // just assert that the kernel error was among an expected set.
-            // Probably all failures of these kernel calls should either
-            // be totally fatal or should translate into ENOMEM.
-            errno = ENOMEM;
-            goto error;
-        }
-        if (ph->p_memsz > ph->p_filesz) {
-            size_t brk = (size_t)base + ph->p_vaddr + ph->p_filesz;
-            size_t pgbrk = brk + PAGE_SIZE - 1 & -PAGE_SIZE;
-            memset((void*)brk, 0, pgbrk - brk & PAGE_SIZE - 1);
-            if (pgbrk - (size_t)base < this_max) {
-                size_t bss_len = (size_t)base + this_max - pgbrk;
-                mx_handle_t bss_vmo = mx_vm_object_create(bss_len);
-                if (bss_vmo < 0) {
-                    status = bss_vmo;
-                    goto mx_error;
+            if (data_size == 0) {
+                // This segment is purely zero-fill.
+                status = _mx_vmo_create(map_size, 0, &map_vmo);
+            } else {
+                // Get a writable (lazy) copy of the portion of the file VMO.
+                status = _mx_vmo_clone(vmo, MX_VMO_CLONE_COPY_ON_WRITE,
+                                       off_start, data_size, &map_vmo);
+                if (status == NO_ERROR && map_size > data_size) {
+                    // Extend the writable VMO to cover the .bss pages too.
+                    // These pages will be zero-filled, not copied from the
+                    // file VMO.
+                    status = _mx_vmo_set_size(map_vmo, map_size);
+                    if (status != NO_ERROR) {
+                        _mx_handle_close(map_vmo);
+                        goto error;
+                    }
                 }
-                uintptr_t bss_mapaddr = pgbrk;
-                status = mx_process_vm_map(libc.proc, bss_vmo, 0, bss_len,
-                                           &bss_mapaddr, mx_flags);
-                mx_handle_close(bss_vmo);
-                if (status < 0)
-                    goto mx_error;
             }
+            if (status != NO_ERROR)
+                goto error;
+            off_start = 0;
+        } else if (ph->p_memsz > ph->p_filesz) {
+            // Read-only .bss is not a thing.
+            goto noexec;
+        }
+
+        status = _mx_vmar_map(dso->vmar, mapaddr - vmar_base, map_vmo,
+                              off_start, map_size, mx_flags, &mapaddr);
+        if (map_vmo != vmo)
+            _mx_handle_close(map_vmo);
+        if (status != NO_ERROR)
+            goto error;
+
+        if (ph->p_memsz > ph->p_filesz) {
+            // The final partial page of data from the file is followed by
+            // whatever the file's contents there are, but in the memory
+            // image that partial page should be all zero.
+            uintptr_t file_end = (uintptr_t)base + ph->p_vaddr + ph->p_filesz;
+            uintptr_t map_end = mapaddr + map_size;
+            if (map_end > file_end)
+                memset((void*)file_end, 0, map_end - file_end);
         }
     }
-done_mapping:
+
     dso->base = base;
     dso->dynv = laddr(dso, dyn);
     if (dso->tls.size)
         dso->tls.image = laddr(dso, tls_image);
-    if (!runtime)
-        reclaim_gaps(dso);
-    free(allocated_buf);
-    return map;
+    return NO_ERROR;
 noexec:
-    errno = ENOEXEC;
+    // We overload this to translate into ENOEXEC later.
+    status = ERR_WRONG_TYPE;
 error:
     if (map != MAP_FAILED)
         unmap_library(dso);
-    free(allocated_buf);
-    return 0;
+    if (dso->vmar != MX_HANDLE_INVALID)
+        _mx_handle_close(dso->vmar);
+    return status;
 }
 
-static void decode_dyn(struct dso* p) {
+__NO_SAFESTACK static void decode_dyn(struct dso* p) {
     size_t dyn[DYN_CNT];
     decode_vec(p->dynv, dyn, DYN_CNT);
     p->syms = laddr(p, dyn[DT_SYMTAB]);
@@ -742,7 +747,20 @@ static size_t count_syms(struct dso* p) {
     return nsym;
 }
 
-static struct dso* find_library(const char* name) {
+__NO_SAFESTACK static struct dso* find_library_in(struct dso* p,
+                                                  const char* name) {
+    while (p != NULL) {
+        if (!strcmp(p->name, name) ||
+            (p->soname != NULL && !strcmp(p->soname, name))) {
+            ++p->refcnt;
+            break;
+        }
+        p = p->next;
+    }
+    return p;
+}
+
+__NO_SAFESTACK static struct dso* find_library(const char* name) {
     int is_self = 0;
 
     /* Catch and block attempts to reload the implementation itself */
@@ -780,28 +798,148 @@ static struct dso* find_library(const char* name) {
         return &ldso;
     }
 
-    /* Search for the name to see if it's already loaded */
-    for (struct dso* p = head->next; p; p = p->next) {
-        if (!strcmp(p->name, name) ||
-            (p->soname != NULL && !strcmp(p->soname, name))) {
-            p->refcnt++;
-            return p;
+    // First see if it's in the general list.
+    struct dso* p = find_library_in(head, name);
+    if (p == NULL && ldso.prev == NULL) {
+        // ldso is not in the list yet, so the first search didn't notice
+        // anything that is only a dependency of ldso, i.e. the vDSO.
+        // See if the lookup by name matches ldso or its dependencies.
+        p = find_library_in(&ldso, name);
+        if (p != NULL) {
+            // Take it out of its place in the list rooted at ldso.
+            if (p->prev != NULL)
+                p->prev->next = p->next;
+            if (p->next != NULL)
+                p->next->prev = p->prev;
+            // Stick it on the main list.
+            tail->next = p;
+            p->prev = tail;
+            tail = p;
         }
     }
 
-    return NULL;
+    return p;
 }
 
-static struct dso* load_library_vmo(mx_handle_t vmo, const char* name,
-                                    struct dso* needed_by) {
-    unsigned char* map;
-    struct dso *p, temp_dso = {0};
+#define MAX_BUILDID_SIZE 64
+
+__NO_SAFESTACK static void read_buildid(struct dso* p,
+                                        char* buf, size_t buf_size) {
+    Phdr* ph = p->phdr;
+    size_t cnt;
+
+    for (cnt = p->phnum; cnt--; ph = (void*)((char*)ph + p->phentsize)) {
+        if (ph->p_type != PT_NOTE)
+            continue;
+
+        // Find the PT_LOAD segment we live in.
+        Phdr* ph2 = p->phdr;
+        Phdr* ph_load = NULL;
+        size_t cnt2;
+        for (cnt2 = p->phnum; cnt2--; ph2 = (void*)((char*)ph2 + p->phentsize)) {
+            if (ph2->p_type != PT_LOAD)
+                continue;
+            if (ph->p_vaddr >= ph2->p_vaddr &&
+                ph->p_vaddr < ph2->p_vaddr + ph2->p_filesz) {
+                ph_load = ph2;
+                break;
+            }
+        }
+        if (ph_load == NULL)
+            continue;
+
+        size_t off = ph_load->p_vaddr + (ph->p_offset - ph_load->p_offset);
+        size_t size = ph->p_filesz;
+
+        struct {
+            Elf32_Nhdr hdr;
+            char name[sizeof("GNU")];
+        } hdr;
+
+        while (size > sizeof(hdr)) {
+            memcpy(&hdr, (char*)p->base + off, sizeof(hdr));
+            size_t header_size = sizeof(Elf32_Nhdr) + ((hdr.hdr.n_namesz + 3) & -4);
+            size_t payload_size = (hdr.hdr.n_descsz + 3) & -4;
+            off += header_size;
+            size -= header_size;
+            uint8_t* payload = (uint8_t*)p->base + off;
+            off += payload_size;
+            size -= payload_size;
+            if (hdr.hdr.n_type != NT_GNU_BUILD_ID ||
+                hdr.hdr.n_namesz != sizeof("GNU") ||
+                memcmp(hdr.name, "GNU", sizeof("GNU")) != 0) {
+                continue;
+            }
+            if (hdr.hdr.n_descsz > MAX_BUILDID_SIZE) {
+                // TODO(dje): Revisit.
+                snprintf(buf, buf_size, "build_id_too_large_%u", hdr.hdr.n_descsz);
+            } else {
+                for (size_t i = 0; i < hdr.hdr.n_descsz; ++i) {
+                    snprintf(&buf[i * 2], 3, "%02x", payload[i]);
+                }
+            }
+            return;
+        }
+    }
+
+    strcpy(buf, "<none>");
+}
+
+__NO_SAFESTACK static void trace_load(struct dso* p) {
+    static mx_koid_t pid = MX_KOID_INVALID;
+    if (pid == MX_KOID_INVALID) {
+        mx_info_handle_basic_t process_info;
+        if (_mx_object_get_info(__magenta_process_self,
+                                MX_INFO_HANDLE_BASIC,
+                                &process_info, sizeof(process_info),
+                                NULL, NULL) == NO_ERROR) {
+            pid = process_info.koid;
+        } else {
+            // No point in continually calling mx_object_get_info.
+            // The first 100 are reserved.
+            pid = 1;
+        }
+    }
+
+    // Compute extra values useful to tools.
+    // This is done here so that it's only done when necessary.
+    char buildid[MAX_BUILDID_SIZE * 2 + 1];
+    read_buildid(p, buildid, sizeof(buildid));
+
+    const char* name = p->soname == NULL ? "<application>" : p->name;
+    const char* soname = p->soname == NULL ? "<application>" : p->soname;
+
+    // The output is in multiple lines to cope with damn line wrapping.
+    // N.B. Programs like the Intel Processor Trace decoder parse this output.
+    // Do not change without coordination with consumers.
+    // TODO(dje): Switch to official tracing mechanism when ready. MG-519
+    static int seqno;
+    debugmsg("@trace_load: %" PRIu64 ":%da %p %p %p",
+             pid, seqno, p->base, p->map, p->map + p->map_len);
+    debugmsg("@trace_load: %" PRIu64 ":%db %s",
+             pid, seqno, buildid);
+    debugmsg("@trace_load: %" PRIu64 ":%dc %s %s",
+             pid, seqno, soname, name);
+    ++seqno;
+}
+
+__NO_SAFESTACK static mx_status_t load_library_vmo(mx_handle_t vmo,
+                                                   const char* name,
+                                                   int rtld_mode,
+                                                   struct dso* needed_by,
+                                                   struct dso** loaded) {
+    struct dso *p, temp_dso = {};
     size_t alloc_size;
     int n_th = 0;
 
-    map = noload ? 0 : map_library(vmo, &temp_dso);
-    if (!map)
-        return 0;
+    if (rtld_mode & RTLD_NOLOAD) {
+        *loaded = NULL;
+        return NO_ERROR;
+    }
+
+    mx_status_t status = map_library(vmo, &temp_dso);
+    if (status != NO_ERROR)
+        return status;
 
     decode_dyn(&temp_dso);
     if (temp_dso.soname != NULL) {
@@ -810,7 +948,8 @@ static struct dso* load_library_vmo(mx_handle_t vmo, const char* name,
         p = find_library(temp_dso.soname);
         if (p != NULL) {
             unmap_library(&temp_dso);
-            return p;
+            *loaded = p;
+            return NO_ERROR;
         }
     }
 
@@ -820,42 +959,45 @@ static struct dso* load_library_vmo(mx_handle_t vmo, const char* name,
         name = temp_dso.soname;
         if (name == NULL) {
             unmap_library(&temp_dso);
-            errno = ENOEXEC;
-            return NULL;
+            return ERR_WRONG_TYPE;
         }
     }
+
+    // Calculate how many slots are needed for dependencies.
+    size_t ndeps = 0;
+    for (size_t i = 0; temp_dso.dynv[i].d_tag; i++) {
+        if (temp_dso.dynv[i].d_tag == DT_NEEDED)
+            ++ndeps;
+    }
+    if (ndeps > 0)
+        // Account for a NULL terminator.
+        ++ndeps;
 
     /* Allocate storage for the new DSO. When there is TLS, this
      * storage must include a reservation for all pre-existing
      * threads to obtain copies of both the new TLS, and an
      * extended DTV capable of storing an additional slot for
      * the newly-loaded DSO. */
-    alloc_size = sizeof *p + strlen(name) + 1;
+    alloc_size = sizeof *p + ndeps * sizeof(p->deps[0]) + strlen(name) + 1;
     if (runtime && temp_dso.tls.image) {
-        /* TODO(kulakowski) DSO TLS API */
-        /*
         size_t per_th = temp_dso.tls.size + temp_dso.tls.align + sizeof(void*) * (tls_cnt + 3);
-        n_th = libc.threads_minus_1 + 1;
+        n_th = atomic_load(&libc.thread_count);
         if (n_th > SSIZE_MAX / per_th)
             alloc_size = SIZE_MAX;
         else
             alloc_size += n_th * per_th;
-            */
-        a_crash();
     }
-    p = calloc(1, alloc_size);
+    p = dl_alloc(alloc_size);
     if (!p) {
         unmap_library(&temp_dso);
-        return 0;
+        return ERR_NO_MEMORY;
     }
-    memcpy(p, &temp_dso, sizeof temp_dso);
+    *p = temp_dso;
     p->refcnt = 1;
     p->needed_by = needed_by;
-    p->name = p->buf;
+    p->name = (void*)&p->buf[ndeps];
     strcpy(p->name, name);
     if (p->tls.image) {
-        // TODO(mcgrathr): ELF TLS support
-        __builtin_trap();
         p->tls_id = ++tls_cnt;
         tls_align = MAXP2(tls_align, p->tls.align);
 #ifdef TLS_ABOVE_TP
@@ -883,55 +1025,57 @@ static struct dso* load_library_vmo(mx_handle_t vmo, const char* name,
     if (ldd_mode)
         debugmsg("\t%s => %s (%p)\n", p->soname, name, p->base);
 
-    return p;
+    *loaded = p;
+    return NO_ERROR;
 }
 
-static struct dso* load_library(const char* name, struct dso* needed_by) {
-    if (!*name) {
-        errno = EINVAL;
-        return 0;
+__NO_SAFESTACK static mx_status_t load_library(const char* name, int rtld_mode,
+                                               struct dso* needed_by,
+                                               struct dso** loaded) {
+    if (!*name)
+        return ERR_INVALID_ARGS;
+
+    *loaded = find_library(name);
+    if (*loaded != NULL)
+        return NO_ERROR;
+
+    mx_handle_t vmo;
+    mx_status_t status = get_library_vmo(name, &vmo);
+    if (status == NO_ERROR) {
+        status = load_library_vmo(vmo, name, rtld_mode, needed_by, loaded);
+        _mx_handle_close(vmo);
     }
 
-    struct dso* p = find_library(name);
-    if (p == NULL) {
-        mx_handle_t vmo = get_library_vmo(name);
-        if (vmo >= 0) {
-            p = load_library_vmo(vmo, name, needed_by);
-            mx_handle_close(vmo);
-        }
-    }
-
-    return p;
+    return status;
 }
 
-static void load_deps(struct dso* p) {
-    size_t i, ndeps = 0;
-    struct dso ***deps = &p->deps, **tmp, *dep;
+__NO_SAFESTACK static void load_deps(struct dso* p) {
     for (; p; p = p->next) {
-        for (i = 0; p->dynv[i]; i += 2) {
-            if (p->dynv[i] != DT_NEEDED)
+        // These don't get space allocated for ->deps.
+        if (p == &ldso || p == &vdso)
+            continue;
+        struct dso** deps = NULL;
+        if (runtime && p->deps == NULL)
+            deps = p->deps = p->buf;
+        for (size_t i = 0; p->dynv[i].d_tag; i++) {
+            if (p->dynv[i].d_tag != DT_NEEDED)
                 continue;
-            dep = load_library(p->strings + p->dynv[i + 1], p);
-            if (!dep) {
-                error("Error loading shared library %s: %m (needed by %s)",
-                      p->strings + p->dynv[i + 1], p->name);
+            const char* name = p->strings + p->dynv[i].d_un.d_val;
+            struct dso* dep;
+            mx_status_t status = load_library(name, 0, p, &dep);
+            if (status != NO_ERROR) {
+                error("Error loading shared library %s: %s (needed by %s)",
+                      name, _mx_status_get_string(status), p->name);
                 if (runtime)
                     longjmp(*rtld_fail, 1);
-                continue;
-            }
-            if (runtime) {
-                tmp = realloc(*deps, sizeof(*tmp) * (ndeps + 2));
-                if (!tmp)
-                    longjmp(*rtld_fail, 1);
-                tmp[ndeps++] = dep;
-                tmp[ndeps] = 0;
-                *deps = tmp;
+            } else if (deps != NULL) {
+                *deps++ = dep;
             }
         }
     }
 }
 
-static void load_preload(char* s) {
+__NO_SAFESTACK static void load_preload(char* s) {
     int tmp;
     char* z;
     for (z = s; *z; s = z) {
@@ -941,17 +1085,18 @@ static void load_preload(char* s) {
             ;
         tmp = *z;
         *z = 0;
-        load_library(s, 0);
+        struct dso *p;
+        load_library(s, 0, NULL, &p);
         *z = tmp;
     }
 }
 
-static void make_global(struct dso* p) {
+__NO_SAFESTACK static void make_global(struct dso* p) {
     for (; p; p = p->next)
         p->global = 1;
 }
 
-static void do_mips_relocs(struct dso* p, size_t* got) {
+__NO_SAFESTACK static void do_mips_relocs(struct dso* p, size_t* got) {
     size_t i, j, rel[2];
     unsigned char* base = p->base;
     i = 0;
@@ -974,7 +1119,7 @@ static void do_mips_relocs(struct dso* p, size_t* got) {
     }
 }
 
-static void reloc_all(struct dso* p) {
+__NO_SAFESTACK static void reloc_all(struct dso* p) {
     size_t dyn[DYN_CNT];
     for (; p; p = p->next) {
         if (p->relocated)
@@ -986,23 +1131,39 @@ static void reloc_all(struct dso* p) {
         do_relocs(p, laddr(p, dyn[DT_REL]), dyn[DT_RELSZ], 2);
         do_relocs(p, laddr(p, dyn[DT_RELA]), dyn[DT_RELASZ], 3);
 
-#if 0
-        // TODO(mcgrathr): No mprotect yet, and ENOSYS stub not safe because
-        // TLS errno here might crash.
-        if (head != &ldso && p->relro_start != p->relro_end &&
-            mprotect(laddr(p, p->relro_start), p->relro_end - p->relro_start, PROT_READ) &&
-            errno != ENOSYS) {
-            error("Error relocating %s: RELRO protection failed: %m", p->name);
-            if (runtime)
-                longjmp(*rtld_fail, 1);
+        if (head != &ldso && p->relro_start != p->relro_end) {
+            mx_status_t status =
+                _mx_vmar_protect(p->vmar,
+                                 (uintptr_t)laddr(p, p->relro_start),
+                                 p->relro_end - p->relro_start,
+                                 MX_VM_FLAG_PERM_READ);
+            if (status == ERR_BAD_HANDLE &&
+                p == &ldso && p->vmar == MX_HANDLE_INVALID) {
+                debugmsg("No VMAR_LOADED handle received;"
+                         " cannot protect RELRO for %s\n",
+                         p->name);
+            } else if (status != NO_ERROR) {
+                error("Error relocating %s: RELRO protection"
+                      " %p+%#zx failed: %s",
+                      p->name,
+                      laddr(p, p->relro_start), p->relro_end - p->relro_start,
+                      _mx_status_get_string(status));
+                if (runtime)
+                    longjmp(*rtld_fail, 1);
+            }
         }
-#endif
+
+        // Hold the VMAR handle only long enough to apply RELRO.
+        // Now it's no longer needed and the mappings cannot be
+        // changed any more (only unmapped).
+        _mx_handle_close(p->vmar);
+        p->vmar = MX_HANDLE_INVALID;
 
         p->relocated = 1;
     }
 }
 
-static void kernel_mapped_dso(struct dso* p) {
+__NO_SAFESTACK static void kernel_mapped_dso(struct dso* p) {
     size_t min_addr = -1, max_addr = 0, cnt;
     Phdr* ph = p->phdr;
     for (cnt = p->phnum; cnt--; ph = (void*)((char*)ph + p->phentsize)) {
@@ -1023,7 +1184,6 @@ static void kernel_mapped_dso(struct dso* p) {
     max_addr = (max_addr + PAGE_SIZE - 1) & -PAGE_SIZE;
     p->map = p->base + min_addr;
     p->map_len = max_addr - min_addr;
-    p->kernel_mapped = 1;
 }
 
 void __libc_exit_fini(void) {
@@ -1083,20 +1243,15 @@ static void dl_debug_state(void) {}
 
 weak_alias(dl_debug_state, _dl_debug_state);
 
-#if 0
-// TODO(mcgrathr): Probably this comes back with working ELF TLS.
-void __init_tls(size_t* auxv) {}
-#endif
-
 __attribute__((__visibility__("hidden"))) void* __tls_get_new(size_t* v) {
     pthread_t self = __pthread_self();
 
     /* Block signals to make accessing new TLS async-signal-safe */
     sigset_t set;
     __block_all_sigs(&set);
-    if (v[0] <= (size_t)self->dtv[0]) {
+    if (v[0] <= (size_t)self->head.dtv[0]) {
         __restore_sigs(&set);
-        return (char*)self->dtv[v[0]] + v[1] + DTP_OFFSET;
+        return (char*)self->head.dtv[v[0]] + v[1] + DTP_OFFSET;
     }
 
     /* This is safe without any locks held because, if the caller
@@ -1108,21 +1263,21 @@ __attribute__((__visibility__("hidden"))) void* __tls_get_new(size_t* v) {
         ;
 
     /* Get new DTV space from new DSO if needed */
-    if (v[0] > (size_t)self->dtv[0]) {
-        void** newdtv = p->new_dtv + (v[0] + 1) * a_fetch_add(&p->new_dtv_idx, 1);
-        memcpy(newdtv, self->dtv, ((size_t)self->dtv[0] + 1) * sizeof(void*));
+    if (v[0] > (size_t)self->head.dtv[0]) {
+        void** newdtv = p->new_dtv + (v[0] + 1) * atomic_fetch_add(&p->new_dtv_idx, 1);
+        memcpy(newdtv, self->head.dtv, ((size_t)self->head.dtv[0] + 1) * sizeof(void*));
         newdtv[0] = (void*)v[0];
-        self->dtv = self->dtv_copy = newdtv;
+        self->head.dtv = newdtv;
     }
 
     /* Get new TLS memory from all new DSOs up to the requested one */
     unsigned char* mem;
     for (p = head;; p = p->next) {
-        if (!p->tls_id || self->dtv[p->tls_id])
+        if (!p->tls_id || self->head.dtv[p->tls_id])
             continue;
-        mem = p->new_tls + (p->tls.size + p->tls.align) * a_fetch_add(&p->new_tls_idx, 1);
+        mem = p->new_tls + (p->tls.size + p->tls.align) * atomic_fetch_add(&p->new_tls_idx, 1);
         mem += ((uintptr_t)p->tls.image - (uintptr_t)mem) & (p->tls.align - 1);
-        self->dtv[p->tls_id] = mem;
+        self->head.dtv[p->tls_id] = mem;
         memcpy(mem, p->tls.image, p->tls.len);
         if (p->tls_id == v[0])
             break;
@@ -1131,12 +1286,34 @@ __attribute__((__visibility__("hidden"))) void* __tls_get_new(size_t* v) {
     return mem + v[1] + DTP_OFFSET;
 }
 
-static void update_tls_size(void) {
+__NO_SAFESTACK struct pthread* __init_main_thread(mx_handle_t thread_self) {
+    pthread_attr_t attr = DEFAULT_PTHREAD_ATTR;
+    attr._a_stacksize = libc.stack_size;
+
+    pthread_t td = __allocate_thread(&attr);
+    if (td == NULL) {
+        debugmsg("No memory for %zu bytes thread-local storage.\n",
+                 libc.tls_size);
+        _exit(127);
+    }
+
+    mx_status_t status = mxr_thread_adopt(thread_self, &td->mxr_thread);
+    if (status != NO_ERROR)
+        __builtin_trap();
+
+    mxr_tp_set(thread_self, pthread_to_tp(td));
+    return td;
+}
+
+__NO_SAFESTACK static void update_tls_size(void) {
     libc.tls_cnt = tls_cnt;
     libc.tls_align = tls_align;
     libc.tls_size =
         ALIGN((1 + tls_cnt) * sizeof(void*) + tls_offset + sizeof(struct pthread) + tls_align * 2,
               tls_align);
+    // TODO(mcgrathr): The TLS block is always allocated in whole pages.
+    // We should keep track of the available slop to the end of the page
+    // and make dlopen use that for new dtv/TLS space when it fits.
 }
 
 /* Stage 1 of the dynamic linker is defined in dlstart.c. It calls the
@@ -1150,18 +1327,41 @@ static void update_tls_size(void) {
  * linker itself, but some of the relocations performed may need to be
  * replaced later due to copy relocations in the main program. */
 
-__attribute__((__visibility__("hidden"))) dl_start_return_t __dls2(
-    unsigned char* base, void* start_arg) {
-    ldso.base = base;
+static dl_start_return_t __dls3(void* start_arg);
+
+__NO_SAFESTACK __attribute__((__visibility__("hidden")))
+dl_start_return_t __dls2(
+    void* start_arg, void* vdso_map) {
+    ldso.base = (unsigned char*)__ehdr_start;
 
     Ehdr* ehdr = (void*)ldso.base;
-    ldso.name = "libc.so";
-    ldso.global = 1;
+    ldso.name = (char*)"libc.so";
+    ldso.global = -1;
     ldso.phnum = ehdr->e_phnum;
     ldso.phdr = laddr(&ldso, ehdr->e_phoff);
     ldso.phentsize = ehdr->e_phentsize;
     kernel_mapped_dso(&ldso);
     decode_dyn(&ldso);
+
+    if (vdso_map != NULL) {
+        // The vDSO was mapped in by our creator.  Stitch it in as
+        // a preloaded shared object right away, so ld.so itself
+        // can depend on it and require its symbols.
+
+        vdso.base = vdso_map;
+        vdso.name = (char*)"<vDSO>";
+        vdso.global = -1;
+
+        Ehdr* ehdr = vdso_map;
+        vdso.phnum = ehdr->e_phnum;
+        vdso.phdr = laddr(&vdso, ehdr->e_phoff);
+        vdso.phentsize = ehdr->e_phentsize;
+        kernel_mapped_dso(&vdso);
+        decode_dyn(&vdso);
+
+        vdso.prev = &ldso;
+        ldso.next = &vdso;
+    }
 
     /* Prepare storage for to save clobbered REL addends so they
      * can be reused in stage 3. There should be very few. If
@@ -1177,7 +1377,7 @@ __attribute__((__visibility__("hidden"))) dl_start_return_t __dls2(
         if (!IS_RELATIVE(rel[1], ldso.syms))
             symbolic_rel_cnt++;
     if (symbolic_rel_cnt >= ADDEND_LIMIT)
-        a_crash();
+        __builtin_trap();
     size_t addends[symbolic_rel_cnt + 1];
     saved_addends = addends;
 
@@ -1186,11 +1386,11 @@ __attribute__((__visibility__("hidden"))) dl_start_return_t __dls2(
 
     ldso.relocated = 0;
 
-    /* Call dynamic linker stage-3, __dls3, looking it up
-     * symbolically as a barrier against moving the address
-     * load across the above relocation processing. */
-    struct symdef dls3_def = find_sym(&ldso, "__dls3", 0);
-    return ((stage3_func)laddr(&ldso, dls3_def.sym->st_value))(start_arg);
+    // Make sure all the relocations have landed before calling __dls3,
+    // which relies on them.
+    atomic_signal_fence(memory_order_seq_cst);
+
+    return __dls3(start_arg);
 }
 
 /* Stage 3 of the dynamic linker is called with the dynamic linker/libc
@@ -1198,10 +1398,9 @@ __attribute__((__visibility__("hidden"))) dl_start_return_t __dls2(
  * process dependencies and relocations for the main application and
  * transfer control to its entry point. */
 
-static void* dls3(mx_handle_t exec_vmo, int argc, char** argv) {
+__NO_SAFESTACK static void* dls3(mx_handle_t exec_vmo, int argc, char** argv) {
     static struct dso app;
     size_t i;
-    char* env_preload = 0;
     char** argv_orig = argv;
 
     if (argc < 1 || argv[0] == NULL) {
@@ -1211,26 +1410,18 @@ static void* dls3(mx_handle_t exec_vmo, int argc, char** argv) {
 
     libc.page_size = PAGE_SIZE;
 
-    /* Setup early thread pointer in builtin_tls for ldso/libc itself to
-     * use during dynamic linking. If possible it will also serve as the
-     * thread pointer at runtime. */
-    libc.tls_size = sizeof builtin_tls;
-    libc.tls_align = tls_align;
-#if 0
-    // TODO(mcgrathr): ELF TLS support
-    if (__init_tp(__copy_tls((void*)builtin_tls)) < 0) {
-        a_crash();
-    }
-#endif
-
-    /* Only trust user/env if kernel says we're not suid/sgid */
     bool log_libs = false;
-    if (!libc.secure) {
-        env_preload = getenv("LD_PRELOAD");
+    char* ld_preload = getenv("LD_PRELOAD");
+    const char* ld_debug = getenv("LD_DEBUG");
+    if (ld_debug != NULL && ld_debug[0] != '\0')
+        log_libs = true;
 
-        const char* debug = getenv("LD_DEBUG");
-        if (debug != NULL && debug[0] != '\0')
-            log_libs = true;
+    {
+        // Features like Intel Processor Trace require specific output in a
+        // specific format. Thus this output has its own env var.
+        const char* ld_trace = getenv("LD_TRACE");
+        if (ld_trace != NULL && ld_trace[0] != '\0')
+            trace_maps = true;
     }
 
     if (exec_vmo == MX_HANDLE_INVALID) {
@@ -1248,11 +1439,11 @@ static void* dls3(mx_handle_t exec_vmo, int argc, char** argv) {
                 ldd_mode = 1;
             } else if (!memcmp(opt, "preload", 7)) {
                 if (opt[7] == '=')
-                    env_preload = opt + 8;
+                    ld_preload = opt + 8;
                 else if (opt[7])
                     *argv = 0;
                 else if (*argv)
-                    env_preload = *argv++;
+                    ld_preload = *argv++;
             } else {
                 argv[0] = 0;
             }
@@ -1268,17 +1459,18 @@ static void* dls3(mx_handle_t exec_vmo, int argc, char** argv) {
 
         ldso.name = ldname;
 
-        exec_vmo = get_library_vmo(argv[0]);
-        if (exec_vmo < 0) {
-            debugmsg("%s: cannot load %s: %d\n", ldname, argv[0], exec_vmo);
+        mx_status_t status = get_library_vmo(argv[0], &exec_vmo);
+        if (status != NO_ERROR) {
+            debugmsg("%s: cannot load %s: %d\n", ldname, argv[0], status);
             _exit(1);
         }
     }
 
-    Ehdr* ehdr = map_library(exec_vmo, &app);
-    mx_handle_close(exec_vmo);
-    if (!ehdr) {
-        debugmsg("%s: %s: Not a valid dynamic program\n", ldso.name, argv[0]);
+    mx_status_t status = map_library(exec_vmo, &app);
+    _mx_handle_close(exec_vmo);
+    if (status != NO_ERROR) {
+        debugmsg("%s: %s: Not a valid dynamic program (%s)\n",
+                 ldso.name, argv[0], _mx_status_get_string(status));
         _exit(1);
     }
 
@@ -1295,9 +1487,6 @@ static void* dls3(mx_handle_t exec_vmo, int argc, char** argv) {
     }
 
     if (app.tls.size) {
-        // TODO(mcgrathr): ELF TLS support
-        __builtin_trap();
-
         libc.tls_head = tls_tail = &app.tls;
         app.tls_id = tls_cnt = 1;
 #ifdef TLS_ABOVE_TP
@@ -1314,48 +1503,21 @@ static void* dls3(mx_handle_t exec_vmo, int argc, char** argv) {
     app.global = 1;
     decode_dyn(&app);
 
-    // TODO(mcgrathr): vdso will be different when we have one
-#if 0
-    /* Attach to vdso, if provided by the kernel */
-    if (search_vec(auxv, &vdso_base, AT_SYSINFO_EHDR)) {
-        Ehdr* ehdr = (void*)vdso_base;
-        Phdr* phdr = vdso.phdr = (void*)(vdso_base + ehdr->e_phoff);
-        vdso.phnum = ehdr->e_phnum;
-        vdso.phentsize = ehdr->e_phentsize;
-        for (i = ehdr->e_phnum; i; i--, phdr = (void*)((char*)phdr + ehdr->e_phentsize)) {
-            if (phdr->p_type == PT_DYNAMIC)
-                vdso.dynv = (void*)(vdso_base + phdr->p_offset);
-            if (phdr->p_type == PT_LOAD)
-                vdso.base = (void*)(vdso_base - phdr->p_vaddr + phdr->p_offset);
-        }
-        vdso.name = "";
-        vdso.global = 1;
-        vdso.relocated = 1;
-        decode_dyn(&vdso);
-        vdso.prev = &ldso;
-        ldso.next = &vdso;
-    }
-#endif
-
     /* Initial dso chain consists only of the app. */
     head = tail = &app;
 
-    // Donate unused parts of ldso mapping to malloc.
-    // map_library already did this for app.
-    reclaim_gaps(&ldso);
-
     /* Load preload/needed libraries, add their symbols to the global
      * namespace, and perform all remaining relocations. */
-    if (env_preload)
-        load_preload(env_preload);
+    if (ld_preload)
+        load_preload(ld_preload);
     load_deps(&app);
     make_global(&app);
 
-    for (i = 0; app.dynv[i]; i += 2) {
-        if (!DT_DEBUG_INDIRECT && app.dynv[i] == DT_DEBUG)
-            app.dynv[i + 1] = (size_t)&debug;
-        if (DT_DEBUG_INDIRECT && app.dynv[i] == DT_DEBUG_INDIRECT) {
-            size_t* ptr = (size_t*)app.dynv[i + 1];
+    for (i = 0; app.dynv[i].d_tag; i++) {
+        if (!DT_DEBUG_INDIRECT && app.dynv[i].d_tag == DT_DEBUG)
+            app.dynv[i].d_un.d_ptr = (size_t)&debug;
+        if (DT_DEBUG_INDIRECT && app.dynv[i].d_tag == DT_DEBUG_INDIRECT) {
+            size_t* ptr = (size_t*)app.dynv[i].d_un.d_ptr;
             *ptr = (size_t)&debug;
         }
     }
@@ -1366,31 +1528,6 @@ static void* dls3(mx_handle_t exec_vmo, int argc, char** argv) {
     reloc_all(&app);
 
     update_tls_size();
-
-    // TODO(mcgrathr): ELF TLS support
-#if 0
-    if (libc.tls_size > sizeof builtin_tls || tls_align > MIN_TLS_ALIGN) {
-        void* initial_tls = calloc(libc.tls_size, 1);
-        if (!initial_tls) {
-            debugmsg("%s: Error getting %zu bytes thread-local storage: %m\n", argv[0],
-                    libc.tls_size);
-            _exit(127);
-        }
-        if (__init_tp(__copy_tls(initial_tls)) < 0) {
-            a_crash();
-        }
-    } else {
-        size_t tmp_tls_size = libc.tls_size;
-        pthread_t self = __pthread_self();
-        /* Temporarily set the tls size to the full size of
-         * builtin_tls so that __copy_tls will use the same layout
-         * as it did for before. Then check, just to be safe. */
-        libc.tls_size = sizeof builtin_tls;
-        if (__copy_tls((void*)builtin_tls) != self)
-            a_crash();
-        libc.tls_size = tmp_tls_size;
-    }
-#endif
     static_tls_cnt = tls_cnt;
 
     if (ldso_fail)
@@ -1408,6 +1545,18 @@ static void* dls3(mx_handle_t exec_vmo, int argc, char** argv) {
     debug.head = head;
     debug.base = ldso.base;
     debug.state = 0;
+
+    status = _mx_object_set_property(__magenta_process_self,
+                                     MX_PROP_PROCESS_DEBUG_ADDR,
+                                     &_dl_debug_addr, sizeof(_dl_debug_addr));
+    if (status != NO_ERROR) {
+        // Bummer. Crashlogger backtraces, debugger sessions, etc. will be
+        // problematic, but this isn't fatal.
+        // TODO(dje): Is there a way to detect we're here because of being
+        // an injected process (launchpad_start_injected)? IWBN to print a
+        // warning here but launchpad_start_injected can trigger this.
+    }
+
     _dl_debug_state();
 
     if (log_libs) {
@@ -1430,26 +1579,39 @@ static void* dls3(mx_handle_t exec_vmo, int argc, char** argv) {
         }
     }
 
+    if (trace_maps) {
+        for (struct dso* p = &app; p != NULL; p = p->next) {
+            trace_load(p);
+        }
+    }
+
     // Reset from the argv[0] value so we don't save a dangling pointer
     // into the caller's stack frame.
-    app.name = "";
+    app.name = (char*)"";
 
-    errno = 0;
+    // Check for a PT_GNU_STACK header requesting a main thread stack size.
+    libc.stack_size = DEFAULT_PTHREAD_ATTR._a_stacksize;
+    for (i = 0; i < app.phnum; i++) {
+        if (app.phdr[i].p_type == PT_GNU_STACK) {
+            size_t size = app.phdr[i].p_memsz;
+            if (size > 0)
+                libc.stack_size = size;
+            break;
+        }
+    }
 
+    const Ehdr* ehdr = (void*)app.map;
     return laddr(&app, ehdr->e_entry);
 }
 
-dl_start_return_t __dls3(void* start_arg) {
-    // TODO(mcgrathr): Probably can drop this, but not clear yet.
-    __mxr_thread_main();
-
+__NO_SAFESTACK static dl_start_return_t __dls3(void* start_arg) {
     mx_handle_t bootstrap = (uintptr_t)start_arg;
 
     uint32_t nbytes, nhandles;
     mx_status_t status = mxr_message_size(bootstrap, &nbytes, &nhandles);
     if (status != NO_ERROR) {
         error("mxr_message_size bootstrap handle %#x failed: %d (%s)",
-              bootstrap, status, mx_strstatus(status));
+              bootstrap, status, _mx_status_get_string(status));
         nbytes = nhandles = 0;
     }
 
@@ -1464,14 +1626,15 @@ dl_start_return_t __dls3(void* start_arg) {
     if (status != NO_ERROR) {
         error("bad message of %u bytes, %u handles"
               " from bootstrap handle %#x: %d (%s)",
-              nbytes, nhandles, bootstrap, status, mx_strstatus(status));
+              nbytes, nhandles, bootstrap, status,
+              _mx_status_get_string(status));
         nbytes = nhandles = 0;
     }
 
     mx_handle_t exec_vmo = MX_HANDLE_INVALID;
     for (int i = 0; i < nhandles; ++i) {
-        switch (MX_HND_INFO_TYPE(handle_info[i])) {
-        case MX_HND_TYPE_LOADER_SVC:
+        switch (PA_HND_TYPE(handle_info[i])) {
+        case PA_SVC_LOADER:
             if (loader_svc != MX_HANDLE_INVALID ||
                 handles[i] == MX_HANDLE_INVALID) {
                 error("bootstrap message bad LOADER_SVC %#x vs %#x",
@@ -1479,7 +1642,7 @@ dl_start_return_t __dls3(void* start_arg) {
             }
             loader_svc = handles[i];
             break;
-        case MX_HND_TYPE_EXEC_VMO:
+        case PA_VMO_EXECUTABLE:
             if (exec_vmo != MX_HANDLE_INVALID ||
                 handles[i] == MX_HANDLE_INVALID) {
                 error("bootstrap message bad EXEC_VMO %#x vs %#x",
@@ -1487,7 +1650,7 @@ dl_start_return_t __dls3(void* start_arg) {
             }
             exec_vmo = handles[i];
             break;
-        case MX_HND_TYPE_MXIO_LOGGER:
+        case PA_MXIO_LOGGER:
             if (logger != MX_HANDLE_INVALID ||
                 handles[i] == MX_HANDLE_INVALID) {
                 error("bootstrap message bad MXIO_LOGGER %#x vs %#x",
@@ -1495,20 +1658,35 @@ dl_start_return_t __dls3(void* start_arg) {
             }
             logger = handles[i];
             break;
-        case MX_HND_TYPE_PROC_SELF:
-            if (0) // TODO(mcgrathr): later
-                libc.proc = handles[i];
+        case PA_VMAR_LOADED:
+            if (ldso.vmar != MX_HANDLE_INVALID ||
+                handles[i] == MX_HANDLE_INVALID) {
+                error("bootstrap message bad VMAR_LOADED %#x vs %#x",
+                      handles[i], ldso.vmar);
+            }
+            ldso.vmar = handles[i];
+            break;
+        case PA_PROC_SELF:
+            __magenta_process_self = handles[i];
+            break;
+        case PA_VMAR_ROOT:
+            __magenta_vmar_root_self = handles[i];
             break;
         default:
-            mx_handle_close(handles[i]);
+            _mx_handle_close(handles[i]);
             break;
         }
     }
 
+    if (__magenta_process_self == MX_HANDLE_INVALID)
+        error("bootstrap message bad no proc self");
+    if (__magenta_vmar_root_self == MX_HANDLE_INVALID)
+        error("bootstrap message bad no root vmar");
+
     // Unpack the environment strings so dls3 can use getenv.
-    char* argv[procargs->args_num];
+    char* argv[procargs->args_num + 1];
     char* envp[procargs->environ_num + 1];
-    status = mxr_processargs_strings(buffer, nbytes, argv, envp);
+    status = mxr_processargs_strings(buffer, nbytes, argv, envp, NULL);
     if (status == NO_ERROR)
         __environ = envp;
 
@@ -1519,30 +1697,68 @@ dl_start_return_t __dls3(void* start_arg) {
     // bootstrap message, but that's for __libc_start_main to see.
     __environ = NULL;
 
-    return DL_START_RETURN(entry, start_arg);
+    if (vdso.global <= 0) {
+        // Nothing linked against the vDSO.  Ideally we would unmap the
+        // vDSO, but there is no way to do it because the unmap system call
+        // would try to return to the vDSO code and crash.
+        if (ldso.global < 0) {
+            // TODO(mcgrathr): We could free all heap data structures, and
+            // with some vDSO assistance unmap ourselves and unwind back to
+            // the user entry point.  Thus a program could link against the
+            // vDSO alone and not use this libc/ldso at all after startup.
+            // We'd need to be sure there are no TLSDESC entries pointing
+            // back to our code, but other than that there should no longer
+            // be a way to enter our code.
+        } else {
+            debugmsg("Dynamic linker %s doesn't link in vDSO %s???\n",
+                     ldso.name, vdso.name);
+            _exit(127);
+        }
+    } else if (ldso.global <= 0) {
+        // This should be impossible.
+        __builtin_trap();
+    }
+
+   return DL_START_RETURN(entry, start_arg);
 }
 
-
 static void* dlopen_internal(mx_handle_t vmo, const char* file, int mode) {
-    struct dso* volatile p, *orig_tail, *next;
-    struct tls_module* orig_tls_tail;
-    size_t orig_tls_cnt, orig_tls_offset, orig_tls_align;
-    size_t i;
-    int cs;
-    jmp_buf jb;
-
-    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cs);
     pthread_rwlock_wrlock(&lock);
-    __inhibit_ptc();
+    __thread_allocation_inhibit();
 
-    p = 0;
-    orig_tls_tail = tls_tail;
-    orig_tls_cnt = tls_cnt;
-    orig_tls_offset = tls_offset;
-    orig_tls_align = tls_align;
-    orig_tail = tail;
-    noload = mode & RTLD_NOLOAD;
+    struct dso* orig_tail = tail;
 
+    struct dso* p;
+    mx_status_t status = (vmo != MX_HANDLE_INVALID ?
+                          load_library_vmo(vmo, file, mode, head, &p) :
+                          load_library(file, mode, head, &p));
+
+    if (status != NO_ERROR) {
+        error("Error loading shared library %s: %s",
+              file, _mx_status_get_string(status));
+    fail:
+        __thread_allocation_release();
+        pthread_rwlock_unlock(&lock);
+        return NULL;
+    }
+
+    if (p == NULL) {
+        if (!(mode & RTLD_NOLOAD))
+            __builtin_trap();
+        error("Library %s is not already loaded", file);
+        goto fail;
+    }
+
+    struct tls_module* orig_tls_tail = tls_tail;
+    size_t orig_tls_cnt = tls_cnt;
+    size_t orig_tls_offset = tls_offset;
+    size_t orig_tls_align = tls_align;
+
+    struct dl_alloc_checkpoint checkpoint;
+    dl_alloc_checkpoint(&checkpoint);
+
+    size_t i;
+    jmp_buf jb;
     rtld_fail = &jb;
     if (setjmp(*rtld_fail)) {
         /* Clean up anything new that was (partially) loaded */
@@ -1550,17 +1766,8 @@ static void* dlopen_internal(mx_handle_t vmo, const char* file, int mode) {
             for (i = 0; p->deps[i]; i++)
                 if (p->deps[i]->global < 0)
                     p->deps[i]->global = 0;
-        for (p = orig_tail->next; p; p = next) {
-            next = p->next;
-            while (p->td_index) {
-                void* tmp = p->td_index->next;
-                free(p->td_index);
-                p->td_index = tmp;
-            }
-            free(p->deps);
+        for (p = orig_tail->next; p; p = p->next)
             unmap_library(p);
-            free(p);
-        }
         if (!orig_tls_tail)
             libc.tls_head = 0;
         tls_tail = orig_tls_tail;
@@ -1569,19 +1776,8 @@ static void* dlopen_internal(mx_handle_t vmo, const char* file, int mode) {
         tls_align = orig_tls_align;
         tail = orig_tail;
         tail->next = 0;
-        p = 0;
-        goto end;
-    } else {
-        if (vmo != MX_HANDLE_INVALID)
-            p = load_library_vmo(vmo, file, head);
-        else
-            p = load_library(file, head);
-    }
-
-    if (!p) {
-        error(noload ? "Library %s is not already loaded" : "Error loading shared library %s: %m",
-              file);
-        goto end;
+        dl_alloc_rollback(&checkpoint);
+        goto fail;
     }
 
     /* First load handling */
@@ -1611,15 +1807,26 @@ static void* dlopen_internal(mx_handle_t vmo, const char* file, int mode) {
 
     update_tls_size();
     _dl_debug_state();
-    orig_tail = tail;
-end:
-    __release_ptc();
-    if (p)
-        gencnt++;
+    if (trace_maps) {
+        trace_load(p);
+    }
+
+    // Allow thread creation, now that the TLS bookkeeping is consistent.
+    __thread_allocation_release();
+
+    // Bump the dl_iterate_phdr dlpi_adds counter.
+    gencnt++;
+
+    // Collect the current new tail before we release the lock.
+    // Another dlopen can come in and advance the tail, but we
+    // alone are responsible for making sure that do_init_fini
+    // starts with the first object we just added.
+    struct dso* new_tail = tail;
+
     pthread_rwlock_unlock(&lock);
-    if (p)
-        do_init_fini(orig_tail);
-    pthread_setcancelstate(cs, 0);
+
+    do_init_fini(new_tail);
+
     return p;
 }
 
@@ -1630,7 +1837,7 @@ void* dlopen(const char* file, int mode) {
 }
 
 void* dlopen_vmo(mx_handle_t vmo, int mode) {
-    if (vmo < 0 || vmo == MX_HANDLE_INVALID) {
+    if (vmo == MX_HANDLE_INVALID) {
         errno = EINVAL;
         return NULL;
     }
@@ -1763,11 +1970,10 @@ int dladdr(const void* addr, Dl_info* info) {
     return 1;
 }
 
-__attribute__((__visibility__("hidden"))) void* __dlsym(void* restrict p, const char* restrict s,
-                                                        void* restrict ra) {
+void* dlsym(void* restrict p, const char* restrict s) {
     void* res;
     pthread_rwlock_rdlock(&lock);
-    res = do_dlsym(p, s, ra);
+    res = do_dlsym(p, s, __builtin_return_address(0));
     pthread_rwlock_unlock(&lock);
     return res;
 }
@@ -1805,10 +2011,12 @@ __attribute__((__visibility__("hidden"))) void __dl_vseterr(const char*, va_list
 
 // This detects recursion via the error function.
 static bool loader_svc_rpc_in_progress;
+static mx_txid_t loader_svc_txid;
 
-static mx_handle_t loader_svc_rpc(uint32_t opcode,
-                                  const void* data, size_t len) {
-    mx_handle_t handle = MX_HANDLE_INVALID;
+__NO_SAFESTACK static mx_status_t loader_svc_rpc(uint32_t opcode,
+                                                 const void* data, size_t len,
+                                                 mx_handle_t* result) {
+    mx_status_t status;
     struct {
         mx_loader_svc_msg_t header;
         uint8_t data[LOADER_SVC_MSG_MAX - sizeof(mx_loader_svc_msg_t)];
@@ -1819,85 +2027,86 @@ static mx_handle_t loader_svc_rpc(uint32_t opcode,
     if (len >= sizeof msg.data) {
         error("message of %zu bytes too large for loader service protocol",
               len);
-        handle = ERR_OUT_OF_RANGE;
+        status = ERR_OUT_OF_RANGE;
         goto out;
     }
 
     memset(&msg.header, 0, sizeof msg.header);
+    msg.header.txid = ++loader_svc_txid;
     msg.header.opcode = opcode;
     memcpy(msg.data, data, len);
     msg.data[len] = 0;
+    if (result != NULL) {
+      // Don't return an uninitialized value if the channel call
+      // succeeds but doesn't provide any handles.
+      *result = MX_HANDLE_INVALID;
+    }
 
-    uint32_t nbytes = sizeof msg.header + len + 1;
-    mx_status_t status = mx_message_write(loader_svc, &msg, nbytes,
-                                          NULL, 0, 0);
+    mx_channel_call_args_t call = {
+        .wr_bytes = &msg,
+        .wr_num_bytes = sizeof(msg.header) + len + 1,
+        .rd_bytes = &msg,
+        .rd_num_bytes = sizeof(msg),
+        .rd_handles = result,
+        .rd_num_handles = result == NULL ? 0 : 1,
+    };
+
+    uint32_t reply_size;
+    uint32_t handle_count;
+    mx_status_t read_status = NO_ERROR;
+    status = _mx_channel_call(loader_svc, 0, MX_TIME_INFINITE,
+                              &call, &reply_size, &handle_count,
+                              &read_status);
     if (status != NO_ERROR) {
-        error("mx_message_write of %u bytes to loader service: %d (%s)",
-              nbytes, status, mx_strstatus(status));
-        handle = status;
+        error("_mx_channel_call of %u bytes to loader service: "
+              "%d (%s), read %d (%s)",
+              call.wr_num_bytes, status, _mx_status_get_string(status),
+              read_status, _mx_status_get_string(read_status));
+        if (status == ERR_CALL_FAILED && read_status != NO_ERROR)
+            status = read_status;
         goto out;
     }
 
-    status = mx_handle_wait_one(loader_svc, MX_SIGNAL_READABLE,
-                                MX_TIME_INFINITE, NULL);
-    if (status != NO_ERROR) {
-        error("mx_handle_wait_one for loader service reply: %d (%s)",
-              status, mx_strstatus(status));
-        handle = status;
-        goto out;
-    }
-
-    uint32_t reply_size = sizeof(msg.header);
-    uint32_t handle_count = 1;
-    status = mx_message_read(loader_svc, &msg, &reply_size,
-                             &handle, &handle_count, 0);
-    if (status != NO_ERROR) {
-        error("mx_message_read of %u bytes for loader service reply: %d (%s)",
-              sizeof(msg.header), status, mx_strstatus(status));
-        handle = status;
-        goto out;
-    }
     if (reply_size != sizeof(msg.header)) {
         error("loader service reply %u bytes != %u",
               reply_size, sizeof(msg.header));
-        handle = ERR_INVALID_ARGS;
+        status = ERR_INVALID_ARGS;
         goto out;
     }
     if (msg.header.opcode != LOADER_SVC_OP_STATUS) {
         error("loader service reply opcode %u != %u",
               msg.header.opcode, LOADER_SVC_OP_STATUS);
-        handle = ERR_INVALID_ARGS;
+        status = ERR_INVALID_ARGS;
         goto out;
     }
     if (msg.header.arg != NO_ERROR) {
-        if (handle != MX_HANDLE_INVALID) {
+        // |result| is non-null if |handle_count| > 0, because
+        // |handle_count| <= |rd_num_handles|.
+        if (handle_count > 0 && *result != MX_HANDLE_INVALID) {
             error("loader service error %d reply contains handle %#x",
-                  msg.header.arg, handle);
-            handle = ERR_INVALID_ARGS;
+                  msg.header.arg, *result);
+            status = ERR_INVALID_ARGS;
             goto out;
         }
-        if (msg.header.arg > 0) {
-            error("loader service error reply %d > 0", msg.header.arg);
-            handle = ERR_INVALID_ARGS;
-            goto out;
-        }
-        handle = msg.header.arg;
+        status = msg.header.arg;
     }
 
 out:
     loader_svc_rpc_in_progress = false;
-    return handle;
+    return status;
 }
 
-static mx_handle_t get_library_vmo(const char* name) {
+__NO_SAFESTACK static mx_status_t get_library_vmo(const char* name,
+                                                  mx_handle_t* result) {
     if (loader_svc == MX_HANDLE_INVALID) {
         error("cannot look up \"%s\" with no loader service", name);
-        return MX_HANDLE_INVALID;
+        return ERR_UNAVAILABLE;
     }
-    return loader_svc_rpc(LOADER_SVC_OP_LOAD_OBJECT, name, strlen(name));
+    return loader_svc_rpc(LOADER_SVC_OP_LOAD_OBJECT, name, strlen(name),
+                          result);
 }
 
-static void log_write(const void* buf, size_t len) {
+__NO_SAFESTACK static void log_write(const void* buf, size_t len) {
     // The loader service prints "header: %s\n" when we send %s,
     // so strip a trailing newline.
     if (((const char*)buf)[len - 1] == '\n')
@@ -1905,18 +2114,19 @@ static void log_write(const void* buf, size_t len) {
 
     mx_status_t status;
     if (logger != MX_HANDLE_INVALID)
-        status = mx_log_write(logger, len, buf, 0);
+        status = _mx_log_write(logger, len, buf, 0);
     else if (!loader_svc_rpc_in_progress && loader_svc != MX_HANDLE_INVALID)
-        status = loader_svc_rpc(LOADER_SVC_OP_DEBUG_PRINT, buf, len);
+        status = loader_svc_rpc(LOADER_SVC_OP_DEBUG_PRINT, buf, len, NULL);
     else {
-        int n = mx_debug_write(buf, len);
+        int n = _mx_debug_write(buf, len);
         status = n < 0 ? n : NO_ERROR;
     }
     if (status != NO_ERROR)
         __builtin_trap();
 }
 
-static size_t errormsg_write(FILE* f, const unsigned char* buf, size_t len) {
+__NO_SAFESTACK static size_t errormsg_write(FILE* f, const unsigned char* buf,
+                                            size_t len) {
     if (f != NULL && f->wpos > f->wbase)
         log_write(f->wbase, f->wpos - f->wbase);
 
@@ -1931,24 +2141,26 @@ static size_t errormsg_write(FILE* f, const unsigned char* buf, size_t len) {
     return len;
 }
 
-static int errormsg_vprintf(const char* restrict fmt, va_list ap) {
+__NO_SAFESTACK static int errormsg_vprintf(const char* restrict fmt,
+                                           va_list ap) {
     FILE f = {
         .lbf = EOF,
         .write = errormsg_write,
-        .buf = (void*)fmt, .buf_size = 0,
+        .buf = (void*)fmt,
+        .buf_size = 0,
         .lock = -1,
     };
     return vfprintf(&f, fmt, ap);
 }
 
-static void debugmsg(const char* fmt, ...) {
+__NO_SAFESTACK static void debugmsg(const char* fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
     errormsg_vprintf(fmt, ap);
     va_end(ap);
 }
 
-static void error(const char* fmt, ...) {
+__NO_SAFESTACK static void error(const char* fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
     if (!runtime) {

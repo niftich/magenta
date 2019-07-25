@@ -1,30 +1,18 @@
-// Copyright 2016 The Fuchsia Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
 
 #include <mxio/io.h>
 
+#include <stdatomic.h>
 #include <stdlib.h>
+#include <threads.h>
 
 #include <magenta/syscalls.h>
-
-#include <runtime/mutex.h>
-#include <runtime/tls.h>
+#include <magenta/syscalls/log.h>
+#include <magenta/processargs.h>
 
 #include "private.h"
-
-static int logbuf_tls = -1;
-static mxr_mutex_t logbuf_lock;
 
 typedef struct mxio_log mxio_log_t;
 struct mxio_log {
@@ -34,20 +22,18 @@ struct mxio_log {
 
 #define LOGBUF_MAX (MX_LOG_RECORD_MAX - sizeof(mx_log_record_t))
 
-typedef struct ciobuf {
-    unsigned next;
-    char data[LOGBUF_MAX];
-} logbuf_t;
-
 static ssize_t log_write(mxio_t* io, const void* _data, size_t len) {
-    mxio_log_t* log_io = (mxio_log_t*)io;
-    logbuf_t* log = mxr_tls_get(logbuf_tls);
+    static thread_local struct {
+        unsigned next;
+        char data[LOGBUF_MAX];
+    }* logbuf = NULL;
 
-    if (log == NULL) {
-        if ((log = calloc(1, sizeof(logbuf_t))) == NULL) {
+    mxio_log_t* log_io = (mxio_log_t*)io;
+
+    if (logbuf == NULL) {
+        if ((logbuf = calloc(1, sizeof(*logbuf))) == NULL) {
             return len;
         }
-        mxr_tls_set(logbuf_tls, log);
     }
 
     const char* data = _data;
@@ -56,17 +42,17 @@ static ssize_t log_write(mxio_t* io, const void* _data, size_t len) {
     while (len-- > 0) {
         char c = *data++;
         if (c == '\n') {
-            mx_log_write(log_io->handle, log->next, log->data, 0);
-            log->next = 0;
+            mx_log_write(log_io->handle, logbuf->next, logbuf->data, 0);
+            logbuf->next = 0;
             continue;
         }
         if (c < ' ') {
             continue;
         }
-        log->data[log->next++] = c;
-        if (log->next == LOGBUF_MAX) {
-            mx_log_write(log_io->handle, log->next, log->data, 0);
-            log->next = 0;
+        logbuf->data[logbuf->next++] = c;
+        if (logbuf->next == LOGBUF_MAX) {
+            mx_log_write(log_io->handle, logbuf->next, logbuf->data, 0);
+            logbuf->next = 0;
             continue;
         }
     }
@@ -84,42 +70,39 @@ static mx_status_t log_close(mxio_t* io) {
 static mx_status_t log_clone(mxio_t* io, mx_handle_t* handles, uint32_t* types) {
     mxio_log_t* log_io = (mxio_log_t*)io;
 
-    handles[0] = mx_handle_duplicate(log_io->handle, MX_RIGHT_SAME_RIGHTS);
-    if (handles[0] < 1) {
-        return handles[0];
+    mx_status_t status = mx_handle_duplicate(log_io->handle, MX_RIGHT_SAME_RIGHTS, &handles[0]);
+    if (status < 0) {
+        return status;
     }
-    types[0] = MX_HND_TYPE_MXIO_LOGGER;
+    types[0] = PA_MXIO_LOGGER;
     return 1;
 }
 
 static mxio_ops_t log_io_ops = {
     .read = mxio_default_read,
     .write = log_write,
+    .recvmsg = mxio_default_recvmsg,
+    .sendmsg = mxio_default_sendmsg,
     .seek = mxio_default_seek,
     .misc = mxio_default_misc,
     .close = log_close,
     .open = mxio_default_open,
     .clone = log_clone,
-    .wait = mxio_default_wait,
     .ioctl = mxio_default_ioctl,
+    .wait_begin = mxio_default_wait_begin,
+    .wait_end = mxio_default_wait_end,
+    .posix_ioctl = mxio_default_posix_ioctl,
+    .get_vmo = mxio_default_get_vmo,
 };
 
 mxio_t* mxio_logger_create(mx_handle_t handle) {
-    mxr_mutex_lock(&logbuf_lock);
-    if (logbuf_tls < 0) {
-        logbuf_tls = mxr_tls_allocate();
-    }
-    mxr_mutex_unlock(&logbuf_lock);
-    if (logbuf_tls < 0) {
-        return NULL;
-    }
     mxio_log_t* log = calloc(1, sizeof(mxio_log_t));
     if (log == NULL) {
         return NULL;
     }
     log->io.ops = &log_io_ops;
     log->io.magic = MXIO_MAGIC;
-    log->io.refcount = 1;
+    atomic_init(&log->io.refcount, 1);
     log->handle = handle;
     return &log->io;
 }

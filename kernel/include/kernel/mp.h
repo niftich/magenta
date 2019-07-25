@@ -7,7 +7,7 @@
 
 #pragma once
 
-#include <compiler.h>
+#include <magenta/compiler.h>
 #include <limits.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -22,7 +22,7 @@ typedef void (*mp_sync_task_t)(void *context);
 
 #define MP_CPU_ALL_BUT_LOCAL (UINT32_MAX)
 #define MP_CPU_ALL (1U<<31)
-STATIC_ASSERT(SMP_MAX_CPUS <= 31);
+static_assert(SMP_MAX_CPUS <= 31, "");
 
 /* by default, mp_mbx_reschedule does not signal to cpus that are running realtime
  * threads. Override this behavior.
@@ -32,7 +32,10 @@ STATIC_ASSERT(SMP_MAX_CPUS <= 31);
 typedef enum {
     MP_IPI_GENERIC,
     MP_IPI_RESCHEDULE,
+    MP_IPI_HALT,
 } mp_ipi_t;
+
+#define MAX_IPI (3)
 
 #ifdef WITH_SMP
 void mp_init(void);
